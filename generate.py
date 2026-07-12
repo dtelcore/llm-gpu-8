@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
 def generate(args: argparse.Namespace) -> str:
     gpt_config, params, tokenizer, _, _ = load_checkpoint(args.checkpoint)
     model = GPTModel(gpt_config, params)
-    tracer = cli_common.build_tracer(args)
+    tracer = cli_common.build_tracer(args, default_trace_every=1)
     rng = np.random.default_rng(args.seed)
 
     prompt_ids = tokenizer.encode(args.prompt)

@@ -121,11 +121,21 @@ class DatasetAnalyzer:
 class DatasetLoader:
     """Loads and manages datasets from various sources."""
     
-    def __init__(self):
-        """Initialize loader."""
+    def __init__(self, data_dir: str = 'data', auto_discover: bool = True):
+        """Initialize loader.
+        
+        Args:
+            data_dir: Directory to auto-discover .txt datasets from (e.g. 'data')
+            auto_discover: If True, immediately scan data_dir so its files show
+                up as selectable options alongside the built-in datasets
+        """
         self.datasets = {}
         self.current_dataset = None
+        self.data_dir = data_dir
         logger.info("DatasetLoader initialized")
+        
+        if auto_discover:
+            self.load_from_directory(self.data_dir)
     
     def load_builtin(self, dataset_name: str) -> List[str]:
         """Load a built-in dataset.
@@ -288,11 +298,19 @@ class DatasetLoader:
         print("\nAvailable Datasets:")
         for i, name in enumerate(dataset_list, 1):
             info = datasets[name]
-            print(f"  {i}. {name:20s} ({info['sentences']:3d} sentences, {info['type']})")
+            source_note = f", {info['source']}" if info['type'] != 'builtin' else ""
+            print(f"  {i}. {name:20s} ({info['sentences']:3d} sentences, {info['type']}{source_note})")
+        print(f"  0. Load a custom file path (e.g. data/my_corpus.txt)")
         
         while True:
             try:
-                choice = int(input(f"\nSelect dataset (1-{len(dataset_list)}) [default=1]: ") or "1")
+                raw = input(f"\nSelect dataset (0-{len(dataset_list)}) [default=1]: ") or "1"
+                choice = int(raw)
+                
+                if choice == 0:
+                    custom_path = input("  File path: ").strip()
+                    return self.load_from_file(custom_path)
+                
                 if 1 <= choice <= len(dataset_list):
                     selected_name = dataset_list[choice - 1]
                     
@@ -302,7 +320,7 @@ class DatasetLoader:
                     
                     return self.get_corpus(selected_name)
                 else:
-                    print(f"  ⚠ Please enter a number between 1 and {len(dataset_list)}")
+                    print(f"  ⚠ Please enter a number between 0 and {len(dataset_list)}")
             except ValueError:
                 print("  ⚠ Invalid input")
 
@@ -342,22 +360,34 @@ def recommend_dataset_for_config(model_config: Dict) -> str:
 # QUICK START FUNCTION
 # ============================================================================
 
-def load_dataset_interactive(model_config: Optional[Dict] = None) -> Tuple[List[str], str]:
+def load_dataset_interactive(model_config: Optional[Dict] = None, data_dir: str = 'data') -> Tuple[List[str], str]:
     """Interactive dataset loading with recommendations.
     
     Args:
         model_config: Optional model configuration for recommendations
+        data_dir: Directory auto-scanned for .txt datasets (shown as extra
+            options alongside the built-in corpora, e.g. 'data/tiny_stories.txt')
         
     Returns:
         Tuple of (corpus, dataset_name)
     """
-    loader = DatasetLoader()
+    loader = DatasetLoader(data_dir=data_dir)
+    
+    discovered = [name for name, info in loader.datasets.items()]
+    if discovered:
+        print(f"\n✓ Found {len(discovered)} dataset file(s) in '{data_dir}/': {', '.join(discovered)}")
     
     # Show recommendation if config provided
     if model_config:
         recommended = recommend_dataset_for_config(model_config)
         print(f"\n✓ Recommended dataset for your config: {recommended}")
-        use_recommended = input("Use recommended dataset? (y/n) [default=y]: ").strip().lower()
+        use_recommended = input("Use recommended dataset? (y/n, or 'l' to pick from the list) [default=y]: ").strip().lower()
+        
+        if use_recommended == 'l':
+            corpus = loader.interactive_select()
+            analyzer = DatasetAnalyzer(corpus)
+            analyzer.print_stats()
+            return corpus, loader.current_dataset
         
         if use_recommended != 'n':
             corpus = loader.load_builtin(recommended)
@@ -365,7 +395,7 @@ def load_dataset_interactive(model_config: Optional[Dict] = None) -> Tuple[List[
             analyzer.print_stats()
             return corpus, recommended
     
-    # Let user choose
+    # Let user choose (builtins + auto-discovered data_dir files + custom path)
     corpus = loader.interactive_select()
     analyzer = DatasetAnalyzer(corpus)
     analyzer.print_stats()

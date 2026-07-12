@@ -34,6 +34,13 @@ logger.info("PyCUDA kernels compiled for sm_35 (Kepler GT 730)")
 MAX_THREADS_PER_BLOCK = 1024
 
 
+def get_memory_info():
+    # type: () -> tuple
+    """Return (free_bytes, total_bytes) of GPU VRAM, straight from the driver."""
+    free_bytes, total_bytes = cuda.mem_get_info()
+    return free_bytes, total_bytes
+
+
 def next_pow2(n: int, cap: int = MAX_THREADS_PER_BLOCK) -> int:
     """Smallest power of two >= n, capped at `cap`. Minimum 32 (one warp)."""
     p = 32

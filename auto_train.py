@@ -8,6 +8,7 @@ resulting checkpoint as a smoke test. One command for
 Usage:
     python auto_train.py --config setup/training_config.json --checkpoint models/run1
     python auto_train.py --epochs 5 --prompt "once upon a" --trace-logits
+    python auto_train.py --steps 1500 --prompt "once upon a"
 """
 
 import argparse
@@ -22,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     cli_common.add_config_arg(parser)
     cli_common.add_checkpoint_arg(parser)
     cli_common.add_seed_arg(parser)
-    parser.add_argument("--epochs", type=int, default=None, help="Override config num_epochs")
+    cli_common.add_training_length_args(parser)
     parser.add_argument("--prompt", type=str, default="the", help="Prompt for the post-training smoke sample")
     parser.add_argument("--max-new-tokens", type=int, default=80, help="Characters to generate for the smoke sample")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for the smoke sample")

@@ -84,16 +84,23 @@ HYPERPARAMETER_PRESETS = {
 class TrainingSetup:
     """Orchestrates complete training setup."""
     
-    def __init__(self):
-        """Initialize setup orchestrator."""
+    def __init__(self, data_dir: str = 'data'):
+        """Initialize setup orchestrator.
+        
+        Args:
+            data_dir: Directory auto-scanned for .txt datasets during dataset
+                selection (e.g. 'data/tiny_stories.txt' shows up as an option
+                alongside the built-in corpora)
+        """
         self.model_config = None
         self.dataset = None
         self.dataset_name = None
         self.hyperparams = None
         self.init_scales = None
+        self.data_dir = data_dir
         self.setup_dir = Path('setup')
         self.config_file = self.setup_dir / 'training_config.json'
-        logger.info("TrainingSetup initialized")
+        logger.info(f"TrainingSetup initialized (data_dir={data_dir!r})")
     
     def run_interactive_setup(self, use_presets: bool = True) -> Dict:
         """Run complete interactive setup.
@@ -165,8 +172,8 @@ class TrainingSetup:
             recommended = recommend_dataset_for_config(self.model_config)
             print(f"\n✓ Recommended dataset: {recommended}")
         
-        # Load dataset
-        self.dataset, self.dataset_name = load_dataset_interactive(self.model_config)
+        # Load dataset (auto-discovers .txt files under self.data_dir as options)
+        self.dataset, self.dataset_name = load_dataset_interactive(self.model_config, data_dir=self.data_dir)
         
         # Update vocab size in model config
         if self.dataset:
@@ -326,16 +333,18 @@ class TrainingSetup:
 # QUICK START FUNCTION
 # ============================================================================
 
-def quickstart_training_setup(interactive: bool = True) -> Dict:
+def quickstart_training_setup(interactive: bool = True, data_dir: str = 'data') -> Dict:
     """Quick start training setup.
     
     Args:
         interactive: If True, run interactive wizard; else use all defaults
+        data_dir: Directory auto-scanned for .txt datasets during dataset
+            selection (only relevant when interactive=True)
         
     Returns:
         Complete training configuration
     """
-    setup = TrainingSetup()
+    setup = TrainingSetup(data_dir=data_dir)
     
     if interactive:
         return setup.run_interactive_setup()
@@ -353,5 +362,11 @@ def quickstart_training_setup(interactive: bool = True) -> Dict:
 
 
 if __name__ == "__main__":
-    config = quickstart_training_setup(interactive=True)
+    import argparse
+
+    _parser = argparse.ArgumentParser(description="Interactive training setup wizard")
+    _parser.add_argument("--data-dir", type=str, default="data", help="Directory auto-scanned for .txt datasets (default: data)")
+    _args = _parser.parse_args()
+
+    config = quickstart_training_setup(interactive=True, data_dir=_args.data_dir)
     print("\nSetup complete. Keys:", ", ".join(config.keys()))

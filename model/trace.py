@@ -36,13 +36,17 @@ class TraceContext:
 
     @classmethod
     def from_args(cls, args) -> "TraceContext":
+        # trace_every may be None here (meaning "not explicitly set"); callers
+        # should resolve it via cli_common.build_tracer, which overrides it
+        # with a context-appropriate default before this context is used.
+        raw_trace_every = getattr(args, "trace_every", None)
         return cls(
             verbose=args.verbose,
             trace_logits=args.trace_logits,
             trace_tokens=args.trace_tokens,
             trace_neurons=args.trace_neurons,
             trace_vectorization=args.trace_vectorization,
-            trace_every=getattr(args, "trace_every", 100),
+            trace_every=raw_trace_every if raw_trace_every is not None else 100,
         )
 
     @property

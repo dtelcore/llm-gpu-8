@@ -39,7 +39,7 @@ def main() -> None:
     args = parse_args()
     gpt_config, params, tokenizer, _, _ = load_checkpoint(args.checkpoint)
     model = GPTModel(gpt_config, params)
-    tracer = cli_common.build_tracer(args)
+    tracer = cli_common.build_tracer(args, default_trace_every=1)
     rng = np.random.default_rng(args.seed)
 
     temperature = args.temperature
