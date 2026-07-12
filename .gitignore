@@ -1,0 +1,11 @@
+ignore all files in the setup folder and venv folder
+ignore all files in the logs folder
+ignore all files in the models folder
+ignore all files in the data folder
+
+venv/
+logs/
+models/
+data/
+__pycache__/
+*.log
