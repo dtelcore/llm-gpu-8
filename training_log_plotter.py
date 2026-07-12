@@ -126,25 +126,64 @@ def _rows_from_structured(path: Path) -> Tuple[List[int], Dict[str, List[Optiona
     return steps, metrics, total_steps
 
 
-def _rows_from_text_log(path: Path) -> List[Tuple[int, int, Dict[str, Optional[float]]]]:
+def _parse_log_line(line: str) -> Optional[Tuple[int, int, Dict[str, Optional[float]]]]:
+    step_match = LOG_LINE_RE.search(line)
+    if not step_match:
+        return None
+    step = int(step_match.group(1))
+    total_steps = int(step_match.group(2))
+    row: Dict[str, Optional[float]] = {}
+    for key, raw in KV_RE.findall(line):
+        if key == "step":
+            continue
+        row[key] = _safe_float(raw)
+    return step, total_steps, row
+
+
+# Cache of already-parsed rows per text log path, keyed so live refreshes only
+# need to read/parse bytes appended since the last poll instead of re-reading
+# the whole (potentially huge, ever-growing) file each time.
+_TEXT_LOG_CACHE: Dict[Path, Dict[str, Any]] = {}
+
+
+def _rows_from_text_log(path: Path, use_cache: bool = False) -> List[Tuple[int, int, Dict[str, Optional[float]]]]:
     """Parse a plaintext log (e.g. logs/training.log) into (step, total_steps, kv-row)
     tuples, one per line matching `step=N/TOTAL`. Any line with that pattern counts,
-    whether or not it's tagged "[train]" -- keeps this resilient to log format tweaks."""
-    rows: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            step_match = LOG_LINE_RE.search(line)
-            if not step_match:
-                continue
-            step = int(step_match.group(1))
-            total_steps = int(step_match.group(2))
-            row: Dict[str, Optional[float]] = {}
-            for key, raw in KV_RE.findall(line):
-                if key == "step":
-                    continue
-                row[key] = _safe_float(raw)
-            rows.append((step, total_steps, row))
-    return rows
+    whether or not it's tagged "[train]" -- keeps this resilient to log format tweaks.
+
+    When use_cache is True (live mode), only bytes appended since the previous
+    call are read and parsed; previously parsed rows are reused as-is."""
+    if not use_cache:
+        rows: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parsed = _parse_log_line(line)
+                if parsed:
+                    rows.append(parsed)
+        return rows
+
+    cache = _TEXT_LOG_CACHE.get(path)
+    size = path.stat().st_size
+    if cache is None or size < cache["offset"]:
+        # First load, or file shrank/rotated -- reparse from scratch.
+        cache = {"offset": 0, "rows": [], "leftover": ""}
+
+    if size > cache["offset"]:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            f.seek(cache["offset"])
+            chunk = cache["leftover"] + f.read()
+            cache["offset"] = size
+        lines = chunk.split("\n")
+        # Last element may be a partial line if the writer hasn't flushed a
+        # trailing newline yet; stash it and prepend on the next read.
+        cache["leftover"] = lines.pop() if lines else ""
+        for line in lines:
+            parsed = _parse_log_line(line)
+            if parsed:
+                cache["rows"].append(parsed)
+
+    _TEXT_LOG_CACHE[path] = cache
+    return cache["rows"]
 
 
 def _segment_by_step_reset(
@@ -181,7 +220,7 @@ def _derive_ppl(metrics: Dict[str, List[Optional[float]]]) -> None:
     metrics["ppl"] = ppl
 
 
-def _parse_log_file(path: Path, all_runs: bool = False) -> List[RunSeries]:
+def _parse_log_file(path: Path, all_runs: bool = False, use_cache: bool = False) -> List[RunSeries]:
     """Parse a log/metrics file into one RunSeries per contiguous training run found
     in it. Text logs (like logs/training.log) may contain many runs concatenated;
     structured .jsonl/.csv exports are treated as a single run."""
@@ -194,7 +233,7 @@ def _parse_log_file(path: Path, all_runs: bool = False) -> List[RunSeries]:
                                           total_steps=total_steps, metrics=metrics))
         return [run]
 
-    rows = _rows_from_text_log(path)
+    rows = _rows_from_text_log(path, use_cache=use_cache)
     segments = _segment_by_step_reset(rows)
     if not segments:
         return []
@@ -253,11 +292,11 @@ def _canonicalize_run(run: RunSeries) -> RunSeries:
     )
 
 
-def _load_runs(paths: List[Path], all_runs: bool = False) -> List[RunSeries]:
+def _load_runs(paths: List[Path], all_runs: bool = False, use_cache: bool = False) -> List[RunSeries]:
     runs: List[RunSeries] = []
     for path in paths:
         if path.exists():
-            runs.extend(_parse_log_file(path, all_runs=all_runs))
+            runs.extend(_parse_log_file(path, all_runs=all_runs, use_cache=use_cache))
     return runs
 
 
@@ -268,16 +307,34 @@ def _to_arr(values: Sequence[Optional[float]]) -> np.ndarray:
 
 
 def _rolling_mean(values: Sequence[Optional[float]], window: int) -> np.ndarray:
+    """Centered rolling mean, NaN-aware. Vectorized via cumulative sums so it
+    stays O(n) regardless of window size -- the naive per-index-slice loop
+    turned O(n*window) and became the dominant cost (and thus the main drag
+    on how quickly the chart could redraw/autoscale) once logs grew past
+    tens of thousands of steps."""
     arr = _to_arr(values)
-    if window <= 1:
+    n = len(arr)
+    if n == 0 or window <= 1:
         return arr.copy()
-    out = np.full_like(arr, np.nan)
+
     half = window // 2
-    for i in range(len(arr)):
-        chunk = arr[max(0, i - half): i + half + 1]
-        valid = chunk[~np.isnan(chunk)]
-        if len(valid):
-            out[i] = valid.mean()
+    mask = ~np.isnan(arr)
+    filled = np.where(mask, arr, 0.0)
+
+    # Prefix sums (padded with a leading 0) let us get any window's sum/count
+    # via two subtractions instead of re-scanning the slice.
+    sum_cs = np.concatenate(([0.0], np.cumsum(filled)))
+    cnt_cs = np.concatenate(([0.0], np.cumsum(mask, dtype=float)))
+
+    lo = np.clip(np.arange(n) - half, 0, n)
+    hi = np.clip(np.arange(n) + half + 1, 0, n)
+
+    counts = cnt_cs[hi] - cnt_cs[lo]
+    sums = sum_cs[hi] - sum_cs[lo]
+
+    out = np.full(n, np.nan)
+    valid = counts > 0
+    out[valid] = sums[valid] / counts[valid]
     return out
 
 
@@ -703,7 +760,7 @@ def plot_runs_liveable(
                  fontweight="semibold", y=0.98)
 
     while True:
-        current_runs = _load_runs(source_paths, all_runs=all_runs) if live else list(runs)
+        current_runs = _load_runs(source_paths, all_runs=all_runs, use_cache=live) if live else list(runs)
         if not current_runs:
             print("No valid training logs found.", file=sys.stderr)
             return

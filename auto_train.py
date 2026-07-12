@@ -10,6 +10,7 @@ Usage:
     python auto_train.py --epochs 5 --prompt "once upon a" --trace-logits
     python auto_train.py --steps 1500 --prompt "once upon a"
     python auto_train.py --learning-rate 0.005 --steps 500 --no-prompt   # fully non-interactive
+    python auto_train.py --menu        # wizard first; first prompt offers resuming a checkpoint
 
 If --learning-rate/--steps/--epochs aren't all given on the command line, you'll
 be prompted for whichever ones are missing (pass --no-prompt to disable and
@@ -33,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", type=str, default="the", help="Prompt for the post-training smoke sample")
     parser.add_argument("--max-new-tokens", type=int, default=80, help="Characters to generate for the smoke sample")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for the smoke sample")
+    parser.add_argument(
+        "--menu", action="store_true",
+        help="Run the interactive training setup wizard before training. First prompt lets "
+             "you resume from an existing checkpoint instead of starting fresh.",
+    )
+    parser.add_argument("--data-dir", type=str, default="data", help="Directory auto-scanned for .txt datasets when --menu is used")
+    parser.add_argument("--models-dir", type=str, default="models", help="Directory scanned for existing checkpoints by --menu")
     cli_common.add_trace_args(parser)
     return parser.parse_args()
 

@@ -9,7 +9,7 @@ Usage:
     python train.py --config setup/training_config.json --checkpoint models/run1
     python train.py --epochs 3 --trace-tokens --trace-logits --trace-every 10
     python train.py --steps 1500   # total steps across ALL epochs, overrides --epochs/config
-    python train.py --menu         # run the interactive setup wizard first, then train with it
+    python train.py --menu         # wizard first; first prompt offers resuming a checkpoint instead
     python train.py --generate     # skip training; pick a checkpoint and enter a generation test menu
 
 If --learning-rate/--steps/--epochs/model-hyperparameters (--embedding-dim,
@@ -131,26 +131,49 @@ def generate_test_menu(args: argparse.Namespace) -> None:
 def train(args: argparse.Namespace) -> str:
     # menu/models_dir/plot are train.py-only flags; default them so this function
     # also works when called from auto_train.py's smaller argument set.
-    if getattr(args, "menu", False):
-        from setup.training_setup import quickstart_training_setup
-        config = quickstart_training_setup(interactive=True, data_dir=getattr(args, "data_dir", "data"))
+    resumed = False
+    start_step = 0
+    tokenizer = gpt_config = params = None
 
-        print("\n[Step 5/5] CHECKPOINT DESTINATION")
+    if getattr(args, "menu", False):
+        from training.checkpoint import load_checkpoint
+
+        models_dir = getattr(args, "models_dir", "models")
+        print("\n[Step 0/5] RESUME OR NEW")
         print("-" * 70)
-        args.checkpoint = cli_common.select_checkpoint_interactive(
-            models_dir=getattr(args, "models_dir", "models"), allow_new=True,
-            default_new_name="run1", prompt_label="checkpoint to save to",
-        )
-        print(f"-> Training will checkpoint to '{args.checkpoint}'")
+        resume_ckpt = cli_common.prompt_resume_or_new(models_dir)
+
+        if resume_ckpt:
+            gpt_config, params, tokenizer, config, state = load_checkpoint(resume_ckpt)
+            args.checkpoint = resume_ckpt
+            start_step = int(state.get("step", 0))
+            resumed = True
+            print(f"-> Resuming '{resume_ckpt}' from step {start_step:,} "
+                  f"(model architecture is fixed by the checkpoint; only training-length/LR "
+                  f"prompts still apply)")
+        else:
+            from setup.training_setup import quickstart_training_setup
+            config = quickstart_training_setup(interactive=True, data_dir=getattr(args, "data_dir", "data"))
+
+            print("\n[Step 5/5] CHECKPOINT DESTINATION")
+            print("-" * 70)
+            args.checkpoint = cli_common.select_checkpoint_interactive(
+                models_dir=models_dir, allow_new=True,
+                default_new_name="run1", prompt_label="checkpoint to save to",
+            )
+            print(f"-> Training will checkpoint to '{args.checkpoint}'")
     else:
         config = cli_common.load_config(args.config)
 
     hyperparams = config["hyperparameters"]
-    cli_common.prompt_model_hyperparams(args, config["model"], hyperparams)
 
-    tokenizer, gpt_config = build_tokenizer_and_config(config)
+    if not resumed:
+        # Architecture is fixed once a checkpoint exists, so these prompts only
+        # apply to fresh runs.
+        cli_common.prompt_model_hyperparams(args, config["model"], hyperparams)
+        tokenizer, gpt_config = build_tokenizer_and_config(config)
+        params = ModelParameters(gpt_config, init_scales=config.get("weight_initialization", {}), seed=args.seed)
 
-    params = ModelParameters(gpt_config, init_scales=config.get("weight_initialization", {}), seed=args.seed)
     model = GPTModel(gpt_config, params)
 
     cli_common.prompt_training_length_and_lr(args, hyperparams)
@@ -174,11 +197,13 @@ def train(args: argparse.Namespace) -> str:
 
     # --steps is the TOTAL step count across all epochs and takes priority over
     # --epochs and the config's num_epochs (which only matter when --steps is absent).
+    # When resuming, --steps/--epochs are interpreted as "how many MORE steps",
+    # added on top of the checkpoint's saved step.
     if args.steps is not None:
-        total_steps = args.steps
+        total_steps = start_step + args.steps
     else:
         epochs = args.epochs if args.epochs is not None else hyperparams["num_epochs"]
-        total_steps = epochs * steps_per_epoch
+        total_steps = start_step + epochs * steps_per_epoch
 
     checkpoint_every = args.checkpoint_every or steps_per_epoch
     log_every = max(1, args.log_every)
@@ -193,9 +218,9 @@ def train(args: argparse.Namespace) -> str:
           f"batches/epoch={steps_per_epoch} | total_steps={total_steps} | "
           f"checkpoint_every={checkpoint_every} steps | trace_every={tracer.trace_every} steps")
     print("=" * 70)
-    logger.info(f"Training started: {gpt_config} total_steps={total_steps}")
+    logger.info(f"Training started: {gpt_config} total_steps={total_steps} start_step={start_step}")
 
-    global_step = 0
+    global_step = start_step
     window_loss_sum = 0.0
     window_steps = 0
     window_start_time = time.time()

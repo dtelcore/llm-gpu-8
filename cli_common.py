@@ -8,7 +8,7 @@ and interactive.py so trace flags and paths stay consistent across CLIs.
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from model.trace import TraceContext
 
@@ -149,6 +149,41 @@ def list_checkpoints(models_dir: str = "models") -> List[Path]:
         return []
     found = [d for d in root.iterdir() if d.is_dir() and (d / "config.json").exists()]
     return sorted(found, key=lambda d: d.stat().st_mtime, reverse=True)
+
+
+def prompt_resume_or_new(models_dir: str = "models") -> Optional[str]:
+    """First-menu-option prompt: resume training from an existing checkpoint, or
+    start a fresh run. Returns the checkpoint path to resume from, or None to
+    signal 'start fresh' (including when no checkpoints exist or stdin is EOF)."""
+    checkpoints = list_checkpoints(models_dir)
+
+    print(f"\nAvailable checkpoints in '{models_dir}':")
+    if checkpoints:
+        for i, d in enumerate(checkpoints, 1):
+            print(f"  {i}. {d}")
+    else:
+        print("  (none found)")
+    print("  n. Start a new training run")
+
+    if not checkpoints:
+        return None
+
+    try:
+        choice = input("\nResume from checkpoint (number), or 'n' for new [default=n]: ").strip()
+    except EOFError:
+        return None
+
+    if not choice or choice.lower() == "n":
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(checkpoints):
+        return str(checkpoints[int(choice) - 1])
+
+    candidate = Path(choice)
+    if (candidate / "config.json").exists():
+        return str(candidate)
+
+    print(f"'{choice}' not recognized; starting a new training run.")
+    return None
 
 
 def select_checkpoint_interactive(
