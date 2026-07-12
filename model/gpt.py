@@ -75,6 +75,8 @@ class GPTModel:
         cfg = self.config
         w = self.params.weights
         b = self.params.biases
+        dw = self.params.device_weights
+        db = self.params.device_biases
         T = len(token_ids)
 
         tok_emb = w["token_embedding"][token_ids]  # [T, C]
@@ -118,7 +120,7 @@ class GPTModel:
         cache["final_xhat"], cache["final_invstd"] = xhat_f, invstd_f
         cache["h_final"] = h_final
 
-        logits = layers.linear(h_final, w["lm_head"], b["lm_head_bias"], tracer=tracer, name="lm_head")
+        logits = layers.linear(h_final, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head")
         cache["logits"] = logits
 
         return logits, cache
@@ -126,10 +128,11 @@ class GPTModel:
     def _attention_forward(self, ln1_out: np.ndarray, prefix: str, tracer: TraceContext = None):
         cfg = self.config
         w, b = self.params.weights, self.params.biases
+        dw, db = self.params.device_weights, self.params.device_biases
         T, C = ln1_out.shape
         H, hd = cfg.num_heads, cfg.head_dim
 
-        qkv = layers.linear(ln1_out, w[f"{prefix}.qkv_proj"], b[f"{prefix}.qkv_bias"], tracer=tracer, name=f"{prefix}.qkv")
+        qkv = layers.linear(ln1_out, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"], tracer=tracer, name=f"{prefix}.qkv")
         q, k, v = np.split(qkv, 3, axis=-1)
         q_h = q.reshape(T, H, hd).transpose(1, 0, 2)  # [H,T,hd]
         k_h = k.reshape(T, H, hd).transpose(1, 0, 2)
@@ -148,7 +151,7 @@ class GPTModel:
             head_out[hidx] = probs @ v_h[hidx]
 
         attn_concat = head_out.transpose(1, 0, 2).reshape(T, C)
-        attn_out = layers.linear(attn_concat, w[f"{prefix}.attn_out_proj"], b[f"{prefix}.attn_out_bias"], tracer=tracer, name=f"{prefix}.attn_out")
+        attn_out = layers.linear(attn_concat, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"], tracer=tracer, name=f"{prefix}.attn_out")
 
         if tracer is not None:
             tracer.dump_neurons(f"{prefix}.attn_out", attn_out)
@@ -160,10 +163,10 @@ class GPTModel:
         return attn_out, cache
 
     def _mlp_forward(self, ln2_out: np.ndarray, prefix: str, tracer: TraceContext = None):
-        w, b = self.params.weights, self.params.biases
-        hidden = layers.linear(ln2_out, w[f"{prefix}.mlp_expand"], b[f"{prefix}.mlp_expand_bias"], tracer=tracer, name=f"{prefix}.mlp_expand")
+        dw, db = self.params.device_weights, self.params.device_biases
+        hidden = layers.linear(ln2_out, dw[f"{prefix}.mlp_expand"], db[f"{prefix}.mlp_expand_bias"], tracer=tracer, name=f"{prefix}.mlp_expand")
         act = layers.gelu(hidden)
-        mlp_out = layers.linear(act, w[f"{prefix}.mlp_contract"], b[f"{prefix}.mlp_contract_bias"], tracer=tracer, name=f"{prefix}.mlp_contract")
+        mlp_out = layers.linear(act, dw[f"{prefix}.mlp_contract"], db[f"{prefix}.mlp_contract_bias"], tracer=tracer, name=f"{prefix}.mlp_contract")
 
         if tracer is not None:
             tracer.dump_neurons(f"{prefix}.mlp_out", mlp_out)

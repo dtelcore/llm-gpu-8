@@ -35,8 +35,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_repl(args: argparse.Namespace) -> None:
+    """Runs the interactive generation REPL for the checkpoint in `args.checkpoint`.
+    Reusable by other CLIs (e.g. train.py --generate) that build their own args."""
     gpt_config, params, tokenizer, _, _ = load_checkpoint(args.checkpoint)
     model = GPTModel(gpt_config, params)
     tracer = cli_common.build_tracer(args, default_trace_every=1)
@@ -94,6 +95,11 @@ def main() -> None:
             rng=rng,
         )
         print(tokenizer.decode(generated_ids))
+
+
+def main() -> None:
+    args = parse_args()
+    run_repl(args)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,18 @@
 model/layers.py
 
 Attention and MLP block ops, built on top of model/cuda/ops.py primitives.
-Each function accepts a NumPy [rows, C] activation, uploads it to the
+Each function accepts a NumPy [rows, C] activation, uploads *that* to the
 device, runs the relevant kernels, and returns a NumPy array -- keeping
 model/gpt.py free of any direct PyCUDA calls.
+
+V2: `weight`/`bias` arguments are now GPU-resident gpuarrays (from
+model.weights.ModelParameters.device_weights/device_biases), not NumPy
+arrays. Previously every call re-uploaded the full weight matrix from host
+to device -- on the GT 730's slow PCIe link that dwarfed the actual matmul
+cost. Weights now live on the device permanently and are only re-synced
+once per optimizer step (see ModelParameters.sync_device), not once per op.
+Only the activation `x` still crosses the host<->device boundary here,
+since the analytic NumPy backward pass needs it cached on the host anyway.
 """
 
 from typing import Optional, Tuple
@@ -15,14 +24,13 @@ from model.cuda import ops
 from model.trace import TraceContext
 
 
-def linear(x: np.ndarray, weight: np.ndarray, bias: Optional[np.ndarray], tracer: TraceContext = None, name: str = "linear") -> np.ndarray:
-    """y = x @ weight + bias, executed on the GPU."""
+def linear(x: np.ndarray, weight, bias=None, tracer: TraceContext = None, name: str = "linear") -> np.ndarray:
+    """y = x @ weight + bias, executed on the GPU. `weight`/`bias` must already be
+    device-resident gpuarrays (see ModelParameters.device_weights/device_biases)."""
     xd = ops.to_device(x)
-    wd = ops.to_device(weight)
-    out = ops.matmul(xd, wd, tracer=tracer, name=name)
+    out = ops.matmul(xd, weight, tracer=tracer, name=name)
     if bias is not None:
-        bd = ops.to_device(bias)
-        out = ops.add_bias(out, bd)
+        out = ops.add_bias(out, bias)
     return ops.to_host(out)
 
 

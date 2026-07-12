@@ -5,9 +5,17 @@ NumPy host-side parameter storage for the GPT model. Allocates float32
 arrays matching the layout used by setup/model_config.estimate_vram_footprint,
 and initializes them via setup/weight_init.WeightInitializer using the
 per-layer-type scales already computed by setup/training_setup.py.
+
+V2: also keeps a persistent GPU-resident mirror of every weight/bias tensor
+(device_weights / device_biases). Forward-pass matmuls read straight from
+these mirrors instead of re-uploading the same weight matrix on every single
+op call -- that per-call host->device transfer was the dominant cost on the
+GT 730's slow PCIe link, dwarfing the actual matmul time for these small
+matrices. The mirrors are refreshed once per optimizer step via sync_device(),
+not once per layer op.
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 
@@ -16,15 +24,18 @@ from setup.weight_init import WeightInitializer
 
 
 class ModelParameters:
-    """Owns every trainable NumPy array for a GPTConfig."""
+    """Owns every trainable NumPy array for a GPTConfig, plus a GPU-resident mirror."""
 
     def __init__(self, config: GPTConfig, init_scales: Dict[str, float] = None, seed: int = 42) -> None:
         self.config = config
         self.scales = init_scales or {}
         self.weights: Dict[str, np.ndarray] = {}
         self.biases: Dict[str, np.ndarray] = {}
+        self.device_weights: Dict[str, "pycuda.gpuarray.GPUArray"] = {}
+        self.device_biases: Dict[str, "pycuda.gpuarray.GPUArray"] = {}
         self._rng = np.random.default_rng(seed)
         self.allocate_and_init()
+        self.upload_to_device()
 
     def allocate_and_init(self) -> None:
         C = self.config.embedding_dim
@@ -103,3 +114,28 @@ class ModelParameters:
                 self.weights[key] = data[key].astype(np.float32)
             elif key in self.biases:
                 self.biases[key] = data[key].astype(np.float32)
+        self.sync_device()
+
+    # ------------------------------------------------------------------
+    # V2: GPU-resident mirror
+    # ------------------------------------------------------------------
+
+    def upload_to_device(self) -> None:
+        """Upload every weight/bias tensor to the GPU once. Called at construction
+        and after load(); training calls sync_device() after each optimizer step
+        instead of re-running this from scratch."""
+        from model.cuda import ops
+        self.device_weights = {name: ops.to_device(arr) for name, arr in self.weights.items()}
+        self.device_biases = {name: ops.to_device(arr) for name, arr in self.biases.items()}
+
+    def sync_device(self, names: Optional[Iterable[str]] = None) -> None:
+        """Re-upload the current NumPy values to their persistent GPU mirrors.
+        Call this once per optimizer step (after optimizer.step() mutates
+        self.weights/self.biases in place) -- NOT once per layer op."""
+        from model.cuda import ops
+        keys = names if names is not None else list(self.weights.keys()) + list(self.biases.keys())
+        for name in keys:
+            if name in self.weights:
+                self.device_weights[name] = ops.to_device(self.weights[name])
+            elif name in self.biases:
+                self.device_biases[name] = ops.to_device(self.biases[name])

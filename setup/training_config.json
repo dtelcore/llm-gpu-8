@@ -1,14 +1,12 @@
 {
   "model": {
-    "name": "Tiny (Testing)",
     "vocab_size": 61,
-    "max_len": 8,
-    "embedding_dim": 16,
-    "num_heads": 2,
-    "num_layers": 1,
-    "dropout_prob": 0.0,
-    "init_scale": 0.02,
-    "description": "Minimal config for quick testing. ~50KB parameters. Batch=2, SeqLen=8."
+    "name": "Custom Configuration",
+    "max_len": 256,
+    "embedding_dim": 128,
+    "num_heads": 8,
+    "num_layers": 8,
+    "dropout_prob": 0.02
   },
   "dataset": {
     "name": "tiny_stories",
@@ -257,12 +255,12 @@
   },
   "weight_initialization": {
     "token_embedding": 0.12803687993289598,
-    "position_embedding": 0.35355339059327373,
-    "qkv_proj": 0.25,
-    "attention_output_proj": 0.25,
-    "mlp_expand": 0.25,
-    "mlp_contract": 0.125,
-    "lm_head": 0.25
+    "position_embedding": 0.0625,
+    "qkv_proj": 0.08838834764831843,
+    "attention_output_proj": 0.08838834764831843,
+    "mlp_expand": 0.08838834764831843,
+    "mlp_contract": 0.044194173824159216,
+    "lm_head": 0.08838834764831843
   },
   "hyperparameters": {
     "name": "Moderate (Balanced)",
