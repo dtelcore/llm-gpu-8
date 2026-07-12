@@ -350,3 +350,8 @@ def quickstart_training_setup(interactive: bool = True) -> Dict:
         setup.hyperparams = HYPERPARAMETER_PRESETS['conservative'].copy()
         
         return setup.get_complete_config()
+
+
+if __name__ == "__main__":
+    config = quickstart_training_setup(interactive=True)
+    print("\nSetup complete. Keys:", ", ".join(config.keys()))
