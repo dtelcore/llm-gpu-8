@@ -24,6 +24,28 @@ from logging_config import logger
 # ============================================================================
 
 PRESETS = {
+    'toy': {
+        'name': 'Toy Run',
+        'vocab_size': None,  # Inferred from tokenizer
+        'max_len': 8,
+        'embedding_dim': 16,
+        'num_heads': 2,
+        'num_layers': 1,
+        'dropout_prob': 0.0,
+        'init_scale': 0.02,
+        'description': 'Toy smoke test. ~7k params. batch=64, seq=8.',
+    },
+    'tiny_stories': {
+        'name': 'Tiny Stories Run',
+        'vocab_size': None,
+        'max_len': 128,
+        'embedding_dim': 128,
+        'num_heads': 8,
+        'num_layers': 6,
+        'dropout_prob': 0.1,
+        'init_scale': 0.02,
+        'description': 'TinyStories-capable real run. ~1-5M params. batch=32, seq=128.',
+    },
     'tiny': {
         'name': 'Tiny (Testing)',
         'vocab_size': None,  # Inferred from tokenizer
@@ -33,7 +55,7 @@ PRESETS = {
         'num_layers': 1,
         'dropout_prob': 0.0,
         'init_scale': 0.02,
-        'description': 'Minimal config for quick testing. ~50KB parameters. Batch=2, SeqLen=8.',
+        'description': 'Alias for toy. ~7k parameters.',
     },
     'small': {
         'name': 'Small (Development)',
@@ -194,7 +216,7 @@ class ModelConfigBuilder:
         """Load a predefined configuration preset.
         
         Args:
-            preset_name: One of 'tiny', 'small', 'medium'
+            preset_name: One of 'toy', 'tiny_stories', 'tiny', 'small', 'medium'
             
         Returns:
             Configuration dictionary
@@ -222,23 +244,23 @@ class ModelConfigBuilder:
         print("="*70)
         
         print("\n[Quick Start] Choose a preset or customize:")
-        print("  1. Tiny (minimal testing)")
-        print("  2. Small (development)")
-        print("  3. Medium (production)")
-        print("  4. Custom (full customization)")
+        print("  1. Toy Run (smoke test, ~7k params)")
+        print("  2. Tiny Stories (real run, ~1M params)")
+        print("  3. Small (development)")
+        print("  4. Medium (production)")
+        print("  5. Custom (full customization)")
         
-        choice = input("\nSelect (1-4): ").strip()
+        choice = input("\nSelect (1-5) [default=1]: ").strip()
         
-        if choice in ['1', '2', '3']:
-            preset_map = {'1': 'tiny', '2': 'small', '3': 'medium'}
+        preset_map = {'1': 'toy', '2': 'tiny_stories', '3': 'small', '4': 'medium'}
+        if choice in preset_map:
             return self.preset_config(preset_map[choice])
         
-        elif choice == '4':
+        if choice == '5':
             return self._build_custom_config()
         
-        else:
-            logger.warning(f"Invalid choice: {choice}, defaulting to tiny")
-            return self.preset_config('tiny')
+        logger.warning(f"Invalid choice: {choice!r}, defaulting to toy")
+        return self.preset_config('toy')
     
     def _build_custom_config(self) -> Dict:
         """Build custom configuration step-by-step."""

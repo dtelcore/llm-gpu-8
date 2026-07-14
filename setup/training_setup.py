@@ -28,6 +28,7 @@ from logging_config import logger
 from setup.model_config import ModelConfigBuilder, estimate_vram_footprint, load_or_create_config
 from setup.dataset_setup import DatasetLoader, DatasetAnalyzer, load_dataset_interactive, recommend_dataset_for_config
 from setup.weight_init import setup_model_initialization, get_init_scales_for_config
+from setup.training_presets import apply_scale_preset, prompt_scale_preset
 
 
 # ============================================================================
@@ -98,6 +99,8 @@ class TrainingSetup:
         self.hyperparams = None
         self.init_scales = None
         self.data_dir = data_dir
+        self.scale_preset = None
+        self.preset_dataset = None
         self.setup_dir = Path('setup')
         self.config_file = self.setup_dir / 'training_config.json'
         logger.info(f"TrainingSetup initialized (data_dir={data_dir!r})")
@@ -114,10 +117,29 @@ class TrainingSetup:
         print("COMPLETE TRAINING SETUP WIZARD")
         print("="*70)
         
-        # Step 1: Model Configuration
-        print("\n[Step 1/4] MODEL CONFIGURATION")
+        # Step 1: Scaling preset (model + hyperparameters) or custom wizard
+        print("\n[Step 1/4] MODEL & TRAINING SCALE")
         print("-"*70)
-        self._setup_model_config(use_presets)
+        self.scale_preset = prompt_scale_preset()
+
+        if self.scale_preset in ('toy', 'tiny_stories'):
+            self.model_config, self.hyperparams, self.preset_dataset = apply_scale_preset(self.scale_preset)
+            builder = ModelConfigBuilder(vocab_size=100)
+            builder.config = self.model_config
+            builder.print_summary()
+            print(f"\n✓ Scale preset: {self.hyperparams['name']}")
+            print(f"  Batch size: {self.hyperparams['batch_size']}  |  "
+                  f"LR: {self.hyperparams['learning_rate']}  |  "
+                  f"Recommended dataset: {self.preset_dataset}")
+            logger.info(f"Scale preset applied: {self.scale_preset}")
+        else:
+            print("\n[Step 1a/4] MODEL CONFIGURATION")
+            print("-"*70)
+            self._setup_model_config(use_presets)
+            print("\n[Step 4/4] TRAINING HYPERPARAMETERS")
+            print("-"*70)
+            self._setup_hyperparameters(use_presets)
+            self.preset_dataset = None
         
         # Step 2: Dataset Selection
         print("\n[Step 2/4] DATASET SELECTION")
@@ -129,10 +151,15 @@ class TrainingSetup:
         print("-"*70)
         self._setup_weight_initialization()
         
-        # Step 4: Hyperparameters
-        print("\n[Step 4/4] TRAINING HYPERPARAMETERS")
-        print("-"*70)
-        self._setup_hyperparameters(use_presets)
+        # Step 4: Hyperparameters (only if not already set by scale preset)
+        if self.scale_preset in ('toy', 'tiny_stories'):
+            print("\n[Step 4/4] TRAINING HYPERPARAMETERS")
+            print("-"*70)
+            print(f"✓ Using hyperparameters from '{self.hyperparams['name']}' preset "
+                  f"(batch={self.hyperparams['batch_size']}, lr={self.hyperparams['learning_rate']})")
+            override = input("Override hyperparameters? (y/n) [default=n]: ").strip().lower()
+            if override == 'y':
+                self._setup_hyperparameters(use_presets)
         
         # Summary
         self._print_setup_summary()
@@ -149,14 +176,16 @@ class TrainingSetup:
         builder = ModelConfigBuilder(vocab_size=100)  # Default, will be updated
         
         if use_presets:
-            choice = input("\nUse preset or custom? (preset/custom/tiny/small/medium) [default=preset]: ").strip().lower()
+            print("\nModel presets:")
+            print("  toy / tiny_stories / small / medium / custom")
+            choice = input("\nUse preset or custom? [default=toy]: ").strip().lower()
             
-            if choice in ['tiny', 'small', 'medium']:
+            if choice in ['toy', 'tiny_stories', 'tiny', 'small', 'medium']:
                 self.model_config = builder.preset_config(choice)
             elif choice == 'custom':
                 self.model_config = builder.interactive_config()
             else:
-                self.model_config = builder.preset_config('tiny')
+                self.model_config = builder.preset_config('toy')
         else:
             self.model_config = builder.interactive_config()
         
@@ -167,13 +196,45 @@ class TrainingSetup:
         """Setup dataset selection."""
         logger.info("Setting up dataset...")
         
-        # Get recommendation based on model config
-        if self.model_config:
+        loader = DatasetLoader(data_dir=self.data_dir)
+
+        if self.preset_dataset:
+            recommended = self.preset_dataset
+            print(f"\n✓ Preset recommends dataset: {recommended}")
+        elif self.model_config:
             recommended = recommend_dataset_for_config(self.model_config)
             print(f"\n✓ Recommended dataset: {recommended}")
-        
-        # Load dataset (auto-discovers .txt files under self.data_dir as options)
-        self.dataset, self.dataset_name = load_dataset_interactive(self.model_config, data_dir=self.data_dir)
+        else:
+            recommended = None
+
+        if recommended:
+            use_recommended = input(
+                "Use recommended dataset? (y/n, or 'l' to pick from the list) [default=y]: "
+            ).strip().lower()
+
+            if use_recommended == 'l':
+                self.dataset, self.dataset_name = load_dataset_interactive(
+                    self.model_config, data_dir=self.data_dir,
+                )
+            elif use_recommended != 'n':
+                try:
+                    corpus = loader.load_by_name(recommended)
+                    self.dataset = corpus
+                    self.dataset_name = recommended
+                    DatasetAnalyzer(corpus).print_stats()
+                except (ValueError, FileNotFoundError) as exc:
+                    logger.warning(f"Could not load preset dataset {recommended!r}: {exc}")
+                    self.dataset, self.dataset_name = load_dataset_interactive(
+                        self.model_config, data_dir=self.data_dir,
+                    )
+            else:
+                self.dataset, self.dataset_name = load_dataset_interactive(
+                    self.model_config, data_dir=self.data_dir,
+                )
+        else:
+            self.dataset, self.dataset_name = load_dataset_interactive(
+                self.model_config, data_dir=self.data_dir,
+            )
         
         # Update vocab size in model config
         if self.dataset:
@@ -275,7 +336,9 @@ class TrainingSetup:
     
     def _save_configuration(self):
         """Save complete configuration to file."""
+        # In-memory corpus for the current session (not written to training_config.json).
         config = self.get_complete_config()
+        config['dataset']['corpus'] = self.dataset
         
         # Ensure setup directory exists
         self.setup_dir.mkdir(exist_ok=True)
@@ -297,8 +360,8 @@ class TrainingSetup:
             'model': self.model_config,
             'dataset': {
                 'name': self.dataset_name,
-                'corpus': self.dataset,
                 'vocab_size': self.model_config['vocab_size'],
+                'num_sentences': len(self.dataset) if self.dataset else 0,
             },
             'weight_initialization': self.init_scales,
             'hyperparameters': self.hyperparams,
@@ -352,11 +415,11 @@ def quickstart_training_setup(interactive: bool = True, data_dir: str = 'data') 
         # Use all defaults
         setup.model_config = {'vocab_size': 92, 'max_len': 8, 'embedding_dim': 16,
                              'num_heads': 2, 'num_layers': 1, 'dropout_prob': 0.0,
-                             'init_scale': 0.02, 'name': 'Tiny (Testing)'}
+                             'init_scale': 0.02, 'name': 'Toy Run'}
         setup.dataset = ["cuda training operational", "gpu acceleration optimizes"]
         setup.dataset_name = 'minimal'
         setup.init_scales = get_init_scales_for_config(setup.model_config)
-        setup.hyperparams = HYPERPARAMETER_PRESETS['conservative'].copy()
+        setup.hyperparams = apply_scale_preset('toy')[1]
         
         return setup.get_complete_config()
 

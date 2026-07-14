@@ -4,6 +4,7 @@ training/checkpoint.py
 Save/load model weights + tokenizer vocab + config snapshot to models/<run>/.
 """
 
+import copy
 import json
 from pathlib import Path
 from typing import Dict
@@ -30,8 +31,18 @@ def save_checkpoint(
     np.savez(out_dir / "weights.npz", **params.all_params())
     tokenizer.save_vocab(out_dir / "vocab.json")
 
+    # The training corpus can be large (thousands of sentences); keep it out of
+    # config.json (which should stay a small, human-readable snapshot) and store
+    # it in its own file instead. It's still restored on load so resuming works.
+    config_to_save = copy.deepcopy(config)
+    corpus = config_to_save.get("dataset", {}).pop("corpus", None)
+    if corpus is not None:
+        with open(out_dir / "corpus.json", "w", encoding="utf-8") as f:
+            json.dump(corpus, f, ensure_ascii=False)
+        config_to_save["dataset"]["num_sentences"] = len(corpus)
+
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+        json.dump(config_to_save, f, indent=2, ensure_ascii=False)
 
     with open(out_dir / "state.json", "w", encoding="utf-8") as f:
         json.dump({"step": step, "epoch": epoch}, f, indent=2)
@@ -46,6 +57,11 @@ def load_checkpoint(checkpoint_dir: str):
 
     with open(ckpt_dir / "config.json", "r", encoding="utf-8") as f:
         full_config = json.load(f)
+
+    corpus_path = ckpt_dir / "corpus.json"
+    if corpus_path.exists():
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            full_config.setdefault("dataset", {})["corpus"] = json.load(f)
 
     tokenizer = CharacterGPTTokenizer.load_vocab(ckpt_dir / "vocab.json")
     gpt_config = GPTConfig(full_config["model"])

@@ -1,15 +1,11 @@
 """
 model/gpt.py
 
-A from-scratch character-level GPT. Forward compute for every linear /
-layernorm / gelu / softmax runs through the PyCUDA kernels in
-model/cuda/ops.py (via model/layers.py). Backward is a hand-derived,
-analytic NumPy backprop over the cached forward intermediates -- host
-compute is fine here since batch_size and max_len are tiny (GT 730 VRAM
-budget targets ~1MB param models), and it keeps gradient math auditable.
-
-Sequences are processed one at a time (no batched attention); the
-training loop sums/averages gradients across a mini-batch.
+A from-scratch character-level GPT. Forward compute runs through PyCUDA
+kernels (model/cuda/ops.py via model/layers.py) with batched sequences
+stacked as [B*T, C]. Batched CPU attention runs one qkv download per layer for
+the whole mini-batch. A fused GPU attention kernel (causal_mha_fp32) is also
+compiled but disabled by default on GT 730. Backward is analytic NumPy.
 """
 
 from typing import Dict, List, Tuple
@@ -18,10 +14,14 @@ import numpy as np
 
 from model import layers
 from model.config import GPTConfig
+from model.cuda import ops as cuda_ops
 from model.trace import TraceContext
 from model.weights import ModelParameters
 
 EPS = 1e-5
+# Fused GPU attention + full GPU training path (forward, backward, optimizer on device).
+_USE_GPU_ATTENTION = True
+_GPU_TRAINING = True
 
 
 def _gelu_grad(x: np.ndarray) -> np.ndarray:
@@ -61,123 +61,558 @@ def _layernorm_backward(dout: np.ndarray, xhat: np.ndarray, invstd: np.ndarray, 
     return dx, dgamma, dbeta
 
 
+def _qkv_to_heads(qkv: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int):
+    """qkv [B*T, 3C] -> q_h,k_h,v_h each [B, H, T, hd]."""
+    c = num_heads * head_dim
+    q, k, v = np.split(qkv, 3, axis=-1)
+    q_h = q.reshape(batch_size, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    k_h = k.reshape(batch_size, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    v_h = v.reshape(batch_size, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    return q_h, k_h, v_h
+
+
+def _batched_attention_host(
+    qkv: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int, scale: float,
+):
+    """CPU causal attention for a stacked batch. qkv is [B*T, 3C]."""
+    B, T, H, hd = batch_size, seq_len, num_heads, head_dim
+    C = H * hd
+    causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+    q_h, k_h, v_h = _qkv_to_heads(qkv, B, T, H, hd)
+    probs_h = np.empty((B, H, T, T), dtype=np.float32)
+    attn_concat = np.empty((B * T, C), dtype=np.float32)
+
+    for b in range(B):
+        head_out = np.empty((H, T, hd), dtype=np.float32)
+        for hidx in range(H):
+            raw = (q_h[b, hidx] @ k_h[b, hidx].T) * scale
+            raw = np.where(causal_mask, -1e9, raw).astype(np.float32)
+            shifted = raw - np.max(raw, axis=-1, keepdims=True)
+            exp = np.exp(shifted)
+            probs = exp / np.sum(exp, axis=-1, keepdims=True)
+            probs_h[b, hidx] = probs
+            head_out[hidx] = probs @ v_h[b, hidx]
+        attn_concat[b * T:(b + 1) * T] = head_out.transpose(1, 0, 2).reshape(T, C)
+
+    return attn_concat, probs_h, q_h, k_h, v_h
+
+
 class GPTModel:
     def __init__(self, config: GPTConfig, params: ModelParameters) -> None:
         self.config = config
         self.params = params
 
     # ------------------------------------------------------------------
-    # Forward
+    # Forward (batched)
     # ------------------------------------------------------------------
 
-    def forward(self, token_ids: np.ndarray, tracer: TraceContext = None) -> Tuple[np.ndarray, Dict]:
-        """token_ids: 1D int array of length T (<= config.max_len). Returns (logits [T,V], cache)."""
+    def forward_batch(
+        self, token_ids_batch: np.ndarray, tracer: TraceContext = None,
+    ) -> Tuple[np.ndarray, Dict]:
+        """token_ids_batch: [B, T] int. Returns (logits [B, T, V], cache)."""
         cfg = self.config
         w = self.params.weights
         b = self.params.biases
         dw = self.params.device_weights
         db = self.params.device_biases
-        T = len(token_ids)
 
-        tok_emb = w["token_embedding"][token_ids]  # [T, C]
+        token_ids_batch = np.asarray(token_ids_batch, dtype=np.int64)
+        if token_ids_batch.ndim == 1:
+            token_ids_batch = token_ids_batch.reshape(1, -1)
+        B, T = token_ids_batch.shape
+        H, hd = cfg.num_heads, cfg.head_dim
+        scale = 1.0 / np.sqrt(hd)
+
+        cache: Dict = {
+            "ids": token_ids_batch, "B": B, "T": T, "batched": True, "gpu": _GPU_TRAINING,
+        }
+
+        if _GPU_TRAINING:
+            h_d = cuda_ops.embedding_lookup(
+                token_ids_batch.astype(np.int32),
+                dw["token_embedding"], dw["position_embedding"], T,
+            )
+            cache["layers"] = []
+
+            for layer in range(cfg.num_layers):
+                prefix = f"layer_{layer}"
+                layer_cache: Dict = {"B": B, "T": T, "gpu": True}
+
+                ln1_out_d, ln1_xhat_d, ln1_invstd_d = cuda_ops.layernorm_with_cache(
+                    h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"],
+                )
+                layer_cache["ln1_out_d"] = ln1_out_d
+                layer_cache["ln1_xhat_d"] = ln1_xhat_d
+                layer_cache["ln1_invstd_d"] = ln1_invstd_d
+
+                attn_out_d, attn_cache = self._attention_forward_batch(
+                    ln1_out_d, None, prefix, B, T, H, hd, scale, tracer=tracer,
+                )
+                layer_cache["attn"] = attn_cache
+                h_d = layers.add_residual(h_d, attn_out_d)
+
+                ln2_out_d, ln2_xhat_d, ln2_invstd_d = cuda_ops.layernorm_with_cache(
+                    h_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"],
+                )
+                layer_cache["ln2_out_d"] = ln2_out_d
+                layer_cache["ln2_xhat_d"] = ln2_xhat_d
+                layer_cache["ln2_invstd_d"] = ln2_invstd_d
+
+                mlp_out_d, mlp_cache = self._mlp_forward_batch(
+                    ln2_out_d, None, prefix, tracer=tracer,
+                )
+                layer_cache["mlp"] = mlp_cache
+                h_d = layers.add_residual(h_d, mlp_out_d)
+
+                if tracer is not None and tracer.trace_neurons and tracer.active_step:
+                    tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
+
+                cache["layers"].append(layer_cache)
+
+            h_final_d, final_xhat_d, final_invstd_d = cuda_ops.layernorm_with_cache(
+                h_d, dw["final_ln_gamma"], db["final_ln_beta"],
+            )
+            cache["h_final_d"] = h_final_d
+            cache["final_xhat_d"] = final_xhat_d
+            cache["final_invstd_d"] = final_invstd_d
+
+            logits_d = layers.linear(
+                h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
+            )
+            cache["logits_d"] = logits_d
+            logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size) if (
+                tracer is not None and (tracer.trace_logits or tracer.trace_tokens)
+            ) else np.empty((B, T, cfg.vocab_size), dtype=np.float32)
+            cache["logits"] = logits
+            return logits, cache
+
+        tok_emb = w["token_embedding"][token_ids_batch]  # [B, T, C]
         pos_emb = w["position_embedding"][:T]  # [T, C]
-        x0 = (tok_emb + pos_emb).astype(np.float32)
+        x0 = (tok_emb + pos_emb).astype(np.float32).reshape(B * T, cfg.embedding_dim)
 
-        cache: Dict = {"ids": np.asarray(token_ids), "x0": x0, "layers": []}
-        h = x0
+        cache["x0"] = x0
+        cache["layers"] = []
+        h_d = cuda_ops.to_device(x0)
 
         for layer in range(cfg.num_layers):
             prefix = f"layer_{layer}"
-            layer_cache: Dict = {}
+            layer_cache: Dict = {"B": B, "T": T}
 
-            ln1_out, xhat1, invstd1 = _layernorm_cache(h, w[f"{prefix}.ln1_gamma"], b[f"{prefix}.ln1_beta"])
-            layer_cache["ln1_in"] = h
-            layer_cache["ln1_xhat"], layer_cache["ln1_invstd"] = xhat1, invstd1
+            ln1_in = cuda_ops.to_host(h_d)
+            ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"] = _layernorm_cache(
+                ln1_in, w[f"{prefix}.ln1_gamma"], b[f"{prefix}.ln1_beta"],
+            )
+            layer_cache["ln1_in"] = ln1_in
 
-            attn_out, attn_cache = self._attention_forward(
-                ln1_out, prefix, tracer=tracer,
+            ln1_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"])
+            attn_out_d, attn_cache = self._attention_forward_batch(
+                ln1_out_d, ln1_out, prefix, B, T, H, hd, scale, tracer=tracer,
             )
             layer_cache["attn"] = attn_cache
-            h = h + attn_out
-            layer_cache["resid1_out"] = h
+            h_d = layers.add_residual(h_d, attn_out_d)
 
-            ln2_out, xhat2, invstd2 = _layernorm_cache(h, w[f"{prefix}.ln2_gamma"], b[f"{prefix}.ln2_beta"])
-            layer_cache["ln2_in"] = h
-            layer_cache["ln2_xhat"], layer_cache["ln2_invstd"] = xhat2, invstd2
+            ln2_in = cuda_ops.to_host(h_d)
+            ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"] = _layernorm_cache(
+                ln2_in, w[f"{prefix}.ln2_gamma"], b[f"{prefix}.ln2_beta"],
+            )
+            layer_cache["ln2_in"] = ln2_in
 
-            mlp_out, mlp_cache = self._mlp_forward(ln2_out, prefix, tracer=tracer)
+            ln2_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"])
+            mlp_out_d, mlp_cache = self._mlp_forward_batch(ln2_out_d, ln2_out, prefix, tracer=tracer)
             layer_cache["mlp"] = mlp_cache
-            h = h + mlp_out
-            layer_cache["resid2_out"] = h
+            h_d = layers.add_residual(h_d, mlp_out_d)
 
-            if tracer is not None:
-                tracer.dump_neurons(f"{prefix}.resid2_out", h)
+            if tracer is not None and tracer.trace_neurons and tracer.active_step:
+                tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
 
             cache["layers"].append(layer_cache)
 
-        h_final, xhat_f, invstd_f = _layernorm_cache(h, w["final_ln_gamma"], b["final_ln_beta"])
-        cache["h_pre_final_ln"] = h
-        cache["final_xhat"], cache["final_invstd"] = xhat_f, invstd_f
-        cache["h_final"] = h_final
+        cache["h_pre_final_ln"] = cuda_ops.to_host(h_d)
+        cache["h_final"], cache["final_xhat"], cache["final_invstd"] = _layernorm_cache(
+            cache["h_pre_final_ln"], w["final_ln_gamma"], b["final_ln_beta"],
+        )
 
-        logits = layers.linear(h_final, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head")
+        h_final_d = layers.layernorm(h_d, dw["final_ln_gamma"], db["final_ln_beta"])
+        logits_d = layers.linear(h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head")
+        logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
         cache["logits"] = logits
 
         return logits, cache
 
-    def _attention_forward(self, ln1_out: np.ndarray, prefix: str, tracer: TraceContext = None):
+    def forward(self, token_ids: np.ndarray, tracer: TraceContext = None) -> Tuple[np.ndarray, Dict]:
+        """Single-sequence forward (wraps forward_batch with B=1)."""
+        logits, cache = self.forward_batch(np.asarray(token_ids).reshape(1, -1), tracer=tracer)
+        return logits[0], _squeeze_batch_cache(cache)
+
+    def _attention_forward_batch(
+        self, ln1_out_d, ln1_out_host: np.ndarray, prefix: str,
+        B: int, T: int, H: int, hd: int, scale: float, tracer: TraceContext = None,
+    ):
+        dw, db = self.params.device_weights, self.params.device_biases
+
+        qkv_d = layers.linear(
+            ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+            tracer=tracer, name=f"{prefix}.qkv",
+        )
+
+        if _USE_GPU_ATTENTION:
+            q, k, v = cuda_ops.split_qkv(qkv_d, H * hd)
+            attn_concat_d, probs_d = cuda_ops.causal_self_attention(q, k, v, B, T, H, hd, scale)
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+            attn_cache = {
+                "ln1_out_d": ln1_out_d, "q_d": q, "k_d": k, "v_d": v,
+                "probs_d": probs_d, "attn_concat_d": attn_concat_d,
+                "scale": scale, "B": B, "T": T, "gpu": True,
+            }
+        else:
+            qkv = cuda_ops.to_host(qkv_d)
+            attn_concat, probs_h, q_h, k_h, v_h = _batched_attention_host(
+                qkv, B, T, H, hd, scale,
+            )
+            attn_concat_d = cuda_ops.to_device(attn_concat)
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+            attn_cache = {
+                "ln1_out": ln1_out_host, "q_h": q_h, "k_h": k_h, "v_h": v_h,
+                "probs_h": probs_h, "attn_concat": attn_concat,
+                "causal_mask": np.triu(np.ones((T, T), dtype=bool), k=1),
+                "scale": scale, "B": B, "T": T,
+            }
+
+        if tracer is not None and tracer.trace_neurons and tracer.active_step:
+            tracer.dump_neurons(f"{prefix}.attn_out", cuda_ops.to_host(attn_out_d))
+
+        return attn_out_d, attn_cache
+
+    def _mlp_forward_batch(self, ln2_out_d, ln2_out_host: np.ndarray, prefix: str, tracer: TraceContext = None):
+        dw, db = self.params.device_weights, self.params.device_biases
+
+        hidden_d = layers.linear(
+            ln2_out_d, dw[f"{prefix}.mlp_expand"], db[f"{prefix}.mlp_expand_bias"],
+            tracer=tracer, name=f"{prefix}.mlp_expand",
+        )
+        act_d = layers.gelu(hidden_d)
+        mlp_out_d = layers.linear(
+            act_d, dw[f"{prefix}.mlp_contract"], db[f"{prefix}.mlp_contract_bias"],
+            tracer=tracer, name=f"{prefix}.mlp_contract",
+        )
+
+        if tracer is not None and tracer.trace_neurons and tracer.active_step:
+            tracer.dump_neurons(f"{prefix}.mlp_out", cuda_ops.to_host(mlp_out_d))
+
+        if _GPU_TRAINING and ln2_out_host is None:
+            mlp_cache = {
+                "ln2_out_d": ln2_out_d, "hidden_d": hidden_d, "act_d": act_d, "gpu": True,
+            }
+        else:
+            mlp_cache = {
+                "ln2_out": ln2_out_host,
+                "hidden": cuda_ops.to_host(hidden_d),
+                "act": cuda_ops.to_host(act_d),
+            }
+        return mlp_out_d, mlp_cache
+
+    # ------------------------------------------------------------------
+    # Backward (batched)
+    # ------------------------------------------------------------------
+
+    def backward(self, cache: Dict, dlogits) -> Dict:
+        """Accepts dlogits [T,V] or [B,T,V] (NumPy) or device logits grad."""
+        if cache.get("gpu") and _GPU_TRAINING:
+            return self.backward_batch_gpu(cache, dlogits)
+        if hasattr(dlogits, "get"):
+            dlogits = dlogits.get()
+        if dlogits.ndim == 2:
+            dlogits = dlogits.reshape(1, *dlogits.shape)
+        if not cache.get("batched"):
+            return self._backward_unbatched(cache, dlogits[0])
+        return self.backward_batch(cache, dlogits)
+
+    def backward_batch_gpu(self, cache: Dict, dlogits_d) -> Dict:
+        """Full backward on GPU. dlogits_d: [B*T, V] device array."""
+        import pycuda.gpuarray as gpuarray
+
         cfg = self.config
-        w, b = self.params.weights, self.params.biases
         dw, db = self.params.device_weights, self.params.device_biases
-        T, C = ln1_out.shape
-        H, hd = cfg.num_heads, cfg.head_dim
+        B, T = cache["B"], cache["T"]
+        C, V = cfg.embedding_dim, cfg.vocab_size
+        grads: Dict = {}
 
-        qkv = layers.linear(ln1_out, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"], tracer=tracer, name=f"{prefix}.qkv")
-        q, k, v = np.split(qkv, 3, axis=-1)
-        q_h = q.reshape(T, H, hd).transpose(1, 0, 2)  # [H,T,hd]
-        k_h = k.reshape(T, H, hd).transpose(1, 0, 2)
-        v_h = v.reshape(T, H, hd).transpose(1, 0, 2)
+        if not hasattr(dlogits_d, "get"):
+            dlogits_d = cuda_ops.to_device(np.asarray(dlogits_d, dtype=np.float32).reshape(B * T, V))
 
-        causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
-        scale = 1.0 / np.sqrt(hd)
+        d_h, d_lm_head, d_lm_bias = cuda_ops.linear_backward(
+            dlogits_d, cache["h_final_d"], dw["lm_head"],
+        )
+        grads["lm_head"] = d_lm_head
+        grads["lm_head_bias"] = d_lm_bias
 
-        probs_h = np.empty((H, T, T), dtype=np.float32)
-        head_out = np.empty((H, T, hd), dtype=np.float32)
-        for hidx in range(H):
-            raw = (q_h[hidx] @ k_h[hidx].T) * scale
-            raw = np.where(causal_mask, -1e9, raw).astype(np.float32)
-            probs = layers.softmax(raw)
-            probs_h[hidx] = probs
-            head_out[hidx] = probs @ v_h[hidx]
+        d_h, d_final_gamma, d_final_beta = cuda_ops.layernorm_backward(
+            d_h, cache["final_xhat_d"], cache["final_invstd_d"], dw["final_ln_gamma"],
+        )
+        grads["final_ln_gamma"] = d_final_gamma
+        grads["final_ln_beta"] = d_final_beta
 
-        attn_concat = head_out.transpose(1, 0, 2).reshape(T, C)
-        attn_out = layers.linear(attn_concat, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"], tracer=tracer, name=f"{prefix}.attn_out")
+        for layer in reversed(range(cfg.num_layers)):
+            prefix = f"layer_{layer}"
+            layer_cache = cache["layers"][layer]
 
-        if tracer is not None:
-            tracer.dump_neurons(f"{prefix}.attn_out", attn_out)
+            d_mlp_out = d_h
+            d_resid1 = d_h
 
-        cache = {
-            "ln1_out": ln1_out, "q_h": q_h, "k_h": k_h, "v_h": v_h,
-            "probs_h": probs_h, "attn_concat": attn_concat, "causal_mask": causal_mask, "scale": scale,
+            d_ln2_out, mlp_grads = self._mlp_backward_gpu(d_mlp_out, layer_cache["mlp"], prefix, dw)
+            grads.update(mlp_grads)
+
+            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = cuda_ops.layernorm_backward(
+                d_ln2_out, layer_cache["ln2_xhat_d"], layer_cache["ln2_invstd_d"],
+                dw[f"{prefix}.ln2_gamma"],
+            )
+            grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
+            grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+
+            d_h = cuda_ops.add_arrays(d_resid1, d_h_from_ln2)
+
+            d_attn_out = d_h
+            d_resid0 = d_h
+
+            d_ln1_out, attn_grads = self._attention_backward_batch_gpu(
+                d_attn_out, layer_cache["attn"], prefix, dw,
+            )
+            grads.update(attn_grads)
+
+            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = cuda_ops.layernorm_backward(
+                d_ln1_out, layer_cache["ln1_xhat_d"], layer_cache["ln1_invstd_d"],
+                dw[f"{prefix}.ln1_gamma"],
+            )
+            grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
+            grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+
+            d_h = cuda_ops.add_arrays(d_resid0, d_h_from_ln1)
+
+        d_tok, d_pos = cuda_ops.embed_backward(
+            cache["ids"].astype(np.int32), d_h, cfg.vocab_size, C,
+        )
+        grads["token_embedding"] = d_tok
+        grads["position_embedding"] = d_pos
+        return grads
+
+    def _mlp_backward_gpu(self, d_mlp_out, mlp_cache: Dict, prefix: str, dw: Dict):
+        act_d = mlp_cache["act_d"]
+        hidden_d = mlp_cache["hidden_d"]
+        ln2_out_d = mlp_cache["ln2_out_d"]
+
+        d_act, d_contract, d_contract_b = cuda_ops.linear_backward(
+            d_mlp_out, act_d, dw[f"{prefix}.mlp_contract"],
+        )
+        d_hidden = cuda_ops.gelu_backward(hidden_d, d_act)
+        d_ln2_out, d_expand, d_expand_b = cuda_ops.linear_backward(
+            d_hidden, ln2_out_d, dw[f"{prefix}.mlp_expand"],
+        )
+        grads = {
+            f"{prefix}.mlp_contract": d_contract,
+            f"{prefix}.mlp_contract_bias": d_contract_b,
+            f"{prefix}.mlp_expand": d_expand,
+            f"{prefix}.mlp_expand_bias": d_expand_b,
         }
-        return attn_out, cache
+        return d_ln2_out, grads
 
-    def _mlp_forward(self, ln2_out: np.ndarray, prefix: str, tracer: TraceContext = None):
-        dw, db = self.params.device_weights, self.params.device_biases
-        hidden = layers.linear(ln2_out, dw[f"{prefix}.mlp_expand"], db[f"{prefix}.mlp_expand_bias"], tracer=tracer, name=f"{prefix}.mlp_expand")
-        act = layers.gelu(hidden)
-        mlp_out = layers.linear(act, dw[f"{prefix}.mlp_contract"], db[f"{prefix}.mlp_contract_bias"], tracer=tracer, name=f"{prefix}.mlp_contract")
+    def _attention_backward_batch_gpu(self, d_attn_out, attn_cache: Dict, prefix: str, dw: Dict):
+        import pycuda.gpuarray as gpuarray
 
-        if tracer is not None:
-            tracer.dump_neurons(f"{prefix}.mlp_out", mlp_out)
+        B, T = attn_cache["B"], attn_cache["T"]
+        H, hd = self.config.num_heads, self.config.head_dim
+        C = H * hd
+        scale = attn_cache["scale"]
+        ln1_out_d = attn_cache["ln1_out_d"]
+        q_d, k_d, v_d = attn_cache["q_d"], attn_cache["k_d"], attn_cache["v_d"]
+        probs_d = attn_cache["probs_d"]
+        attn_concat_d = attn_cache["attn_concat_d"]
 
-        return mlp_out, {"ln2_out": ln2_out, "hidden": hidden, "act": act}
+        d_attn_out_flat = d_attn_out.reshape(B * T, C)
+        d_attn_concat, d_out_proj, d_out_bias = cuda_ops.linear_backward(
+            d_attn_out_flat, attn_concat_d, dw[f"{prefix}.attn_out_proj"],
+        )
 
-    # ------------------------------------------------------------------
-    # Backward: analytic gradients over the cached forward intermediates.
-    # ------------------------------------------------------------------
+        d_q_h = np.zeros(cuda_ops.to_host(q_d).shape, dtype=np.float32)
+        d_k_h = np.zeros_like(d_q_h)
+        d_v_h = np.zeros_like(d_q_h)
+        probs_h = probs_d.reshape(B, H, T, T)
 
-    def backward(self, cache: Dict, dlogits: np.ndarray) -> Dict[str, np.ndarray]:
+        for b in range(B):
+            row0 = b * T
+            row1 = (b + 1) * T
+            d_head_np = cuda_ops.to_host(d_attn_concat[row0:row1]).reshape(T, H, hd).transpose(1, 0, 2)
+            for hidx in range(H):
+                cols = slice(hidx * hd, (hidx + 1) * hd)
+                q_bh = q_d[row0:row1, cols]
+                k_bh = k_d[row0:row1, cols]
+                v_bh = v_d[row0:row1, cols]
+                probs_bh = probs_h[b, hidx]
+                d_head_bh = cuda_ops.to_device(d_head_np[hidx].astype(np.float32))
+
+                d_probs = cuda_ops.matmul(d_head_bh, v_bh.T)
+                d_v_bh = cuda_ops.matmul(probs_bh.T, d_head_bh)
+
+                d_probs_h = cuda_ops.to_host(d_probs)
+                probs_bh_h = cuda_ops.to_host(probs_bh)
+                row_dot = np.sum(d_probs_h * probs_bh_h, axis=1, keepdims=True).astype(np.float32)
+                d_raw = cuda_ops.to_device((probs_bh_h * (d_probs_h - row_dot) * scale).astype(np.float32))
+
+                d_q_bh = cuda_ops.matmul(d_raw, k_bh)
+                d_k_bh = cuda_ops.matmul(d_raw.T, q_bh)
+
+                d_q_h[row0:row1, cols] += cuda_ops.to_host(d_q_bh)
+                d_k_h[row0:row1, cols] += cuda_ops.to_host(d_k_bh)
+                d_v_h[row0:row1, cols] += cuda_ops.to_host(d_v_bh)
+
+        d_q = cuda_ops.to_device(d_q_h)
+        d_k = cuda_ops.to_device(d_k_h)
+        d_v = cuda_ops.to_device(d_v_h)
+
+        d_qkv = gpuarray.empty((B * T, 3 * C), dtype=np.float32)
+        d_qkv[:, :C] = d_q
+        d_qkv[:, C:2 * C] = d_k
+        d_qkv[:, 2 * C:] = d_v
+
+        d_ln1_out, d_qkv_w, d_qkv_b = cuda_ops.linear_backward(
+            d_qkv, ln1_out_d, dw[f"{prefix}.qkv_proj"],
+        )
+
+        grads = {
+            f"{prefix}.attn_out_proj": d_out_proj,
+            f"{prefix}.attn_out_bias": d_out_bias,
+            f"{prefix}.qkv_proj": d_qkv_w,
+            f"{prefix}.qkv_bias": d_qkv_b,
+        }
+        return d_ln1_out, grads
+
+    def backward_batch(self, cache: Dict, dlogits: np.ndarray) -> Dict[str, np.ndarray]:
+        """dlogits: [B, T, V]. Weight grads are summed over the batch."""
+        cfg = self.config
+        w = self.params.weights
+        B, T = cache["B"], cache["T"]
+        C = cfg.embedding_dim
+        V = cfg.vocab_size
+        grads: Dict[str, np.ndarray] = {}
+
+        dlogits_flat = dlogits.reshape(B * T, V)
+        h_final = cache["h_final"]
+
+        d_lm_head = h_final.T @ dlogits_flat
+        d_lm_head_bias = np.sum(dlogits_flat, axis=0)
+        d_h_final = dlogits_flat @ w["lm_head"].T
+        grads["lm_head"] = d_lm_head
+        grads["lm_head_bias"] = d_lm_head_bias
+
+        d_h, d_final_gamma, d_final_beta = _layernorm_backward(
+            d_h_final, cache["final_xhat"], cache["final_invstd"], w["final_ln_gamma"],
+        )
+        grads["final_ln_gamma"] = d_final_gamma
+        grads["final_ln_beta"] = d_final_beta
+
+        for layer in reversed(range(cfg.num_layers)):
+            prefix = f"layer_{layer}"
+            layer_cache = cache["layers"][layer]
+
+            d_mlp_out = d_h
+            d_resid1 = d_h
+
+            d_ln2_out, d_mlp_grads = self._mlp_backward(d_mlp_out, layer_cache["mlp"], prefix, w)
+            grads.update(d_mlp_grads)
+
+            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = _layernorm_backward(
+                d_ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"], w[f"{prefix}.ln2_gamma"],
+            )
+            grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
+            grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+
+            d_h = d_resid1 + d_h_from_ln2
+
+            d_attn_out = d_h
+            d_resid0 = d_h
+
+            d_ln1_out, d_attn_grads = self._attention_backward_batch(
+                d_attn_out, layer_cache["attn"], prefix, w,
+            )
+            grads.update(d_attn_grads)
+
+            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = _layernorm_backward(
+                d_ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"], w[f"{prefix}.ln1_gamma"],
+            )
+            grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
+            grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+
+            d_h = d_resid0 + d_h_from_ln1
+
+        d_h = d_h.reshape(B, T, C)
+        d_token_embedding = np.zeros_like(w["token_embedding"])
+        d_position_embedding = np.zeros_like(w["position_embedding"])
+        for b in range(B):
+            np.add.at(d_token_embedding, cache["ids"][b], d_h[b])
+            d_position_embedding[:T] += d_h[b]
+
+        grads["token_embedding"] = d_token_embedding
+        grads["position_embedding"] = d_position_embedding
+        return grads
+
+    def _attention_backward_batch(self, d_attn_out: np.ndarray, attn_cache: Dict, prefix: str, w: Dict):
+        B, T = attn_cache["B"], attn_cache["T"]
+        H, hd = self.config.num_heads, self.config.head_dim
+        C = H * hd
+        ln1_out = attn_cache["ln1_out"]
+        q_h, k_h, v_h = attn_cache["q_h"], attn_cache["k_h"], attn_cache["v_h"]
+        probs_h, scale = attn_cache["probs_h"], attn_cache["scale"]
+
+        d_attn_out_flat = d_attn_out.reshape(B * T, C)
+        attn_concat = attn_cache["attn_concat"]
+
+        d_out_proj = attn_concat.T @ d_attn_out_flat
+        d_out_bias = np.sum(d_attn_out_flat, axis=0)
+        d_attn_concat = d_attn_out_flat @ w[f"{prefix}.attn_out_proj"].T
+        d_head_out = d_attn_concat.reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+
+        d_q = np.zeros((B, T, C), dtype=np.float32)
+        d_k = np.zeros((B, T, C), dtype=np.float32)
+        d_v = np.zeros((B, T, C), dtype=np.float32)
+
+        for b in range(B):
+            for hidx in range(H):
+                probs = probs_h[b, hidx]
+                d_probs = d_head_out[b, hidx] @ v_h[b, hidx].T
+                d_v_h = probs.T @ d_head_out[b, hidx]
+
+                row_dot = np.sum(d_probs * probs, axis=-1, keepdims=True)
+                d_raw = probs * (d_probs - row_dot)
+                d_raw *= scale
+
+                d_q_h = d_raw @ k_h[b, hidx]
+                d_k_h = d_raw.T @ q_h[b, hidx]
+
+                cols = slice(hidx * hd, (hidx + 1) * hd)
+                d_q[b, :, cols] += d_q_h
+                d_k[b, :, cols] += d_k_h
+                d_v[b, :, cols] += d_v_h
+
+        d_qkv = np.concatenate([d_q, d_k, d_v], axis=-1).reshape(B * T, 3 * C)
+        d_qkv_w = ln1_out.T @ d_qkv
+        d_qkv_b = np.sum(d_qkv, axis=0)
+        d_ln1_out = d_qkv @ w[f"{prefix}.qkv_proj"].T
+
+        grads = {
+            f"{prefix}.attn_out_proj": d_out_proj,
+            f"{prefix}.attn_out_bias": d_out_bias,
+            f"{prefix}.qkv_proj": d_qkv_w,
+            f"{prefix}.qkv_bias": d_qkv_b,
+        }
+        return d_ln1_out, grads
+
+    def _backward_unbatched(self, cache: Dict, dlogits: np.ndarray) -> Dict[str, np.ndarray]:
+        """Legacy path for caches without batch metadata (q_h shape [H,T,hd])."""
         cfg = self.config
         w = self.params.weights
         grads: Dict[str, np.ndarray] = {}
@@ -199,9 +634,8 @@ class GPTModel:
             prefix = f"layer_{layer}"
             layer_cache = cache["layers"][layer]
 
-            # residual 2: h = resid1_out + mlp_out
             d_mlp_out = d_h
-            d_resid1 = d_h  # gradient also flows straight through the residual
+            d_resid1 = d_h
 
             d_ln2_out, d_mlp_grads = self._mlp_backward(d_mlp_out, layer_cache["mlp"], prefix, w)
             grads.update(d_mlp_grads)
@@ -212,9 +646,8 @@ class GPTModel:
             grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
             grads[f"{prefix}.ln2_beta"] = d_ln2_beta
 
-            d_h = d_resid1 + d_h_from_ln2  # combine residual + layernorm branch
+            d_h = d_resid1 + d_h_from_ln2
 
-            # residual 1: h = ln1_in + attn_out
             d_attn_out = d_h
             d_resid0 = d_h
 
@@ -229,7 +662,6 @@ class GPTModel:
 
             d_h = d_resid0 + d_h_from_ln1
 
-        # Embeddings
         T = len(cache["ids"])
         d_token_embedding = np.zeros_like(w["token_embedding"])
         np.add.at(d_token_embedding, cache["ids"], d_h)
@@ -238,7 +670,6 @@ class GPTModel:
 
         grads["token_embedding"] = d_token_embedding
         grads["position_embedding"] = d_position_embedding
-
         return grads
 
     def _mlp_backward(self, d_mlp_out: np.ndarray, mlp_cache: Dict, prefix: str, w: Dict):
@@ -344,6 +775,30 @@ class GPTModel:
             next_id = int(rng.choice(len(probs), p=probs))
             ids.append(next_id)
         return ids
+
+
+def _squeeze_batch_cache(cache: Dict) -> Dict:
+    """Convert B=1 batched cache to legacy shapes for single-seq consumers."""
+    if cache.get("B", 1) != 1:
+        return cache
+    out = dict(cache)
+    out["ids"] = cache["ids"][0]
+    out["batched"] = False
+    if cache.get("gpu"):
+        out.pop("B", None)
+        out.pop("T", None)
+        return out
+    for layer_cache in out["layers"]:
+        attn = layer_cache["attn"]
+        B, H, T, hd = attn["B"], attn["q_h"].shape[1], attn["T"], attn["q_h"].shape[3]
+        attn["q_h"] = attn["q_h"][0]
+        attn["k_h"] = attn["k_h"][0]
+        attn["v_h"] = attn["v_h"][0]
+        attn["probs_h"] = attn["probs_h"][0]
+        del attn["B"]
+    out.pop("B", None)
+    out.pop("T", None)
+    return out
 
 
 def _softmax_1d(x: np.ndarray) -> np.ndarray:

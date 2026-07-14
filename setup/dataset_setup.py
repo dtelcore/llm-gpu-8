@@ -132,10 +132,14 @@ class DatasetLoader:
         self.datasets = {}
         self.current_dataset = None
         self.data_dir = data_dir
+        # Files found under data_dir but not yet read into memory. Kept separate
+        # from self.datasets so large corpora (hundreds of MB) aren't loaded just
+        # to populate the selection menu -- only the file actually chosen gets read.
+        self._discovered: Dict[str, Path] = {}
         logger.info("DatasetLoader initialized")
         
         if auto_discover:
-            self.load_from_directory(self.data_dir)
+            self.discover_directory(self.data_dir)
     
     def load_builtin(self, dataset_name: str) -> List[str]:
         """Load a built-in dataset.
@@ -163,6 +167,17 @@ class DatasetLoader:
         
         logger.info(f"Loaded built-in dataset: {dataset_name} ({len(corpus)} sentences)")
         return corpus
+
+    def load_by_name(self, dataset_name: str) -> List[str]:
+        """Load a dataset by built-in name or discovered file stem."""
+        if dataset_name in BUILTIN_DATASETS:
+            return self.load_builtin(dataset_name)
+        if dataset_name in self._discovered:
+            return self.load_from_file(str(self._discovered[dataset_name]), dataset_name)
+        if dataset_name in self.datasets:
+            return self.get_corpus(dataset_name)
+        available = list(BUILTIN_DATASETS.keys()) + list(self._discovered.keys())
+        raise ValueError(f"Unknown dataset: {dataset_name}. Available: {available}")
     
     def load_from_file(self, filepath: str, dataset_name: Optional[str] = None) -> List[str]:
         """Load dataset from text file.
@@ -206,14 +221,45 @@ class DatasetLoader:
         logger.info(f"Loaded dataset from file: {filepath} ({len(corpus)} sentences)")
         return corpus
     
-    def load_from_directory(self, directory: str = 'data', 
-                           pattern: str = '*.txt') -> Dict[str, List[str]]:
-        """Discover and load all datasets from directory.
-        
+    def discover_directory(self, directory: str = 'data',
+                            pattern: str = '*.txt') -> Dict[str, Path]:
+        """Discover (but do not read) text files under a directory.
+
+        Only records file paths + cheap metadata (size, first-line preview) so
+        that even multi-hundred-MB corpora are safe to "discover" -- the full
+        file is only read once a dataset is actually selected via load_from_file.
+
         Args:
             directory: Directory containing text files
             pattern: File pattern to match (default: '*.txt')
-            
+
+        Returns:
+            Dict mapping dataset names (file stem) to their Path
+        """
+        data_dir = Path(directory)
+        if not data_dir.exists():
+            logger.warning(f"Data directory not found: {data_dir}")
+            return {}
+
+        discovered = {}
+        for filepath in sorted(data_dir.glob(pattern)):
+            discovered[filepath.stem] = filepath
+            self._discovered[filepath.stem] = filepath
+
+        logger.info(f"Discovered {len(discovered)} dataset file(s) in {directory} (not yet loaded)")
+        return discovered
+
+    def load_from_directory(self, directory: str = 'data',
+                           pattern: str = '*.txt') -> Dict[str, List[str]]:
+        """Discover AND fully load every dataset from directory.
+
+        Prefer discover_directory() for interactive menus -- this eagerly reads
+        every matching file into memory, which is expensive for large corpora.
+
+        Args:
+            directory: Directory containing text files
+            pattern: File pattern to match (default: '*.txt')
+
         Returns:
             Dict mapping dataset names to corpus lists
         """
@@ -221,20 +267,33 @@ class DatasetLoader:
         if not data_dir.exists():
             logger.warning(f"Data directory not found: {data_dir}")
             return {}
-        
+
         datasets = {}
-        for filepath in data_dir.glob(pattern):
+        for filepath in sorted(data_dir.glob(pattern)):
             try:
                 corpus = self.load_from_file(str(filepath), filepath.stem)
                 datasets[filepath.stem] = corpus
             except Exception as e:
                 logger.warning(f"Failed to load {filepath}: {e}")
-        
+
         logger.info(f"Discovered {len(datasets)} datasets in {directory}")
         return datasets
+
+    @staticmethod
+    def _preview_file(filepath: Path, max_chars: int = 90) -> str:
+        """Read just enough of a file to show a short, unambiguous preview."""
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                snippet = f.read(max_chars * 2)
+            snippet = ' '.join(snippet.split())  # collapse newlines/whitespace
+            snippet = snippet[:max_chars]
+            return snippet + ('...' if len(snippet) == max_chars else '')
+        except Exception:
+            return '(preview unavailable)'
     
     def get_corpus(self, dataset_name: Optional[str] = None) -> List[str]:
-        """Get corpus for a dataset.
+        """Get corpus for a dataset, lazily loading it from disk if it was
+        only discovered (not yet read) so far.
         
         Args:
             dataset_name: Name of dataset (uses current if None)
@@ -243,6 +302,9 @@ class DatasetLoader:
             List of text strings
         """
         name = dataset_name or self.current_dataset
+        
+        if name is not None and name not in self.datasets and name in self._discovered:
+            return self.load_from_file(str(self._discovered[name]), name)
         
         if name is None or name not in self.datasets:
             logger.error(f"Dataset not loaded: {name}")
@@ -266,7 +328,23 @@ class DatasetLoader:
                 'description': info['description'],
             }
         
-        # Add loaded datasets
+        # Add files discovered under data_dir but not read yet (cheap: size + preview only)
+        for name, filepath in self._discovered.items():
+            if name in self.datasets:
+                continue  # already fully loaded below
+            try:
+                size_mb = filepath.stat().st_size / (1024 * 1024)
+            except OSError:
+                size_mb = 0.0
+            all_datasets[name] = {
+                'type': 'discovered',
+                'sentences': None,
+                'source': str(filepath),
+                'size_mb': size_mb,
+                'preview': self._preview_file(filepath),
+            }
+        
+        # Add fully loaded datasets
         for name, data in self.datasets.items():
             all_datasets[name] = {
                 'type': 'loaded',
@@ -298,8 +376,12 @@ class DatasetLoader:
         print("\nAvailable Datasets:")
         for i, name in enumerate(dataset_list, 1):
             info = datasets[name]
-            source_note = f", {info['source']}" if info['type'] != 'builtin' else ""
-            print(f"  {i}. {name:20s} ({info['sentences']:3d} sentences, {info['type']}{source_note})")
+            if info['type'] == 'discovered':
+                print(f"  {i}. {name:24s} ({info['size_mb']:.1f} MB on disk, {info['source']})")
+                print(f"       preview: \"{info['preview']}\"")
+            else:
+                source_note = f", {info['source']}" if info['type'] != 'builtin' else ""
+                print(f"  {i}. {name:24s} ({info['sentences']:3d} sentences, {info['type']}{source_note})")
         print(f"  0. Load a custom file path (e.g. data/my_corpus.txt)")
         
         while True:
@@ -313,12 +395,19 @@ class DatasetLoader:
                 
                 if 1 <= choice <= len(dataset_list):
                     selected_name = dataset_list[choice - 1]
+                    info = datasets[selected_name]
                     
-                    # Load if needed
-                    if selected_name not in self.datasets:
-                        return self.load_builtin(selected_name)
+                    # Load if needed (covers both builtins not yet materialized
+                    # and files that were only discovered, not yet read)
+                    if info['type'] == 'builtin' and selected_name not in self.datasets:
+                        corpus = self.load_builtin(selected_name)
+                    else:
+                        corpus = self.get_corpus(selected_name)
                     
-                    return self.get_corpus(selected_name)
+                    confirm = input(f"  Selected '{selected_name}' ({len(corpus)} sentences). Continue? (y/n) [default=y]: ").strip().lower()
+                    if confirm in ('', 'y', 'yes'):
+                        return corpus
+                    print("  Re-select a dataset below.")
                 else:
                     print(f"  ⚠ Please enter a number between 0 and {len(dataset_list)}")
             except ValueError:
@@ -342,18 +431,13 @@ def recommend_dataset_for_config(model_config: Dict) -> str:
     num_layers = model_config.get('num_layers', 1)
     max_len = model_config.get('max_len', 8)
     
-    # Simple heuristics
-    total_params_approx = embedding_dim * num_layers * 1000  # Rough estimate
-    
-    if total_params_approx < 100000 and max_len <= 16:
-        # Tiny model → use minimal dataset
+    if embedding_dim >= 128 and num_layers >= 4 and max_len >= 64:
+        return 'tiny_stories'
+    if embedding_dim <= 16 and num_layers <= 1 and max_len <= 8:
         return 'minimal'
-    elif embedding_dim <= 64:
-        # Small model → use tiny datasets
+    if embedding_dim <= 64:
         return 'tiny_code'
-    else:
-        # Larger model → could use larger dataset
-        return 'tiny_english'
+    return 'tiny_english'
 
 
 # ============================================================================
@@ -390,10 +474,13 @@ def load_dataset_interactive(model_config: Optional[Dict] = None, data_dir: str 
             return corpus, loader.current_dataset
         
         if use_recommended != 'n':
-            corpus = loader.load_builtin(recommended)
+            try:
+                corpus = loader.load_by_name(recommended)
+            except ValueError:
+                corpus = loader.load_builtin(recommended)
             analyzer = DatasetAnalyzer(corpus)
             analyzer.print_stats()
-            return corpus, recommended
+            return corpus, loader.current_dataset
     
     # Let user choose (builtins + auto-discovered data_dir files + custom path)
     corpus = loader.interactive_select()

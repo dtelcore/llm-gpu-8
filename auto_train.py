@@ -10,7 +10,7 @@ Usage:
     python auto_train.py --epochs 5 --prompt "once upon a" --trace-logits
     python auto_train.py --steps 1500 --prompt "once upon a"
     python auto_train.py --learning-rate 0.005 --steps 500 --no-prompt   # fully non-interactive
-    python auto_train.py --menu        # wizard first; first prompt offers resuming a checkpoint
+    python auto_train.py --menu        # wizard: Toy Run or Tiny Stories presets, or custom
 
 If --learning-rate/--steps/--epochs aren't all given on the command line, you'll
 be prompted for whichever ones are missing (pass --no-prompt to disable and
