@@ -193,6 +193,66 @@ __global__ void layernorm_cache_fp32(
     }
 }
 
+// Fused residual + layernorm-with-cache:
+//   x_out = x + residual;  y = LN(x_out) with xhat/invstd for backward.
+__global__ void residual_layernorm_cache_fp32(
+    const float* x, const float* residual,
+    float* x_out, float* y, float* xhat, float* invstd_row,
+    const float* gamma, const float* beta,
+    int hidden_dim, float eps, int total_rows
+) {
+    extern __shared__ float sdata[];
+
+    int row = blockIdx.x;
+    if (row >= total_rows) return;
+
+    int tid = threadIdx.x;
+    int offset = row * hidden_dim;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float v = x[offset + i] + residual[offset + i];
+        x_out[offset + i] = v;
+        local_sum += v;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / hidden_dim;
+    __syncthreads();
+
+    float local_var_sum = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float diff = x_out[offset + i] - mean;
+        local_var_sum += diff * diff;
+    }
+    sdata[tid] = local_var_sum;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float variance = sdata[0] / hidden_dim;
+    float inv_std = rsqrtf(variance + eps);
+    if (tid == 0) invstd_row[row] = inv_std;
+    __syncthreads();
+
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float xh = (x_out[offset + i] - mean) * inv_std;
+        xhat[offset + i] = xh;
+        y[offset + i] = xh * gamma[i] + beta[i];
+    }
+}
+
+// a[i] += b[i] (non-atomic; a and b must not alias overlapping warps incorrectly — same shape OK)
+__global__ void add_into_fp32(float* a, const float* b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+}
+
 // Layernorm backward: one block per row. Writes dx; dgamma/dbeta via atomicAdd.
 __global__ void layernorm_backward_fp32(
     const float* dout, const float* xhat, const float* invstd_row, const float* gamma,
@@ -584,34 +644,61 @@ __global__ void add_inplace_fp32(float* out, const float* block, int n) {
     if (i < n) atomicAdd(&out[i], block[i]);
 }
 
-// Batched GEMM with optional transpose: C[b]=op(A[b]) @ op(B[b]).
+// Batched tiled GEMM with optional transpose: C[b]=op(A[b]) @ op(B[b]).
 // A,B,C are contiguous [batch, ...] row-major.
 // If transA=0, A[b] is [M,K]; if transA=1, A[b] is stored [K,M] and read as A^T -> [M,K].
 // If transB=0, B[b] is [K,N]; if transB=1, B[b] is stored [N,K] and read as B^T -> [K,N].
-// C[b] is always [M,N].
+// C[b] is always [M,N]. Uses GEMM_TILE shared-memory tiles (Kepler-friendly).
 __global__ void gemm_batched_fp32(
-    const float* A, const float* B, float* C,
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
     int M, int N, int K, int batch,
     int transA, int transB
 ) {
+    __shared__ float sA[GEMM_TILE][GEMM_TILE];
+    __shared__ float sB[GEMM_TILE][GEMM_TILE];
+
     int bat = blockIdx.z;
     if (bat >= batch) return;
 
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= M || col >= N) return;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * GEMM_TILE + ty;
+    int col = blockIdx.x * GEMM_TILE + tx;
 
     const float* Ab = A + bat * (M * K);
     const float* Bb = B + bat * (K * N);
     float* Cb = C + bat * (M * N);
 
     float sum = 0.0f;
-    for (int i = 0; i < K; ++i) {
-        float av = transA ? Ab[i * M + row] : Ab[row * K + i];
-        float bv = transB ? Bb[col * K + i] : Bb[i * N + col];
-        sum += av * bv;
+    int tiles = (K + GEMM_TILE - 1) / GEMM_TILE;
+
+    for (int t = 0; t < tiles; ++t) {
+        int a_k = t * GEMM_TILE + tx;
+        int b_k = t * GEMM_TILE + ty;
+
+        if (row < M && a_k < K) {
+            sA[ty][tx] = transA ? Ab[a_k * M + row] : Ab[row * K + a_k];
+        } else {
+            sA[ty][tx] = 0.0f;
+        }
+
+        if (b_k < K && col < N) {
+            sB[ty][tx] = transB ? Bb[col * K + b_k] : Bb[b_k * N + col];
+        } else {
+            sB[ty][tx] = 0.0f;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < GEMM_TILE; ++i) {
+            sum += sA[ty][i] * sB[i][tx];
+        }
+        __syncthreads();
     }
-    Cb[row * N + col] = sum;
+
+    if (row < M && col < N) {
+        Cb[row * N + col] = sum;
+    }
 }
 
 // Token + position embedding forward: out[(b*T+t)*C+c] = tok_emb[id,c] + pos_emb[t,c]
@@ -715,12 +802,11 @@ __global__ void matmul_score_kernel(
     Scores[h * M * M + i * M + j] = acc * scale;
 }
 
-// Softmax VJP: dRaw[h,i,j] = probs[h,i,j] * (dProbs[h,i,j] - dot_i); causal j<=i
-// Note: does NOT apply attention scale — caller multiplies dRaw by scale afterward.
+// Softmax VJP: dRaw = scale * probs * (dScores - dot); causal j<=i. Scale fused (was separate scal_mul).
 __global__ void softmax_fused_backward(
     const float* dScores, const float* probs,
     float* row_sum, float* dProbs,
-    int H, int M
+    int H, int M, float scale
 ) {
     extern __shared__ float shared_buf[];
 
@@ -753,7 +839,7 @@ __global__ void softmax_fused_backward(
     }
 
     for (int j = tid; j < valid_cols; j += blockDim.x) {
-        dProbs[row_base + j] = probs[row_base + j] * (dScores[row_base + j] - dot_val);
+        dProbs[row_base + j] = scale * probs[row_base + j] * (dScores[row_base + j] - dot_val);
     }
     for (int j = valid_cols + tid; j < M; j += blockDim.x) {
         dProbs[row_base + j] = 0.0f;

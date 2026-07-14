@@ -133,14 +133,19 @@ class GPTModel:
                 dw["token_embedding"], dw["position_embedding"], T,
             )
             cache["layers"] = []
+            pending_ln1 = None
 
             for layer in range(cfg.num_layers):
                 prefix = f"layer_{layer}"
                 layer_cache: Dict = {"B": B, "T": T, "gpu": True}
 
-                ln1_out_d, ln1_xhat_d, ln1_invstd_d = cuda_ops.layernorm_with_cache(
-                    h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"],
-                )
+                if pending_ln1 is None:
+                    ln1_out_d, ln1_xhat_d, ln1_invstd_d = cuda_ops.layernorm_with_cache(
+                        h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"],
+                    )
+                else:
+                    ln1_out_d, ln1_xhat_d, ln1_invstd_d = pending_ln1
+                    pending_ln1 = None
                 layer_cache["ln1_out_d"] = ln1_out_d
                 layer_cache["ln1_xhat_d"] = ln1_xhat_d
                 layer_cache["ln1_invstd_d"] = ln1_invstd_d
@@ -149,10 +154,9 @@ class GPTModel:
                     ln1_out_d, None, prefix, B, T, H, hd, scale, tracer=tracer,
                 )
                 layer_cache["attn"] = attn_cache
-                h_d = layers.add_residual(h_d, attn_out_d)
 
-                ln2_out_d, ln2_xhat_d, ln2_invstd_d = cuda_ops.layernorm_with_cache(
-                    h_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"],
+                h_d, ln2_out_d, ln2_xhat_d, ln2_invstd_d = cuda_ops.residual_layernorm_with_cache(
+                    h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"],
                 )
                 layer_cache["ln2_out_d"] = ln2_out_d
                 layer_cache["ln2_xhat_d"] = ln2_xhat_d
@@ -162,16 +166,24 @@ class GPTModel:
                     ln2_out_d, None, prefix, tracer=tracer,
                 )
                 layer_cache["mlp"] = mlp_cache
-                h_d = layers.add_residual(h_d, mlp_out_d)
+
+                if layer + 1 < cfg.num_layers:
+                    next_prefix = f"layer_{layer + 1}"
+                    h_d, ln1_n, xhat_n, inv_n = cuda_ops.residual_layernorm_with_cache(
+                        h_d, mlp_out_d,
+                        dw[f"{next_prefix}.ln1_gamma"], db[f"{next_prefix}.ln1_beta"],
+                    )
+                    pending_ln1 = (ln1_n, xhat_n, inv_n)
+                else:
+                    h_d, h_final_d, final_xhat_d, final_invstd_d = cuda_ops.residual_layernorm_with_cache(
+                        h_d, mlp_out_d, dw["final_ln_gamma"], db["final_ln_beta"],
+                    )
 
                 if tracer is not None and tracer.trace_neurons and tracer.active_step:
                     tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
 
                 cache["layers"].append(layer_cache)
 
-            h_final_d, final_xhat_d, final_invstd_d = cuda_ops.layernorm_with_cache(
-                h_d, dw["final_ln_gamma"], db["final_ln_beta"],
-            )
             cache["h_final_d"] = h_final_d
             cache["final_xhat_d"] = final_xhat_d
             cache["final_invstd_d"] = final_invstd_d
@@ -374,7 +386,7 @@ class GPTModel:
             grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
             grads[f"{prefix}.ln2_beta"] = d_ln2_beta
 
-            d_h = cuda_ops.add_arrays(d_resid1, d_h_from_ln2)
+            d_h = cuda_ops.add_into(d_resid1, d_h_from_ln2)
 
             d_attn_out = d_h
             d_resid0 = d_h
@@ -391,7 +403,7 @@ class GPTModel:
             grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
             grads[f"{prefix}.ln1_beta"] = d_ln1_beta
 
-            d_h = cuda_ops.add_arrays(d_resid0, d_h_from_ln1)
+            d_h = cuda_ops.add_into(d_resid0, d_h_from_ln1)
 
         d_tok, d_pos = cuda_ops.embed_backward(
             cache["ids"].astype(np.int32), d_h, cfg.vocab_size, C,

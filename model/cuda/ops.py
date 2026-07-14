@@ -27,6 +27,8 @@ TILE_SIZE = 16  # shared-memory tiled GEMM (sm_35 / GT 730)
 _gemm_kernel = _mod.get_function("gemm_fp32")
 _add_bias_kernel = _mod.get_function("add_bias_fp32")
 _layernorm_kernel = _mod.get_function("layernorm_fp32")
+_residual_layernorm_cache_kernel = _mod.get_function("residual_layernorm_cache_fp32")
+_add_into_kernel = _mod.get_function("add_into_fp32")
 _gelu_kernel = _mod.get_function("gelu_fp32")
 _softmax_kernel = _mod.get_function("softmax_fp32")
 _add_kernel = _mod.get_function("add_fp32")
@@ -133,6 +135,16 @@ def add_arrays(a: gpuarray.GPUArray, b: gpuarray.GPUArray) -> gpuarray.GPUArray:
     blocks = int(np.ceil(int(n_elements) / threads))
     _add_kernel(a, b, out, n_elements, block=(threads, 1, 1), grid=(blocks, 1, 1))
     return out
+
+
+def add_into(a: gpuarray.GPUArray, b: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """In-place a += b (same shape). Returns a."""
+    assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
+    n = np.int32(a.size)
+    threads = 256
+    blocks = int(np.ceil(int(n) / threads))
+    _add_into_kernel(a, b, n, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return a
 
 
 def matmul(A: gpuarray.GPUArray, B: gpuarray.GPUArray, tracer=None, name: str = "gemm") -> gpuarray.GPUArray:
@@ -535,39 +547,38 @@ def attention_backward_heads(
         probs_h, d_out_h, d_v_h,
         np.int32(M), np.int32(D), np.int32(M), np.int32(H),
         np.int32(1), np.int32(0),
-        block=(16, 16, 1),
-        grid=(int(np.ceil(D / 16)), int(np.ceil(M / 16)), H),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(D / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
     )
     _gemm_batched_kernel(
         d_out_h, v_h, d_probs,
         np.int32(M), np.int32(M), np.int32(D), np.int32(H),
         np.int32(0), np.int32(1),
-        block=(16, 16, 1),
-        grid=(int(np.ceil(M / 16)), int(np.ceil(M / 16)), H),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(M / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
     )
 
     sm_threads = next_pow2(min(M, 256))
     sm_shared = sm_threads * np.dtype(np.float32).itemsize
     _softmax_fused_backward_kernel(
         d_probs, probs_h, row_sum, d_raw,
-        np.int32(H), np.int32(M),
+        np.int32(H), np.int32(M), np.float32(scale),
         block=(sm_threads, 1, 1), grid=(H, M, 1), shared=sm_shared,
     )
-    scal_mul(d_raw, scale)
 
     _gemm_batched_kernel(
         d_raw, k_h, d_q_h,
         np.int32(M), np.int32(D), np.int32(M), np.int32(H),
         np.int32(0), np.int32(0),
-        block=(16, 16, 1),
-        grid=(int(np.ceil(D / 16)), int(np.ceil(M / 16)), H),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(D / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
     )
     _gemm_batched_kernel(
         d_raw, q_h, d_k_h,
         np.int32(M), np.int32(D), np.int32(M), np.int32(H),
         np.int32(1), np.int32(0),
-        block=(16, 16, 1),
-        grid=(int(np.ceil(D / 16)), int(np.ceil(M / 16)), H),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(D / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
     )
 
     if heads_layout:
@@ -639,6 +650,34 @@ def layernorm_with_cache(
         block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
     )
     return y, xhat, invstd_row
+
+
+def residual_layernorm_with_cache(
+    x: gpuarray.GPUArray,
+    residual: gpuarray.GPUArray,
+    gamma: gpuarray.GPUArray,
+    beta: gpuarray.GPUArray,
+    eps: float = 1e-5,
+) -> tuple:
+    """Fused x_out = x + residual; y = LN(x_out). Returns (x_out, y, xhat, invstd).
+
+    y/xhat/invstd are cached for backward — not pooled. x_out becomes the residual stream.
+    """
+    assert x.shape == residual.shape
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    x_out = gpuarray.empty_like(x)
+    y = gpuarray.empty_like(x)
+    xhat = gpuarray.empty_like(x)
+    invstd_row = gpuarray.empty((total_rows,), dtype=np.float32)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _residual_layernorm_cache_kernel(
+        x, residual, x_out, y, xhat, invstd_row, gamma, beta,
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return x_out, y, xhat, invstd_row
 
 
 def _zeros_gpu(shape, dtype=np.float32) -> gpuarray.GPUArray:
