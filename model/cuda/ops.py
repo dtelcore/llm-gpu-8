@@ -23,6 +23,7 @@ from model.cuda.kernels import CUDA_SOURCE  # noqa: E402
 
 _mod = SourceModule(CUDA_SOURCE, options=_env.NVCC_OPTIONS)
 
+TILE_SIZE = 16  # shared-memory tiled GEMM (sm_35 / GT 730)
 _gemm_kernel = _mod.get_function("gemm_fp32")
 _add_bias_kernel = _mod.get_function("add_bias_fp32")
 _layernorm_kernel = _mod.get_function("layernorm_fp32")
@@ -63,6 +64,35 @@ _fused_attn_fwd_kernel = _mod.get_function("fused_attention_forward_kernel")
 logger.info("PyCUDA kernels compiled for sm_35 (Kepler GT 730)")
 
 MAX_THREADS_PER_BLOCK = 1024
+
+
+class ScratchPool:
+    """Reusable GPU buffers to cut repeated empty() and HtoD zeros.
+
+    Use a unique ``name`` when two same-shaped buffers must coexist
+    (e.g. d_probs vs d_raw). Do **not** pool tensors that outlive the
+    call and are stored in grad dicts or forward caches unless each has
+    a distinct stable name.
+    """
+
+    def __init__(self):
+        self._buffers = {}
+
+    def get(self, shape, dtype=np.float32, zero=False, name=None):
+        key = (tuple(int(s) for s in shape), np.dtype(dtype).str, name)
+        buf = self._buffers.get(key)
+        if buf is None or buf.shape != tuple(shape):
+            buf = gpuarray.empty(shape, dtype=dtype)
+            self._buffers[key] = buf
+        if zero:
+            cuda.memset_d8(buf.gpudata, 0, buf.nbytes)
+        return buf
+
+    def clear(self):
+        self._buffers.clear()
+
+
+scratch_pool = ScratchPool()
 
 
 def _launch_1d(n: int, threads: int = 256):
@@ -117,16 +147,19 @@ def matmul(A: gpuarray.GPUArray, B: gpuarray.GPUArray, tracer=None, name: str = 
     assert Ka == Kb, f"Shape mismatch: {A.shape} vs {B.shape}"
 
     if not A.flags.c_contiguous:
-        # A is a .T view of shape (M, K) over physical (K, M) storage.
         base = gpuarray.GPUArray((Ka, M), np.float32, gpudata=A.gpudata)
-        A = transpose_2d(base)  # contiguous (M, K)
+        A = transpose_2d(base, name="matmul_T_a")
     if not B.flags.c_contiguous:
         base = gpuarray.GPUArray((N, Ka), np.float32, gpudata=B.gpudata)
-        B = transpose_2d(base)  # contiguous (K, N)
+        B = transpose_2d(base, name="matmul_T_b")
 
     C = gpuarray.empty((M, N), dtype=np.float32)
-    block_dim = (16, 16, 1)
-    grid_dim = (int(np.ceil(N / 16)), int(np.ceil(M / 16)), 1)
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
 
     if tracer is not None and getattr(tracer, "trace_vectorization", False):
         tracer.log_vectorization(name, (M, Ka), (Kb, N), (M, N), grid_dim, block_dim)
@@ -135,11 +168,11 @@ def matmul(A: gpuarray.GPUArray, B: gpuarray.GPUArray, tracer=None, name: str = 
     return C
 
 
-def transpose_2d(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
-    """Return contiguous transpose of a C-contiguous 2D array."""
+def transpose_2d(x: gpuarray.GPUArray, name: str = "transpose_2d") -> gpuarray.GPUArray:
+    """Return contiguous transpose of a C-contiguous 2D array (pooled scratch)."""
     assert x.ndim == 2 and x.flags.c_contiguous
     rows, cols = int(x.shape[0]), int(x.shape[1])
-    out = gpuarray.empty((cols, rows), dtype=np.float32)
+    out = scratch_pool.get((cols, rows), name=name)
     n = rows * cols
     grid, block = _launch_1d(n)
     _transpose_2d_kernel(x, out, np.int32(rows), np.int32(cols), block=block, grid=grid)
@@ -156,8 +189,12 @@ def matmul_bias(
     assert B.shape[0] == K and int(bias.size) == int(B.shape[1])
     N = int(B.shape[1])
     C = gpuarray.empty((M, N), dtype=np.float32)
-    block_dim = (16, 16, 1)
-    grid_dim = (int(np.ceil(N / 16)), int(np.ceil(M / 16)), 1)
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
     if tracer is not None and getattr(tracer, "trace_vectorization", False):
         tracer.log_vectorization(name, (M, K), (K, N), (M, N), grid_dim, block_dim)
     _gemm_bias_kernel(
@@ -171,6 +208,7 @@ def reduce_sum_axis0(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
     """Sum over axis 0 of a 2D [rows, channels] array. Returns [channels]."""
     assert x.ndim == 2 and x.flags.c_contiguous
     rows, channels = int(x.shape[0]), int(x.shape[1])
+    # Fresh buffer: result is often stored in the grad dict across layers.
     out = gpuarray.empty((channels,), dtype=np.float32)
     threads = next_pow2(min(rows, 256))
     shared = threads * np.dtype(np.float32).itemsize
@@ -317,7 +355,7 @@ def pack_qkv_from_heads(
     d_q: gpuarray.GPUArray, d_k: gpuarray.GPUArray, d_v: gpuarray.GPUArray,
     batch_size: int, seq_len: int, num_heads: int, head_dim: int,
 ) -> gpuarray.GPUArray:
-    """Pack dQ/dK/dV [B*NH, T, HD] into dQKV [B*T, 3*C]."""
+    """Pack dQ/dK/dV [B*NH, T, HD] into dQKV [B*T, 3*C] (fresh buffer)."""
     B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
     out = gpuarray.empty((B * T, 3 * NH * HD), dtype=np.float32)
     n = B * T * NH * HD
@@ -351,8 +389,8 @@ def fused_causal_attention_from_qkv(
         q_h, k_h, v_h = split_heads_from_qkv(qkv, B, T, NH, HD)
         probs = gpuarray.empty((H, M, M), dtype=np.float32)
         out_h = gpuarray.empty((H, M, D), dtype=np.float32)
-        row_max = gpuarray.empty((H, M), dtype=np.float32)
-        row_sum = gpuarray.empty((H, M), dtype=np.float32)
+        row_max = scratch_pool.get((H, M), name="fused_row_max")
+        row_sum = scratch_pool.get((H, M), name="fused_row_sum")
         threads = next_pow2(max(D, min(M, 256)))
         shared_bytes = (D + M + threads) * np.dtype(np.float32).itemsize
         _fused_attn_fwd_kernel(
@@ -360,15 +398,30 @@ def fused_causal_attention_from_qkv(
             np.int32(H), np.int32(M), np.int32(D), np.float32(scale),
             block=(threads, 1, 1), grid=(H, M, 1), shared=shared_bytes,
         )
-        attn_concat = merge_heads(out_h, B, T, NH, HD)
+        attn_concat = merge_heads(out_h, B, T, NH, HD)  # fresh — cached for backward
         return attn_concat, probs.reshape(H * M * M), q_h, k_h, v_h
 
-    # Default: corrected causal_mha (faster on Kepler) + head-layout cache.
+    # Default: corrected causal_mha + head-layout cache for backward.
+    # q/k/v heads are cached for the full forward — allocate uniquely.
     q, k, v = split_qkv(qkv, C)
     attn_concat, probs = causal_self_attention(q, k, v, B, T, NH, HD, scale)
-    q_h = interleaved_to_heads(q, B, T, NH, HD)
-    k_h = interleaved_to_heads(k, B, T, NH, HD)
-    v_h = interleaved_to_heads(v, B, T, NH, HD)
+    q_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    k_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    v_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _interleaved_to_heads_kernel(
+        q, q_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    _interleaved_to_heads_kernel(
+        k, k_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    _interleaved_to_heads_kernel(
+        v, v_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
     return attn_concat, probs, q_h, k_h, v_h
 
 
@@ -394,10 +447,11 @@ def softmax_backward(
 
 def interleaved_to_heads(
     x: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+    name: str = "interleaved_to_heads",
 ) -> gpuarray.GPUArray:
     """[B*T, NH*HD] -> [B*NH, T, HD] contiguous."""
     B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
-    out = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    out = scratch_pool.get((B * NH, T, HD), name=name)
     n = B * T * NH * HD
     grid, block = _launch_1d(n)
     _interleaved_to_heads_kernel(
@@ -409,10 +463,16 @@ def interleaved_to_heads(
 
 def merge_heads(
     heads: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+    name: str = None,
 ) -> gpuarray.GPUArray:
-    """[B*NH, T, HD] -> [B*T, NH*HD]."""
+    """[B*NH, T, HD] -> [B*T, NH*HD].
+
+    If ``name`` is set, use the scratch pool; otherwise allocate a fresh buffer
+    (required when the result is returned to callers / caches).
+    """
     B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
-    out = gpuarray.empty((B * T, NH * HD), dtype=np.float32)
+    shape = (B * T, NH * HD)
+    out = scratch_pool.get(shape, name=name) if name else gpuarray.empty(shape, dtype=np.float32)
     n = B * T * NH * HD
     grid, block = _launch_1d(n)
     _merge_heads_kernel(
@@ -423,7 +483,7 @@ def merge_heads(
 
 
 def pack_qkv(q: gpuarray.GPUArray, k: gpuarray.GPUArray, v: gpuarray.GPUArray) -> gpuarray.GPUArray:
-    """Pack [rows, C] Q/K/V into [rows, 3*C]."""
+    """Pack [rows, C] Q/K/V into [rows, 3*C] (fresh buffer — often fed to linear_backward)."""
     rows, c = int(q.shape[0]), int(q.shape[1])
     out = gpuarray.empty((rows, 3 * c), dtype=np.float32)
     n = rows * c
@@ -458,18 +518,18 @@ def attention_backward_heads(
     if heads_layout:
         q_h, k_h, v_h = q, k, v
     else:
-        q_h = interleaved_to_heads(q, B, T, NH, HD)
-        k_h = interleaved_to_heads(k, B, T, NH, HD)
-        v_h = interleaved_to_heads(v, B, T, NH, HD)
-    d_out_h = interleaved_to_heads(d_attn_concat, B, T, NH, HD)
+        q_h = interleaved_to_heads(q, B, T, NH, HD, name="attn_bwd_q")
+        k_h = interleaved_to_heads(k, B, T, NH, HD, name="attn_bwd_k")
+        v_h = interleaved_to_heads(v, B, T, NH, HD, name="attn_bwd_v")
+    d_out_h = interleaved_to_heads(d_attn_concat, B, T, NH, HD, name="attn_bwd_dout")
     probs_h = probs.reshape(H, M, M)
 
-    d_probs = gpuarray.empty((H, M, M), dtype=np.float32)
-    d_raw = gpuarray.empty((H, M, M), dtype=np.float32)
-    row_sum = gpuarray.empty((H, M), dtype=np.float32)
-    d_q_h = gpuarray.empty((H, M, D), dtype=np.float32)
-    d_k_h = gpuarray.empty((H, M, D), dtype=np.float32)
-    d_v_h = gpuarray.empty((H, M, D), dtype=np.float32)
+    d_probs = scratch_pool.get((H, M, M), name="attn_d_probs")
+    d_raw = scratch_pool.get((H, M, M), name="attn_d_raw")
+    row_sum = scratch_pool.get((H, M), name="attn_row_sum")
+    d_q_h = scratch_pool.get((H, M, D), name="attn_d_q")
+    d_k_h = scratch_pool.get((H, M, D), name="attn_d_k")
+    d_v_h = scratch_pool.get((H, M, D), name="attn_d_v")
 
     _gemm_batched_kernel(
         probs_h, d_out_h, d_v_h,
@@ -511,6 +571,7 @@ def attention_backward_heads(
     )
 
     if heads_layout:
+        # Safe: caller must pack into a fresh buffer before the next attn-bwd pool reuse.
         return d_q_h, d_k_h, d_v_h
     return (
         merge_heads(d_q_h, B, T, NH, HD),
@@ -549,7 +610,7 @@ def add_inplace(acc: gpuarray.GPUArray, block: gpuarray.GPUArray) -> None:
 
 def grad_global_norm_sq(grads) -> float:
     """Sum of squares of all gradient tensors on device (single scalar D2H)."""
-    buf = _zeros_gpu((1,))
+    buf = scratch_pool.get((1,), zero=True, name="grad_norm_sq")
     threads = 256
     for g in grads.values():
         n = np.int32(g.size)
@@ -561,7 +622,10 @@ def grad_global_norm_sq(grads) -> float:
 def layernorm_with_cache(
     x: gpuarray.GPUArray, gamma: gpuarray.GPUArray, beta: gpuarray.GPUArray, eps: float = 1e-5,
 ) -> tuple:
-    """Layernorm on device; returns (y, xhat, invstd_row) all on GPU."""
+    """Layernorm on device; returns (y, xhat, invstd_row) all on GPU.
+
+    Outputs are cached for backward across layers — not pooled.
+    """
     hidden_dim = int(x.shape[-1])
     total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
     y = gpuarray.empty_like(x)
@@ -578,7 +642,10 @@ def layernorm_with_cache(
 
 
 def _zeros_gpu(shape, dtype=np.float32) -> gpuarray.GPUArray:
-    return to_device(np.zeros(shape, dtype=dtype))
+    """Fresh device zeros via memset (no HtoD). Used for grad outputs that persist."""
+    buf = gpuarray.empty(shape, dtype=dtype)
+    cuda.memset_d8(buf.gpudata, 0, buf.nbytes)
+    return buf
 
 
 def layernorm_backward(
@@ -621,7 +688,7 @@ def cross_entropy(logits: gpuarray.GPUArray, targets: np.ndarray) -> tuple:
     rows, vocab_size = int(logits.shape[0]), int(logits.shape[1])
     targets_d = gpuarray.to_gpu(np.ascontiguousarray(targets, dtype=np.int32))
     d_logits = gpuarray.empty_like(logits)
-    loss_buf = _zeros_gpu((1,))
+    loss_buf = scratch_pool.get((1,), zero=True, name="ce_loss_buf")
     threads = next_pow2(vocab_size)
     shared_bytes = threads * np.dtype(np.float32).itemsize
     _cross_entropy_kernel(

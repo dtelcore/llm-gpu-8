@@ -14,18 +14,74 @@ step before any accumulation, and require a POWER-OF-TWO block size
 """
 
 CUDA_SOURCE = r"""
-// sm_35 compatible Matrix Multiplication (C = A * B)
-// A: [M, K] row-major, B: [K, N] row-major, C: [M, N] row-major
-__global__ void gemm_fp32(const float* A, const float* B, float* C, int M, int N, int K) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+// Tiled GEMM for Kepler (sm_35). TILE=16 fits well on GT 730.
+#define GEMM_TILE 16
+
+__global__ void gemm_fp32(const float* __restrict__ A, const float* __restrict__ B,
+                          float* __restrict__ C, int M, int N, int K) {
+    __shared__ float sA[GEMM_TILE][GEMM_TILE];
+    __shared__ float sB[GEMM_TILE][GEMM_TILE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * GEMM_TILE + ty;
+    int col = blockIdx.x * GEMM_TILE + tx;
+
+    float sum = 0.0f;
+    int tiles = (K + GEMM_TILE - 1) / GEMM_TILE;
+
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * GEMM_TILE + tx;
+        int b_row = t * GEMM_TILE + ty;
+
+        sA[ty][tx] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+        sB[ty][tx] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < GEMM_TILE; ++i) {
+            sum += sA[ty][i] * sB[i][tx];
+        }
+        __syncthreads();
+    }
 
     if (row < M && col < N) {
-        float sum = 0.0f;
-        for (int i = 0; i < K; ++i) {
-            sum += A[row * K + i] * B[i * N + col];
-        }
         C[row * N + col] = sum;
+    }
+}
+
+// Tiled GEMM + bias: C = A @ B + bias[col]
+__global__ void gemm_bias_fp32(const float* __restrict__ A, const float* __restrict__ B,
+                               const float* __restrict__ bias, float* __restrict__ C,
+                               int M, int N, int K) {
+    __shared__ float sA[GEMM_TILE][GEMM_TILE];
+    __shared__ float sB[GEMM_TILE][GEMM_TILE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * GEMM_TILE + ty;
+    int col = blockIdx.x * GEMM_TILE + tx;
+
+    float sum = 0.0f;
+    int tiles = (K + GEMM_TILE - 1) / GEMM_TILE;
+
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * GEMM_TILE + tx;
+        int b_row = t * GEMM_TILE + ty;
+
+        sA[ty][tx] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+        sB[ty][tx] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < GEMM_TILE; ++i) {
+            sum += sA[ty][i] * sB[i][tx];
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum + bias[col];
     }
 }
 
@@ -808,21 +864,6 @@ __global__ void reduce_sum_axis0_fp32(
         __syncthreads();
     }
     if (tid == 0) output[c] = sdata[0];
-}
-
-// GEMM + bias: C = A @ B + bias[col]. A[M,K], B[K,N], bias[N], C[M,N].
-__global__ void gemm_bias_fp32(
-    const float* A, const float* B, const float* bias, float* C,
-    int M, int N, int K
-) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= M || col >= N) return;
-    float sum = 0.0f;
-    for (int i = 0; i < K; ++i) {
-        sum += A[row * K + i] * B[i * N + col];
-    }
-    C[row * N + col] = sum + bias[col];
 }
 
 // QKV [B*T, 3*C] -> Q/K/V [B*NH, T, HD]

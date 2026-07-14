@@ -39,6 +39,7 @@ Golden-check vs NumPy: pass at T=32 and T=256. bigwide batch=4 ≈25s/step (flat
 - `matmul(.T)` materializes contiguous transpose (strided gemm was TDR-slow)
 - Head-layout cache for attn bwd (`split_heads` / `pack_qkv_from_heads`)
 - Phase 2C `fused_attention_forward_kernel` ported; **default off** (`_USE_FUSED_ATTENTION_FORWARD=False`) — ~2× slower than fixed `causal_mha` on sm_35 at T=256
+- **`ScratchPool`** in `ops.py`: named reusable scratch for attn-bwd temps + transpose; `_zeros_gpu` uses `memset_d8` (no HtoD). Do not pool grad/cache outputs.
 
 ## Reality check (don’t re-import blindly)
 
