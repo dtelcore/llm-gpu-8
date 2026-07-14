@@ -180,9 +180,7 @@ class GPTModel:
                 h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
             )
             cache["logits_d"] = logits_d
-            logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size) if (
-                tracer is not None and (tracer.trace_logits or tracer.trace_tokens)
-            ) else np.empty((B, T, cfg.vocab_size), dtype=np.float32)
+            logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
             cache["logits"] = logits
             return logits, cache
 
@@ -256,16 +254,17 @@ class GPTModel:
         )
 
         if _USE_GPU_ATTENTION:
-            q, k, v = cuda_ops.split_qkv(qkv_d, H * hd)
-            attn_concat_d, probs_d = cuda_ops.causal_self_attention(q, k, v, B, T, H, hd, scale)
+            attn_concat_d, probs_d, q_h, k_h, v_h = cuda_ops.fused_causal_attention_from_qkv(
+                qkv_d, B, T, H, hd, scale,
+            )
             attn_out_d = layers.linear(
                 attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
                 tracer=tracer, name=f"{prefix}.attn_out",
             )
             attn_cache = {
-                "ln1_out_d": ln1_out_d, "q_d": q, "k_d": k, "v_d": v,
+                "ln1_out_d": ln1_out_d, "q_d": q_h, "k_d": k_h, "v_d": v_h,
                 "probs_d": probs_d, "attn_concat_d": attn_concat_d,
-                "scale": scale, "B": B, "T": T, "gpu": True,
+                "scale": scale, "B": B, "T": T, "gpu": True, "heads_layout": True,
             }
         else:
             qkv = cuda_ops.to_host(qkv_d)
@@ -422,8 +421,6 @@ class GPTModel:
         return d_ln2_out, grads
 
     def _attention_backward_batch_gpu(self, d_attn_out, attn_cache: Dict, prefix: str, dw: Dict):
-        import pycuda.gpuarray as gpuarray
-
         B, T = attn_cache["B"], attn_cache["T"]
         H, hd = self.config.num_heads, self.config.head_dim
         C = H * hd
@@ -438,46 +435,15 @@ class GPTModel:
             d_attn_out_flat, attn_concat_d, dw[f"{prefix}.attn_out_proj"],
         )
 
-        d_q_h = np.zeros(cuda_ops.to_host(q_d).shape, dtype=np.float32)
-        d_k_h = np.zeros_like(d_q_h)
-        d_v_h = np.zeros_like(d_q_h)
-        probs_h = probs_d.reshape(B, H, T, T)
-
-        for b in range(B):
-            row0 = b * T
-            row1 = (b + 1) * T
-            d_head_np = cuda_ops.to_host(d_attn_concat[row0:row1]).reshape(T, H, hd).transpose(1, 0, 2)
-            for hidx in range(H):
-                cols = slice(hidx * hd, (hidx + 1) * hd)
-                q_bh = q_d[row0:row1, cols]
-                k_bh = k_d[row0:row1, cols]
-                v_bh = v_d[row0:row1, cols]
-                probs_bh = probs_h[b, hidx]
-                d_head_bh = cuda_ops.to_device(d_head_np[hidx].astype(np.float32))
-
-                d_probs = cuda_ops.matmul(d_head_bh, v_bh.T)
-                d_v_bh = cuda_ops.matmul(probs_bh.T, d_head_bh)
-
-                d_probs_h = cuda_ops.to_host(d_probs)
-                probs_bh_h = cuda_ops.to_host(probs_bh)
-                row_dot = np.sum(d_probs_h * probs_bh_h, axis=1, keepdims=True).astype(np.float32)
-                d_raw = cuda_ops.to_device((probs_bh_h * (d_probs_h - row_dot) * scale).astype(np.float32))
-
-                d_q_bh = cuda_ops.matmul(d_raw, k_bh)
-                d_k_bh = cuda_ops.matmul(d_raw.T, q_bh)
-
-                d_q_h[row0:row1, cols] += cuda_ops.to_host(d_q_bh)
-                d_k_h[row0:row1, cols] += cuda_ops.to_host(d_k_bh)
-                d_v_h[row0:row1, cols] += cuda_ops.to_host(d_v_bh)
-
-        d_q = cuda_ops.to_device(d_q_h)
-        d_k = cuda_ops.to_device(d_k_h)
-        d_v = cuda_ops.to_device(d_v_h)
-
-        d_qkv = gpuarray.empty((B * T, 3 * C), dtype=np.float32)
-        d_qkv[:, :C] = d_q
-        d_qkv[:, C:2 * C] = d_k
-        d_qkv[:, 2 * C:] = d_v
+        d_q, d_k, d_v = cuda_ops.attention_backward_heads(
+            d_attn_concat, q_d, k_d, v_d, probs_d,
+            B, T, H, hd, scale,
+            heads_layout=bool(attn_cache.get("heads_layout")),
+        )
+        if attn_cache.get("heads_layout"):
+            d_qkv = cuda_ops.pack_qkv_from_heads(d_q, d_k, d_v, B, T, H, hd)
+        else:
+            d_qkv = cuda_ops.pack_qkv(d_q, d_k, d_v)
 
         d_ln1_out, d_qkv_w, d_qkv_b = cuda_ops.linear_backward(
             d_qkv, ln1_out_d, dw[f"{prefix}.qkv_proj"],

@@ -19,6 +19,12 @@ from model.trace import TraceContext
 
 def linear(xd, weight, bias=None, tracer: TraceContext = None, name: str = "linear"):
     """y = x @ weight + bias on device. `weight`/`bias` must be device-resident."""
+    if (
+        bias is not None
+        and getattr(xd, "flags", None) is not None and xd.flags.c_contiguous
+        and getattr(weight, "flags", None) is not None and weight.flags.c_contiguous
+    ):
+        return ops.matmul_bias(xd, weight, bias, tracer=tracer, name=name)
     out = ops.matmul(xd, weight, tracer=tracer, name=name)
     if bias is not None:
         out = ops.add_bias(out, bias)
@@ -68,8 +74,6 @@ def causal_self_attention_device(
     scale: float,
 ):
     """Fused GPU causal attention from a [B*T, 3*C] qkv projection."""
-    c = num_heads * head_dim
-    q_d, k_d, v_d = ops.split_qkv(qkv_d, c)
-    return ops.causal_self_attention(
-        q_d, k_d, v_d, batch_size, seq_len, num_heads, head_dim, scale,
+    return ops.fused_causal_attention_from_qkv(
+        qkv_d, batch_size, seq_len, num_heads, head_dim, scale,
     )

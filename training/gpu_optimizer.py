@@ -58,10 +58,7 @@ class AdamWGPU:
         return self.base_lr
 
     def clip_grads_(self, grads: Dict[str, gpuarray.GPUArray]) -> float:
-        total_sq = 0.0
-        for g in grads.values():
-            h = g.get()
-            total_sq += float(np.sum(h.astype(np.float64) ** 2))
+        total_sq = cuda_ops.grad_global_norm_sq(grads)
         global_norm = float(np.sqrt(total_sq))
         if self.gradient_clip and global_norm > self.gradient_clip:
             scale = self.gradient_clip / (global_norm + 1e-6)

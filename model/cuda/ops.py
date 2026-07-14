@@ -40,10 +40,33 @@ _pos_embed_backward_kernel = _mod.get_function("pos_embed_backward_fp32")
 _embed_forward_kernel = _mod.get_function("embed_forward_fp32")
 _scal_mul_kernel = _mod.get_function("scal_mul_fp32")
 _adamw_update_kernel = _mod.get_function("adamw_update_fp32")
+_softmax_backward_kernel = _mod.get_function("softmax_backward_fp32")
+_add_block_kernel = _mod.get_function("add_block_fp32")
+_grad_norm_contrib_kernel = _mod.get_function("grad_norm_contrib_fp32")
+_add_inplace_kernel = _mod.get_function("add_inplace_fp32")
+_interleaved_to_heads_kernel = _mod.get_function("interleaved_to_heads")
+_merge_heads_kernel = _mod.get_function("merge_heads_kernel")
+_pack_qkv_kernel = _mod.get_function("pack_qkv_fp32")
+_matmul_score_kernel = _mod.get_function("matmul_score_kernel")
+_softmax_fused_backward_kernel = _mod.get_function("softmax_fused_backward")
+_matmul_grad_q_kernel = _mod.get_function("matmul_grad_q_kernel")
+_matmul_grad_k_kernel = _mod.get_function("matmul_grad_k_kernel")
+_matmul_grad_v_kernel = _mod.get_function("matmul_grad_v")
+_gemm_batched_kernel = _mod.get_function("gemm_batched_fp32")
+_reduce_sum_axis0_kernel = _mod.get_function("reduce_sum_axis0_fp32")
+_transpose_2d_kernel = _mod.get_function("transpose_2d_fp32")
+_gemm_bias_kernel = _mod.get_function("gemm_bias_fp32")
+_split_heads_kernel = _mod.get_function("split_heads_kernel")
+_merge_heads_qkv_kernel = _mod.get_function("merge_heads_qkv_kernel")
+_fused_attn_fwd_kernel = _mod.get_function("fused_attention_forward_kernel")
 
 logger.info("PyCUDA kernels compiled for sm_35 (Kepler GT 730)")
 
 MAX_THREADS_PER_BLOCK = 1024
+
+
+def _launch_1d(n: int, threads: int = 256):
+    return (int(np.ceil(n / threads)), 1, 1), (threads, 1, 1)
 
 
 def get_memory_info():
@@ -83,22 +106,91 @@ def add_arrays(a: gpuarray.GPUArray, b: gpuarray.GPUArray) -> gpuarray.GPUArray:
 
 
 def matmul(A: gpuarray.GPUArray, B: gpuarray.GPUArray, tracer=None, name: str = "gemm") -> gpuarray.GPUArray:
-    """C = A @ B for 2D row-major float32 device arrays."""
-    assert A.shape[1] == B.shape[0], f"Shape mismatch: {A.shape} vs {B.shape}"
+    """C = A @ B for 2D float32 device arrays.
 
-    M, K = np.int32(A.shape[0]), np.int32(A.shape[1])
-    N = np.int32(B.shape[1])
+    Non-contiguous ``.T`` views are materialized with a transpose kernel, then
+    multiplied with the contiguous gemm (strided gemm is TDR-slow on Kepler).
+    """
+    assert A.ndim == 2 and B.ndim == 2, f"matmul expects 2D, got {A.shape} @ {B.shape}"
+    M, Ka = int(A.shape[0]), int(A.shape[1])
+    Kb, N = int(B.shape[0]), int(B.shape[1])
+    assert Ka == Kb, f"Shape mismatch: {A.shape} vs {B.shape}"
 
-    C = gpuarray.empty((int(M), int(N)), dtype=np.float32)
+    if not A.flags.c_contiguous:
+        # A is a .T view of shape (M, K) over physical (K, M) storage.
+        base = gpuarray.GPUArray((Ka, M), np.float32, gpudata=A.gpudata)
+        A = transpose_2d(base)  # contiguous (M, K)
+    if not B.flags.c_contiguous:
+        base = gpuarray.GPUArray((N, Ka), np.float32, gpudata=B.gpudata)
+        B = transpose_2d(base)  # contiguous (K, N)
 
+    C = gpuarray.empty((M, N), dtype=np.float32)
     block_dim = (16, 16, 1)
-    grid_dim = (int(np.ceil(int(N) / 16)), int(np.ceil(int(M) / 16)), 1)
+    grid_dim = (int(np.ceil(N / 16)), int(np.ceil(M / 16)), 1)
 
     if tracer is not None and getattr(tracer, "trace_vectorization", False):
-        tracer.log_vectorization(name, (int(M), int(K)), (int(K), int(N)), (int(M), int(N)), grid_dim, block_dim)
+        tracer.log_vectorization(name, (M, Ka), (Kb, N), (M, N), grid_dim, block_dim)
 
-    _gemm_kernel(A, B, C, M, N, K, block=block_dim, grid=grid_dim)
+    _gemm_kernel(A, B, C, np.int32(M), np.int32(N), np.int32(Ka), block=block_dim, grid=grid_dim)
     return C
+
+
+def transpose_2d(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Return contiguous transpose of a C-contiguous 2D array."""
+    assert x.ndim == 2 and x.flags.c_contiguous
+    rows, cols = int(x.shape[0]), int(x.shape[1])
+    out = gpuarray.empty((cols, rows), dtype=np.float32)
+    n = rows * cols
+    grid, block = _launch_1d(n)
+    _transpose_2d_kernel(x, out, np.int32(rows), np.int32(cols), block=block, grid=grid)
+    return out
+
+
+def matmul_bias(
+    A: gpuarray.GPUArray, B: gpuarray.GPUArray, bias: gpuarray.GPUArray,
+    tracer=None, name: str = "gemm_bias",
+) -> gpuarray.GPUArray:
+    """C = A @ B + bias (contiguous A, B only)."""
+    assert A.flags.c_contiguous and B.flags.c_contiguous
+    M, K = int(A.shape[0]), int(A.shape[1])
+    assert B.shape[0] == K and int(bias.size) == int(B.shape[1])
+    N = int(B.shape[1])
+    C = gpuarray.empty((M, N), dtype=np.float32)
+    block_dim = (16, 16, 1)
+    grid_dim = (int(np.ceil(N / 16)), int(np.ceil(M / 16)), 1)
+    if tracer is not None and getattr(tracer, "trace_vectorization", False):
+        tracer.log_vectorization(name, (M, K), (K, N), (M, N), grid_dim, block_dim)
+    _gemm_bias_kernel(
+        A, B, bias, C, np.int32(M), np.int32(N), np.int32(K),
+        block=block_dim, grid=grid_dim,
+    )
+    return C
+
+
+def reduce_sum_axis0(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Sum over axis 0 of a 2D [rows, channels] array. Returns [channels]."""
+    assert x.ndim == 2 and x.flags.c_contiguous
+    rows, channels = int(x.shape[0]), int(x.shape[1])
+    out = gpuarray.empty((channels,), dtype=np.float32)
+    threads = next_pow2(min(rows, 256))
+    shared = threads * np.dtype(np.float32).itemsize
+    _reduce_sum_axis0_kernel(
+        x, out, np.int32(rows), np.int32(channels),
+        block=(threads, 1, 1), grid=(channels, 1, 1), shared=shared,
+    )
+    return out
+
+
+def linear_backward(
+    dout: gpuarray.GPUArray,
+    x: gpuarray.GPUArray,
+    weight: gpuarray.GPUArray,
+) -> tuple:
+    """Backward for y = x @ weight + b. weight is [in, out]. Returns (d_x, d_weight, d_bias)."""
+    d_weight = matmul(x.T, dout)
+    d_bias = reduce_sum_axis0(dout)
+    d_x = matmul(dout, weight.T)
+    return d_x, d_weight, d_bias
 
 
 def add_bias(a: gpuarray.GPUArray, bias: gpuarray.GPUArray) -> gpuarray.GPUArray:
@@ -180,18 +272,16 @@ def causal_self_attention(
     head_dim: int,
     scale: float,
 ) -> tuple:
-    """Fused causal MHA on device. Q/K/V are [B*T, C] with C = H*hd.
-
-    Returns (attn_concat [B*T, C], probs [B, H, T, T] on device).
-    """
+    """Causal MHA on interleaved Q/K/V [B*T, C]. Returns (attn_concat, probs)."""
     B, T, H, hd = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
     C = H * hd
     out = gpuarray.empty((B * T, C), dtype=np.float32)
     probs = gpuarray.empty((B * H * T * T,), dtype=np.float32)
 
-    shared_bytes = (2 * T + hd) * np.dtype(np.float32).itemsize
+    num_warps = (hd + 31) // 32
+    shared_bytes = (2 * T + hd + num_warps) * np.dtype(np.float32).itemsize
     grid = (T, H, B)
-    block = (hd, 1, 1)
+    block = (int(hd), 1, 1)
 
     _causal_mha_kernel(
         q, k, v, out, probs,
@@ -199,6 +289,273 @@ def causal_self_attention(
         block=block, grid=grid, shared=shared_bytes,
     )
     return out, probs
+
+
+# Phase 2C fused forward is correct but ~2x slower than causal_mha on sm_35 at T=256.
+# Default uses corrected causal_mha; set True to force the GPU5 fused kernel.
+_USE_FUSED_ATTENTION_FORWARD = False
+
+
+def split_heads_from_qkv(
+    qkv: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+) -> tuple:
+    """QKV [B*T, 3*C] -> Q,K,V each [B*NH, T, HD]."""
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    q = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    k = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    v = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _split_heads_kernel(
+        qkv, q, k, v, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return q, k, v
+
+
+def pack_qkv_from_heads(
+    d_q: gpuarray.GPUArray, d_k: gpuarray.GPUArray, d_v: gpuarray.GPUArray,
+    batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+) -> gpuarray.GPUArray:
+    """Pack dQ/dK/dV [B*NH, T, HD] into dQKV [B*T, 3*C]."""
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    out = gpuarray.empty((B * T, 3 * NH * HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _merge_heads_qkv_kernel(
+        d_q, d_k, d_v, out, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return out
+
+
+def fused_causal_attention_from_qkv(
+    qkv: gpuarray.GPUArray,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    scale: float,
+) -> tuple:
+    """Attention from QKV [B*T, 3*C].
+
+    Returns (attn_concat [B*T, C], probs flat, q_h, k_h, v_h) with heads
+    in [B*NH, T, HD] for the backward path (avoids re-split).
+    """
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    C = NH * HD
+    H = B * NH
+    M, D = T, HD
+
+    if _USE_FUSED_ATTENTION_FORWARD:
+        q_h, k_h, v_h = split_heads_from_qkv(qkv, B, T, NH, HD)
+        probs = gpuarray.empty((H, M, M), dtype=np.float32)
+        out_h = gpuarray.empty((H, M, D), dtype=np.float32)
+        row_max = gpuarray.empty((H, M), dtype=np.float32)
+        row_sum = gpuarray.empty((H, M), dtype=np.float32)
+        threads = next_pow2(max(D, min(M, 256)))
+        shared_bytes = (D + M + threads) * np.dtype(np.float32).itemsize
+        _fused_attn_fwd_kernel(
+            q_h, k_h, v_h, probs, out_h, row_max, row_sum,
+            np.int32(H), np.int32(M), np.int32(D), np.float32(scale),
+            block=(threads, 1, 1), grid=(H, M, 1), shared=shared_bytes,
+        )
+        attn_concat = merge_heads(out_h, B, T, NH, HD)
+        return attn_concat, probs.reshape(H * M * M), q_h, k_h, v_h
+
+    # Default: corrected causal_mha (faster on Kepler) + head-layout cache.
+    q, k, v = split_qkv(qkv, C)
+    attn_concat, probs = causal_self_attention(q, k, v, B, T, NH, HD, scale)
+    q_h = interleaved_to_heads(q, B, T, NH, HD)
+    k_h = interleaved_to_heads(k, B, T, NH, HD)
+    v_h = interleaved_to_heads(v, B, T, NH, HD)
+    return attn_concat, probs, q_h, k_h, v_h
+
+
+def softmax_backward(
+    probs: gpuarray.GPUArray,
+    d_probs: gpuarray.GPUArray,
+    scale: float = 1.0,
+) -> gpuarray.GPUArray:
+    """Softmax backward for attention matrices [rows, T]. Returns d_scores on device."""
+    assert probs.shape == d_probs.shape
+    T = int(probs.shape[-1])
+    total_rows = int(np.prod(probs.shape[:-1])) if probs.ndim > 1 else 1
+    d_scores = gpuarray.empty_like(probs)
+    threads = next_pow2(T)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _softmax_backward_kernel(
+        probs, d_probs, d_scores,
+        np.int32(T), np.int32(total_rows), np.float32(scale),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return d_scores
+
+
+def interleaved_to_heads(
+    x: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+) -> gpuarray.GPUArray:
+    """[B*T, NH*HD] -> [B*NH, T, HD] contiguous."""
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    out = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _interleaved_to_heads_kernel(
+        x, out, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return out
+
+
+def merge_heads(
+    heads: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+) -> gpuarray.GPUArray:
+    """[B*NH, T, HD] -> [B*T, NH*HD]."""
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    out = gpuarray.empty((B * T, NH * HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _merge_heads_kernel(
+        heads, out, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return out
+
+
+def pack_qkv(q: gpuarray.GPUArray, k: gpuarray.GPUArray, v: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Pack [rows, C] Q/K/V into [rows, 3*C]."""
+    rows, c = int(q.shape[0]), int(q.shape[1])
+    out = gpuarray.empty((rows, 3 * c), dtype=np.float32)
+    n = rows * c
+    grid, block = _launch_1d(n)
+    _pack_qkv_kernel(q, k, v, out, np.int32(rows), np.int32(c), block=block, grid=grid)
+    return out
+
+
+def attention_backward_heads(
+    d_attn_concat: gpuarray.GPUArray,
+    q: gpuarray.GPUArray,
+    k: gpuarray.GPUArray,
+    v: gpuarray.GPUArray,
+    probs: gpuarray.GPUArray,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    scale: float,
+    heads_layout: bool = False,
+) -> tuple:
+    """Attention backward over all heads in a few batched launches.
+
+    If ``heads_layout`` is True, q/k/v are [B*NH, T, HD]; else [B*T, C].
+    d_attn_concat is always [B*T, C].
+    Returns (d_q, d_k, d_v) in the same layout as q/k/v.
+    """
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    H = B * NH
+    M, D = T, HD
+
+    if heads_layout:
+        q_h, k_h, v_h = q, k, v
+    else:
+        q_h = interleaved_to_heads(q, B, T, NH, HD)
+        k_h = interleaved_to_heads(k, B, T, NH, HD)
+        v_h = interleaved_to_heads(v, B, T, NH, HD)
+    d_out_h = interleaved_to_heads(d_attn_concat, B, T, NH, HD)
+    probs_h = probs.reshape(H, M, M)
+
+    d_probs = gpuarray.empty((H, M, M), dtype=np.float32)
+    d_raw = gpuarray.empty((H, M, M), dtype=np.float32)
+    row_sum = gpuarray.empty((H, M), dtype=np.float32)
+    d_q_h = gpuarray.empty((H, M, D), dtype=np.float32)
+    d_k_h = gpuarray.empty((H, M, D), dtype=np.float32)
+    d_v_h = gpuarray.empty((H, M, D), dtype=np.float32)
+
+    _gemm_batched_kernel(
+        probs_h, d_out_h, d_v_h,
+        np.int32(M), np.int32(D), np.int32(M), np.int32(H),
+        np.int32(1), np.int32(0),
+        block=(16, 16, 1),
+        grid=(int(np.ceil(D / 16)), int(np.ceil(M / 16)), H),
+    )
+    _gemm_batched_kernel(
+        d_out_h, v_h, d_probs,
+        np.int32(M), np.int32(M), np.int32(D), np.int32(H),
+        np.int32(0), np.int32(1),
+        block=(16, 16, 1),
+        grid=(int(np.ceil(M / 16)), int(np.ceil(M / 16)), H),
+    )
+
+    sm_threads = next_pow2(min(M, 256))
+    sm_shared = sm_threads * np.dtype(np.float32).itemsize
+    _softmax_fused_backward_kernel(
+        d_probs, probs_h, row_sum, d_raw,
+        np.int32(H), np.int32(M),
+        block=(sm_threads, 1, 1), grid=(H, M, 1), shared=sm_shared,
+    )
+    scal_mul(d_raw, scale)
+
+    _gemm_batched_kernel(
+        d_raw, k_h, d_q_h,
+        np.int32(M), np.int32(D), np.int32(M), np.int32(H),
+        np.int32(0), np.int32(0),
+        block=(16, 16, 1),
+        grid=(int(np.ceil(D / 16)), int(np.ceil(M / 16)), H),
+    )
+    _gemm_batched_kernel(
+        d_raw, q_h, d_k_h,
+        np.int32(M), np.int32(D), np.int32(M), np.int32(H),
+        np.int32(1), np.int32(0),
+        block=(16, 16, 1),
+        grid=(int(np.ceil(D / 16)), int(np.ceil(M / 16)), H),
+    )
+
+    if heads_layout:
+        return d_q_h, d_k_h, d_v_h
+    return (
+        merge_heads(d_q_h, B, T, NH, HD),
+        merge_heads(d_k_h, B, T, NH, HD),
+        merge_heads(d_v_h, B, T, NH, HD),
+    )
+
+
+def add_block(
+    acc: gpuarray.GPUArray,
+    block: gpuarray.GPUArray,
+    row0: int,
+    col_start: int,
+    C: int,
+    hd: int,
+) -> None:
+    """Accumulate [block_rows, hd] block into acc[row0:row0+block_rows, col_start:col_start+hd]."""
+    block_rows = int(block.shape[0])
+    n = block_rows * hd
+    threads = 256
+    blocks = int(np.ceil(n / threads))
+    _add_block_kernel(
+        acc, block, np.int32(row0), np.int32(C), np.int32(col_start), np.int32(hd), np.int32(block_rows),
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+
+
+def add_inplace(acc: gpuarray.GPUArray, block: gpuarray.GPUArray) -> None:
+    """acc += block elementwise (same shape)."""
+    assert acc.shape == block.shape
+    n = np.int32(acc.size)
+    threads = 256
+    blocks = int(np.ceil(int(n) / threads))
+    _add_inplace_kernel(acc, block, n, block=(threads, 1, 1), grid=(blocks, 1, 1))
+
+
+def grad_global_norm_sq(grads) -> float:
+    """Sum of squares of all gradient tensors on device (single scalar D2H)."""
+    buf = _zeros_gpu((1,))
+    threads = 256
+    for g in grads.values():
+        n = np.int32(g.size)
+        blocks = int(np.ceil(int(n) / threads))
+        _grad_norm_contrib_kernel(g, buf, n, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return float(buf.get()[0])
 
 
 def layernorm_with_cache(
@@ -273,18 +630,6 @@ def cross_entropy(logits: gpuarray.GPUArray, targets: np.ndarray) -> tuple:
         block=(threads, 1, 1), grid=(rows, 1, 1), shared=shared_bytes,
     )
     return float(loss_buf.get()[0]) / rows, d_logits
-
-
-def linear_backward(
-    dout: gpuarray.GPUArray,
-    x: gpuarray.GPUArray,
-    weight: gpuarray.GPUArray,
-) -> tuple:
-    """Backward for y = x @ weight + b. weight is [in, out]. Returns (d_x, d_weight, d_bias)."""
-    d_weight = matmul(x.T, dout)
-    d_bias = to_device(to_host(dout).sum(axis=0).astype(np.float32))
-    d_x = matmul(dout, weight.T)
-    return d_x, d_weight, d_bias
 
 
 def scal_mul(arr: gpuarray.GPUArray, scale: float) -> gpuarray.GPUArray:

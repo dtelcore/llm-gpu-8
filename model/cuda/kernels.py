@@ -252,11 +252,17 @@ __global__ void add_fp32(const float* a, const float* b, float* out, int n_eleme
     }
 }
 
+// Warp-reduction helper (Kepler sm_35: __shfl_down, not __shfl_down_sync).
+__device__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down(val, offset);
+    }
+    return val;
+}
+
 // Fused causal multi-head attention for one (batch, head, query_row).
 // Q,K,V layout: [B*T, C] row-major, C = H*hd; head h cols [h*hd : (h+1)*hd].
-// O: [B*T, C] concatenated head outputs per row.
-// Probs: [B, H, T, T] flattened as ((b*H + h)*T + row)*T + col.
-// blockDim.x must equal hd (head dimension); uses shared-memory reduction.
+// blockDim.x must equal hd.
 __global__ void causal_mha_fp32(
     const float* Q, const float* K, const float* V,
     float* O, float* Probs,
@@ -271,35 +277,37 @@ __global__ void causal_mha_fp32(
 
     int C = H * hd;
     extern __shared__ float smem[];
-    float* s_scores = smem;
-    float* s_probs = smem + T;
-    float* red = smem + 2 * T;
+    float* s_scores = smem;                    // [T]
+    float* s_probs = smem + T;                 // [T]
+    float* q_sh = smem + 2 * T;                // [hd]
+    float* warp_sums = smem + 2 * T + hd;      // [ceil(hd/32)]
 
     const float* q_row = Q + (batch * T + row) * C + head * hd;
     float* o_row = O + (batch * T + row) * C + head * hd;
     int prob_row_base = ((batch * H + head) * T + row) * T;
+    int num_warps = (hd + 31) / 32;
+
+    q_sh[tid] = q_row[tid];
+    __syncthreads();
 
     for (int j = 0; j <= row; ++j) {
         const float* k_row = K + (batch * T + j) * C + head * hd;
-        float partial = q_row[tid] * k_row[tid];
-        red[tid] = partial;
+        float partial = q_sh[tid] * k_row[tid];
+        float warp_sum = warp_reduce_sum(partial);
+        if ((tid & 31) == 0) warp_sums[tid >> 5] = warp_sum;
         __syncthreads();
-
         if (tid == 0) {
             float dot = 0.0f;
-            for (int d = 0; d < hd; ++d) {
-                dot += red[d];
-            }
+            for (int w = 0; w < num_warps; ++w) dot += warp_sums[w];
             s_scores[j] = dot * scale;
         }
+        // Required: prevent other warps from overwriting warp_sums while tid0 reduces.
         __syncthreads();
     }
 
     if (tid == 0) {
-        float max_val = -1e9f;
-        for (int j = 0; j <= row; ++j) {
-            max_val = fmaxf(max_val, s_scores[j]);
-        }
+        float max_val = -1e30f;
+        for (int j = 0; j <= row; ++j) max_val = fmaxf(max_val, s_scores[j]);
         float sum = 0.0f;
         for (int j = 0; j <= row; ++j) {
             float e = expf(s_scores[j] - max_val);
@@ -311,9 +319,7 @@ __global__ void causal_mha_fp32(
             s_probs[j] *= inv_sum;
             Probs[prob_row_base + j] = s_probs[j];
         }
-        for (int j = row + 1; j < T; ++j) {
-            Probs[prob_row_base + j] = 0.0f;
-        }
+        for (int j = row + 1; j < T; ++j) Probs[prob_row_base + j] = 0.0f;
     }
     __syncthreads();
 
@@ -460,6 +466,98 @@ __global__ void pos_embed_backward_fp32(
     atomicAdd(&pos_grad[t * C + tid], acc);
 }
 
+// Fused softmax backward for attention: d_scores = probs * (d_probs - row_dot) * scale
+// probs/d_probs/d_scores are [total_rows, T] row-major (one row per query position).
+__global__ void softmax_backward_fp32(
+    const float* probs,
+    const float* d_probs,
+    float* d_scores,
+    int T,
+    int total_rows,
+    float scale
+) {
+    extern __shared__ float sdata[];
+
+    int row = blockIdx.x;
+    if (row >= total_rows) return;
+
+    int tid = threadIdx.x;
+    int offset = row * T;
+
+    float local_dot = 0.0f;
+    for (int i = tid; i < T; i += blockDim.x) {
+        local_dot += probs[offset + i] * d_probs[offset + i];
+    }
+    sdata[tid] = local_dot;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float row_dot = sdata[0];
+    __syncthreads();
+
+    for (int i = tid; i < T; i += blockDim.x) {
+        d_scores[offset + i] = probs[offset + i] * (d_probs[offset + i] - row_dot) * scale;
+    }
+}
+
+// Add block [block_rows, hd] into acc[(row0+r)*C + col_start + c].
+__global__ void add_block_fp32(
+    float* acc, const float* block,
+    int row0, int C, int col_start, int hd, int block_rows
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = block_rows * hd;
+    if (idx >= n) return;
+    int r = idx / hd;
+    int c = idx % hd;
+    atomicAdd(&acc[(row0 + r) * C + col_start + c], block[r * hd + c]);
+}
+
+// Accumulate squared gradient elements into out[0] (for global norm).
+__global__ void grad_norm_contrib_fp32(const float* g, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) atomicAdd(out, g[i] * g[i]);
+}
+
+// Elementwise add: out += block (same shape, n elements).
+__global__ void add_inplace_fp32(float* out, const float* block, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) atomicAdd(&out[i], block[i]);
+}
+
+// Batched GEMM with optional transpose: C[b]=op(A[b]) @ op(B[b]).
+// A,B,C are contiguous [batch, ...] row-major.
+// If transA=0, A[b] is [M,K]; if transA=1, A[b] is stored [K,M] and read as A^T -> [M,K].
+// If transB=0, B[b] is [K,N]; if transB=1, B[b] is stored [N,K] and read as B^T -> [K,N].
+// C[b] is always [M,N].
+__global__ void gemm_batched_fp32(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, int batch,
+    int transA, int transB
+) {
+    int bat = blockIdx.z;
+    if (bat >= batch) return;
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    const float* Ab = A + bat * (M * K);
+    const float* Bb = B + bat * (K * N);
+    float* Cb = C + bat * (M * N);
+
+    float sum = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        float av = transA ? Ab[i * M + row] : Ab[row * K + i];
+        float bv = transB ? Bb[col * K + i] : Bb[i * N + col];
+        sum += av * bv;
+    }
+    Cb[row * N + col] = sum;
+}
+
 // Token + position embedding forward: out[(b*T+t)*C+c] = tok_emb[id,c] + pos_emb[t,c]
 __global__ void embed_forward_fp32(
     const float* tok_emb, const float* pos_emb, const int* ids,
@@ -474,5 +572,403 @@ __global__ void embed_forward_fp32(
     int t = bt % T;
     int id = ids[b * T + t];
     out[idx] = tok_emb[id * C + c] + pos_emb[t * C + c];
+}
+
+// ============================================================================
+// MHA backward suite (ported from llm gpu 5/core/mha_kernels.py)
+// Score-Space:   [H, M, M]  with H=B*NH, M=T
+// Projection:    [H, M, D]  with D=HD
+// Interleaved:   [B*T, NH*HD]
+// ============================================================================
+
+// [B*T, C] head-interleaved -> [B*NH, T, HD]
+__global__ void interleaved_to_heads(
+    const float* X, float* Out,
+    int B, int T, int NH, int HD
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * T * NH * HD;
+    if (idx >= total) return;
+
+    int hd = idx % HD;
+    int nh = (idx / HD) % NH;
+    int t  = (idx / (HD * NH)) % T;
+    int b  = idx / (HD * NH * T);
+
+    int in_idx = (b * T + t) * (NH * HD) + nh * HD + hd;
+    int out_idx = (b * NH + nh) * T * HD + t * HD + hd;
+    Out[out_idx] = X[in_idx];
+}
+
+// [B*NH, T, HD] -> [B*T, C]
+__global__ void merge_heads_kernel(
+    const float* ContextHeads, float* Context,
+    int B, int T, int NH, int HD
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * T * NH * HD;
+    if (idx >= total) return;
+
+    int hd = idx % HD;
+    int nh = (idx / HD) % NH;
+    int t  = (idx / (HD * NH)) % T;
+    int b  = idx / (HD * NH * T);
+
+    int in_idx = (b * NH + nh) * T * HD + t * HD + hd;
+    int out_idx = (b * T + t) * (NH * HD) + nh * HD + hd;
+    Context[out_idx] = ContextHeads[in_idx];
+}
+
+// Pack Q,K,V [rows, C] into qkv [rows, 3*C]
+__global__ void pack_qkv_fp32(
+    const float* q, const float* k, const float* v, float* qkv,
+    int rows, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = rows * C;
+    if (idx >= n) return;
+    int row = idx / C;
+    int col = idx % C;
+    int base = row * 3 * C;
+    qkv[base + col] = q[idx];
+    qkv[base + C + col] = k[idx];
+    qkv[base + 2 * C + col] = v[idx];
+}
+
+// Scores[h,i,j] = sum_d A[h,i,d] * B[h,j,d] * scale  (used for dProbs = dOut @ V^T)
+__global__ void matmul_score_kernel(
+    const float* A, const float* B, float* Scores,
+    int H, int M, int D, float scale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = H * M * M;
+    if (idx >= total) return;
+
+    int h = idx / (M * M);
+    int rem = idx - h * (M * M);
+    int i = rem / M;
+    int j = rem - i * M;
+
+    int a_base = h * M * D + i * D;
+    int b_base = h * M * D + j * D;
+
+    float acc = 0.0f;
+    for (int d = 0; d < D; ++d) {
+        acc += A[a_base + d] * B[b_base + d];
+    }
+    Scores[h * M * M + i * M + j] = acc * scale;
+}
+
+// Softmax VJP: dRaw[h,i,j] = probs[h,i,j] * (dProbs[h,i,j] - dot_i); causal j<=i
+// Note: does NOT apply attention scale — caller multiplies dRaw by scale afterward.
+__global__ void softmax_fused_backward(
+    const float* dScores, const float* probs,
+    float* row_sum, float* dProbs,
+    int H, int M
+) {
+    extern __shared__ float shared_buf[];
+
+    int h = blockIdx.x;
+    int i = blockIdx.y;
+    int tid = threadIdx.x;
+    if (h >= H || i >= M) return;
+
+    int row_base = h * M * M + i * M;
+    int valid_cols = i + 1;
+
+    float thread_dot = 0.0f;
+    for (int j = tid; j < valid_cols; j += blockDim.x) {
+        thread_dot += dScores[row_base + j] * probs[row_base + j];
+    }
+    shared_buf[tid] = thread_dot;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_buf[tid] += shared_buf[tid + stride];
+        }
+        __syncthreads();
+    }
+    float dot_val = shared_buf[0];
+    __syncthreads();
+
+    if (tid == 0) {
+        row_sum[h * M + i] = dot_val;
+    }
+
+    for (int j = tid; j < valid_cols; j += blockDim.x) {
+        dProbs[row_base + j] = probs[row_base + j] * (dScores[row_base + j] - dot_val);
+    }
+    for (int j = valid_cols + tid; j < M; j += blockDim.x) {
+        dProbs[row_base + j] = 0.0f;
+    }
+}
+
+// dQ = dRaw @ K
+__global__ void matmul_grad_q_kernel(
+    const float* dProbs, const float* K, float* dQ,
+    int H, int M, int D
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = H * M * D;
+    if (idx >= total) return;
+
+    int h = idx / (M * D);
+    int rem = idx - h * (M * D);
+    int i = rem / D;
+    int d = rem - i * D;
+
+    int row_base = h * M * M + i * M;
+    int k_col_base = h * M * D + d;
+
+    float acc = 0.0f;
+    for (int j = 0; j < M; ++j) {
+        acc += dProbs[row_base + j] * K[k_col_base + j * D];
+    }
+    dQ[h * M * D + i * D + d] = acc;
+}
+
+// dK = dRaw^T @ Q
+__global__ void matmul_grad_k_kernel(
+    const float* dProbs, const float* Q, float* dK,
+    int H, int M, int D
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = H * M * D;
+    if (idx >= total) return;
+
+    int h = idx / (M * D);
+    int rem = idx - h * (M * D);
+    int j = rem / D;
+    int d = rem - j * D;
+
+    int q_col_base = h * M * D + d;
+    int scores_base = h * M * M;
+
+    float acc = 0.0f;
+    for (int i = 0; i < M; ++i) {
+        acc += dProbs[scores_base + i * M + j] * Q[q_col_base + i * D];
+    }
+    dK[h * M * D + j * D + d] = acc;
+}
+
+// dV = probs^T @ dOut
+__global__ void matmul_grad_v(
+    const float* probs, const float* dOut, float* dV,
+    int H, int M, int D
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = H * M * D;
+    if (idx >= total) return;
+
+    int h = idx / (M * D);
+    int rem = idx - h * (M * D);
+    int j = rem / D;
+    int d = rem - j * D;
+
+    int dout_col_base = h * M * D + d;
+    int probs_base = h * M * M;
+
+    float acc = 0.0f;
+    for (int i = 0; i < M; ++i) {
+        acc += probs[probs_base + i * M + j] * dOut[dout_col_base + i * D];
+    }
+    dV[h * M * D + j * D + d] = acc;
+}
+
+// Transpose 2D matrix: out[c, r] = in[r, c]. in is [rows, cols], out is [cols, rows].
+__global__ void transpose_2d_fp32(const float* in, float* out, int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = rows * cols;
+    if (idx >= n) return;
+    int r = idx / cols;
+    int c = idx % cols;
+    out[c * rows + r] = in[idx];
+}
+
+// Column sum: output[c] = sum_r input[r, c].
+// One block per channel; threads cooperatively reduce over rows.
+__global__ void reduce_sum_axis0_fp32(
+    const float* input, float* output, int num_rows, int channels
+) {
+    extern __shared__ float sdata[];
+    int c = blockIdx.x;
+    if (c >= channels) return;
+    int tid = threadIdx.x;
+
+    float acc = 0.0f;
+    for (int r = tid; r < num_rows; r += blockDim.x) {
+        acc += input[r * channels + c];
+    }
+    sdata[tid] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) output[c] = sdata[0];
+}
+
+// GEMM + bias: C = A @ B + bias[col]. A[M,K], B[K,N], bias[N], C[M,N].
+__global__ void gemm_bias_fp32(
+    const float* A, const float* B, const float* bias, float* C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+    float sum = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        sum += A[row * K + i] * B[i * N + col];
+    }
+    C[row * N + col] = sum + bias[col];
+}
+
+// QKV [B*T, 3*C] -> Q/K/V [B*NH, T, HD]
+__global__ void split_heads_kernel(
+    const float* QKV, float* Q, float* K, float* V,
+    int B, int T, int NH, int HD
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int C = NH * HD;
+    int total = B * T * NH * HD;
+    if (idx >= total) return;
+
+    int hd = idx % HD;
+    int nh = (idx / HD) % NH;
+    int t  = (idx / (HD * NH)) % T;
+    int b  = idx / (HD * NH * T);
+
+    int qkv_row = b * T + t;
+    int col = nh * HD + hd;
+    int out_idx = (b * NH + nh) * T * HD + t * HD + hd;
+
+    Q[out_idx] = QKV[qkv_row * 3 * C + col];
+    K[out_idx] = QKV[qkv_row * 3 * C + C + col];
+    V[out_idx] = QKV[qkv_row * 3 * C + 2 * C + col];
+}
+
+// Pack dQ/dK/dV [B*NH, T, HD] into dQKV [B*T, 3*C]
+__global__ void merge_heads_qkv_kernel(
+    const float* dQ, const float* dK, const float* dV, float* dQKV,
+    int B, int T, int NH, int HD
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int C = NH * HD;
+    int total = B * T * NH * HD;
+    if (idx >= total) return;
+
+    int hd = idx % HD;
+    int nh = (idx / HD) % NH;
+    int t  = (idx / (HD * NH)) % T;
+    int b  = idx / (HD * NH * T);
+
+    int in_idx = (b * NH + nh) * T * HD + t * HD + hd;
+    int qkv_row = b * T + t;
+    int col = nh * HD + hd;
+    dQKV[qkv_row * 3 * C + col] = dQ[in_idx];
+    dQKV[qkv_row * 3 * C + C + col] = dK[in_idx];
+    dQKV[qkv_row * 3 * C + 2 * C + col] = dV[in_idx];
+}
+
+// Phase 2C: fused QKt + causal softmax + PV. One block per (h, i) row.
+// Q/K/V/Out: [H, M, D]; Scores: [H, M, M] normalized probs.
+__global__ void fused_attention_forward_kernel(
+    const float* Q, const float* K, const float* V,
+    float* Scores, float* Out,
+    float* row_max, float* row_sum,
+    int H, int M, int D, float scale
+) {
+    extern __shared__ float smem[];
+    float* q_row = smem;
+    float* row_scores = smem + D;
+    float* scratch = smem + D + M;
+
+    int h = blockIdx.x;
+    int i = blockIdx.y;
+    int tid = threadIdx.x;
+    if (h >= H || i >= M) return;
+
+    int valid_cols = i + 1;
+    int q_base = h * M * D + i * D;
+
+    for (int d = tid; d < D; d += blockDim.x) {
+        q_row[d] = Q[q_base + d];
+    }
+    __syncthreads();
+
+    for (int j = tid; j < valid_cols; j += blockDim.x) {
+        int k_base = h * M * D + j * D;
+        float acc = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            acc += q_row[d] * K[k_base + d];
+        }
+        row_scores[j] = acc * scale;
+    }
+    __syncthreads();
+
+    float thread_max = -1e30f;
+    for (int j = tid; j < valid_cols; j += blockDim.x) {
+        thread_max = fmaxf(thread_max, row_scores[j]);
+    }
+    scratch[tid] = thread_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float max_val = scratch[0];
+    __syncthreads();
+
+    float thread_sum = 0.0f;
+    for (int j = tid; j < valid_cols; j += blockDim.x) {
+        float exp_v = expf(row_scores[j] - max_val);
+        row_scores[j] = exp_v;
+        thread_sum += exp_v;
+    }
+    scratch[tid] = thread_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    float sum_val = scratch[0];
+    __syncthreads();
+
+    if (tid == 0) {
+        row_max[h * M + i] = max_val;
+        row_sum[h * M + i] = sum_val;
+    }
+
+    float inv_sum = 1.0f / sum_val;
+    for (int j = tid; j < valid_cols; j += blockDim.x) {
+        row_scores[j] *= inv_sum;
+    }
+    for (int j = valid_cols + tid; j < M; j += blockDim.x) {
+        row_scores[j] = 0.0f;
+    }
+    __syncthreads();
+
+    int row_base = h * M * M + i * M;
+    for (int j = tid; j < M; j += blockDim.x) {
+        Scores[row_base + j] = row_scores[j];
+    }
+    __syncthreads();
+
+    // PV: parallelize over D (avoid serial D loop + sync per channel).
+    for (int d = tid; d < D; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < valid_cols; ++j) {
+            acc += row_scores[j] * V[h * M * D + j * D + d];
+        }
+        Out[h * M * D + i * D + d] = acc;
+    }
 }
 """
