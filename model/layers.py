@@ -59,21 +59,24 @@ def mlp_block_device(
     contract_bias,
     tracer: TraceContext = None,
 ):
-    """FFN block entirely on device: linear -> gelu -> linear."""
-    hidden = linear(xd, expand_weight, expand_bias, tracer=tracer, name="mlp_expand")
-    hidden = gelu(hidden)
+    """FFN block entirely on device: fused (linear + gelu) -> linear."""
+    _hidden_preact, hidden = ops.matmul_bias_gelu(
+        xd, expand_weight, expand_bias, tracer=tracer, name="mlp_expand",
+    )
     return linear(hidden, contract_weight, contract_bias, tracer=tracer, name="mlp_contract")
 
 
 def causal_self_attention_device(
-    qkv_d,
+    ln1_out_d,
+    w_qkv,
+    bias_qkv,
     batch_size: int,
     seq_len: int,
     num_heads: int,
     head_dim: int,
     scale: float,
 ):
-    """Fused GPU causal attention from a [B*T, 3*C] qkv projection."""
+    """Fused GPU QKV projection + split + causal attention."""
     return ops.fused_causal_attention_from_qkv(
-        qkv_d, batch_size, seq_len, num_heads, head_dim, scale,
+        ln1_out_d, w_qkv, bias_qkv, batch_size, seq_len, num_heads, head_dim, scale,
     )

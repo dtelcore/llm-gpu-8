@@ -260,14 +260,10 @@ class GPTModel:
     ):
         dw, db = self.params.device_weights, self.params.device_biases
 
-        qkv_d = layers.linear(
-            ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
-            tracer=tracer, name=f"{prefix}.qkv",
-        )
-
         if _USE_GPU_ATTENTION:
             attn_concat_d, probs_d, q_h, k_h, v_h = cuda_ops.fused_causal_attention_from_qkv(
-                qkv_d, B, T, H, hd, scale,
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                B, T, H, hd, scale, tracer=tracer, name=f"{prefix}.qkv",
             )
             attn_out_d = layers.linear(
                 attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
@@ -279,6 +275,10 @@ class GPTModel:
                 "scale": scale, "B": B, "T": T, "gpu": True, "heads_layout": True,
             }
         else:
+            qkv_d = layers.linear(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                tracer=tracer, name=f"{prefix}.qkv",
+            )
             qkv = cuda_ops.to_host(qkv_d)
             attn_concat, probs_h, q_h, k_h, v_h = _batched_attention_host(
                 qkv, B, T, H, hd, scale,
@@ -303,11 +303,10 @@ class GPTModel:
     def _mlp_forward_batch(self, ln2_out_d, ln2_out_host: np.ndarray, prefix: str, tracer: TraceContext = None):
         dw, db = self.params.device_weights, self.params.device_biases
 
-        hidden_d = layers.linear(
+        hidden_d, act_d = cuda_ops.matmul_bias_gelu(
             ln2_out_d, dw[f"{prefix}.mlp_expand"], db[f"{prefix}.mlp_expand_bias"],
             tracer=tracer, name=f"{prefix}.mlp_expand",
         )
-        act_d = layers.gelu(hidden_d)
         mlp_out_d = layers.linear(
             act_d, dw[f"{prefix}.mlp_contract"], db[f"{prefix}.mlp_contract_bias"],
             tracer=tracer, name=f"{prefix}.mlp_contract",

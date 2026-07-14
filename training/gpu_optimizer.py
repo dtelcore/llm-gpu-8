@@ -52,6 +52,23 @@ class AdamWGPU:
             self.m[key] = cuda_ops.to_device(z)
             self.v[key] = cuda_ops.to_device(z)
 
+        # Pointer-table indirection for the batched single-launch update (item 3
+        # of the fusion plan). w/m/v gpuarrays are allocated once for the run
+        # (see model/weights.py) so their pointers + offsets are built once here;
+        # only grad pointers are gathered fresh each step() since grad buffers
+        # are freshly allocated every backward pass.
+        self._batch_keys = [k for k in all_keys if k in self.m]
+        sizes = [int(self._get_weight(k).size) for k in self._batch_keys]
+        offsets = np.zeros(len(sizes) + 1, dtype=np.int64)
+        np.cumsum(sizes, out=offsets[1:])
+        self._total_n = int(offsets[-1])
+        self._offsets_d = cuda_ops.to_device_int64(offsets)
+        self._w_ptrs_d = cuda_ops.to_device_ptrs(
+            [self._get_weight(k).gpudata for k in self._batch_keys]
+        )
+        self._m_ptrs_d = cuda_ops.to_device_ptrs([self.m[k].gpudata for k in self._batch_keys])
+        self._v_ptrs_d = cuda_ops.to_device_ptrs([self.v[k].gpudata for k in self._batch_keys])
+
     def current_lr(self) -> float:
         if self.warmup_steps > 0 and self.t < self.warmup_steps:
             return self.base_lr * (self.t + 1) / self.warmup_steps
@@ -78,14 +95,26 @@ class AdamWGPU:
         bc1 = 1.0 - b1 ** self.t
         bc2 = 1.0 - b2 ** self.t
 
-        for key, grad in grads.items():
-            if key not in self.m:
-                continue
-            w = self._get_weight(key)
-            cuda_ops.adamw_update(
-                w, grad, self.m[key], self.v[key],
-                lr, self.weight_decay, b1, b2, eps, bc1, bc2,
-            )
+        # Any tensor without a fresh grad this step keeps updating against a
+        # stale pointer otherwise (undefined old data) -- fall back to the
+        # per-tensor kernel for a missing subset, batched path for the rest.
+        missing = [k for k in self._batch_keys if k not in grads]
+        if missing:
+            present_keys = [k for k in self._batch_keys if k in grads]
+            for key in present_keys:
+                w = self._get_weight(key)
+                cuda_ops.adamw_update(
+                    w, grads[key], self.m[key], self.v[key],
+                    lr, self.weight_decay, b1, b2, eps, bc1, bc2,
+                )
+            return
+
+        g_ptrs_d = cuda_ops.to_device_ptrs([grads[k].gpudata for k in self._batch_keys])
+        cuda_ops.adamw_update_batched(
+            self._offsets_d, self._w_ptrs_d, g_ptrs_d, self._m_ptrs_d, self._v_ptrs_d,
+            len(self._batch_keys), self._total_n,
+            lr, self.weight_decay, b1, b2, eps, bc1, bc2,
+        )
 
     def sync_host_weights(self, names: Optional[Iterable[str]] = None) -> None:
         """Pull GPU mirrors back to host NumPy dicts (checkpoint save only)."""

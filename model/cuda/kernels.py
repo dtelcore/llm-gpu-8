@@ -85,6 +85,131 @@ __global__ void gemm_bias_fp32(const float* __restrict__ A, const float* __restr
     }
 }
 
+// Fused QKV projection + split: C = A @ B + bias, where B/bias have N = 3*C_head
+// columns. Instead of writing one [M, 3*C_head] buffer and re-reading it in a
+// separate split kernel, the epilogue routes each tile column directly into one
+// of three contiguous [M, C_head] outputs (q/k/v), saving one launch + one
+// round trip through global memory for the combined buffer.
+__global__ void gemm_bias_qkv_split_fp32(const float* __restrict__ A, const float* __restrict__ B,
+                                          const float* __restrict__ bias,
+                                          float* __restrict__ Q, float* __restrict__ K, float* __restrict__ V,
+                                          int M, int N, int Kdim, int C_head) {
+    __shared__ float sA[GEMM_TILE][GEMM_TILE];
+    __shared__ float sB[GEMM_TILE][GEMM_TILE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * GEMM_TILE + ty;
+    int col = blockIdx.x * GEMM_TILE + tx;
+
+    float sum = 0.0f;
+    int tiles = (Kdim + GEMM_TILE - 1) / GEMM_TILE;
+
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * GEMM_TILE + tx;
+        int b_row = t * GEMM_TILE + ty;
+
+        sA[ty][tx] = (row < M && a_col < Kdim) ? A[row * Kdim + a_col] : 0.0f;
+        sB[ty][tx] = (b_row < Kdim && col < N) ? B[b_row * N + col] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < GEMM_TILE; ++i) {
+            sum += sA[ty][i] * sB[i][tx];
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        float val = sum + bias[col];
+        int which = col / C_head;      // 0 = Q, 1 = K, 2 = V
+        int local_col = col % C_head;
+        float* out = (which == 0) ? Q : (which == 1) ? K : V;
+        out[row * C_head + local_col] = val;
+    }
+}
+
+// Fused expand-linear + GELU: C = A @ B + bias; writes both the pre-activation
+// (needed by gelu_backward_fp32) and the activated output, avoiding a separate
+// elementwise gelu_fp32 launch + extra read of the pre-activation buffer.
+__global__ void gemm_bias_gelu_fp32(const float* __restrict__ A, const float* __restrict__ B,
+                                     const float* __restrict__ bias,
+                                     float* __restrict__ Hidden, float* __restrict__ Act,
+                                     int M, int N, int K) {
+    __shared__ float sA[GEMM_TILE][GEMM_TILE];
+    __shared__ float sB[GEMM_TILE][GEMM_TILE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * GEMM_TILE + ty;
+    int col = blockIdx.x * GEMM_TILE + tx;
+
+    float sum = 0.0f;
+    int tiles = (K + GEMM_TILE - 1) / GEMM_TILE;
+
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * GEMM_TILE + tx;
+        int b_row = t * GEMM_TILE + ty;
+
+        sA[ty][tx] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+        sB[ty][tx] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < GEMM_TILE; ++i) {
+            sum += sA[ty][i] * sB[i][tx];
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        float val = sum + bias[col];
+        Hidden[row * N + col] = val;
+        float cdf = 0.5f * (1.0f + tanhf(0.79788456f * (val + 0.044715f * val * val * val)));
+        Act[row * N + col] = val * cdf;
+    }
+}
+
+// Fused single-row MLP: out = GELU(row @ W1 + b1) @ W2 + b2, one block per row.
+// Avoids materializing the [rows, hidden_dim] intermediate in global memory at
+// all (kept entirely in shared memory for the row). Gated behind a benchmark
+// flag in ops.py -- GEMV-per-row loses the tiled-GEMM row-reuse advantage on
+// wide batches, so this is only a win if hidden_dim is small enough that the
+// shared-memory-resident approach beats two tiled GEMMs + gemm_bias_gelu.
+__global__ void fused_mlp_row_fp32(
+    const float* __restrict__ X, const float* __restrict__ W1, const float* __restrict__ b1,
+    const float* __restrict__ W2, const float* __restrict__ b2, float* __restrict__ Out,
+    int C, int Hd
+) {
+    extern __shared__ float shared[];
+    float* x_row = shared;          // [C]
+    float* hidden = shared + C;     // [Hd]
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int threads = blockDim.x;
+    const float* x_ptr = X + row * C;
+
+    for (int i = tid; i < C; i += threads) x_row[i] = x_ptr[i];
+    __syncthreads();
+
+    for (int h = tid; h < Hd; h += threads) {
+        float sum = b1[h];
+        const float* w1_col = W1 + h;  // W1 is [C, Hd], column-major access
+        for (int i = 0; i < C; ++i) sum += x_row[i] * w1_col[i * Hd];
+        float cdf = 0.5f * (1.0f + tanhf(0.79788456f * (sum + 0.044715f * sum * sum * sum)));
+        hidden[h] = sum * cdf;
+    }
+    __syncthreads();
+
+    for (int o = tid; o < C; o += threads) {
+        float sum = b2[o];
+        const float* w2_col = W2 + o;  // W2 is [Hd, C], column-major access
+        for (int h = 0; h < Hd; ++h) sum += hidden[h] * w2_col[h * C];
+        Out[row * C + o] = sum;
+    }
+}
+
 // Elementwise add: out = a + b (broadcasts b over rows if b_len < n_elements and n_elements % b_len == 0)
 __global__ void add_bias_fp32(const float* a, const float* bias, float* out, int n_elements, int bias_len) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -554,6 +679,53 @@ __global__ void adamw_update_fp32(
     float v_hat = vv / bc2;
     w[i] -= lr * (m_hat / (sqrtf(v_hat) + eps));
     if (wd > 0.0f) w[i] -= lr * wd * w[i];
+}
+
+// Batched AdamW update across many separately-allocated tensors in one launch.
+// offsets[0..ntensors] are cumulative element counts (offsets[ntensors] == total_n).
+// w_ptrs/g_ptrs/m_ptrs/v_ptrs are device arrays of raw pointers (as unsigned long
+// long, reinterpreted as float*) into each tensor's buffer. Each thread binary
+// searches offsets (small: number of param tensors, ~tens to low hundreds) to
+// find which tensor it belongs to, then applies the same per-element math as
+// adamw_update_fp32. Replaces one Python-loop launch per tensor with a single
+// grid-stride launch over the union of all tensors.
+__global__ void adamw_update_batched_fp32(
+    const long long* __restrict__ offsets, int ntensors,
+    const unsigned long long* __restrict__ w_ptrs,
+    const unsigned long long* __restrict__ g_ptrs,
+    const unsigned long long* __restrict__ m_ptrs,
+    const unsigned long long* __restrict__ v_ptrs,
+    float lr, float wd, float b1, float b2, float eps,
+    float bc1, float bc2, long long total_n
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+
+    for (; idx < total_n; idx += stride) {
+        int lo = 0, hi = ntensors - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (idx < offsets[mid + 1]) hi = mid;
+            else lo = mid + 1;
+        }
+        int tid_ = lo;
+        long long local_i = idx - offsets[tid_];
+
+        float* w = (float*)w_ptrs[tid_];
+        const float* g = (const float*)g_ptrs[tid_];
+        float* m = (float*)m_ptrs[tid_];
+        float* v = (float*)v_ptrs[tid_];
+
+        float grad = g[local_i];
+        float mm = b1 * m[local_i] + (1.0f - b1) * grad;
+        float vv = b2 * v[local_i] + (1.0f - b2) * grad * grad;
+        m[local_i] = mm;
+        v[local_i] = vv;
+        float m_hat = mm / bc1;
+        float v_hat = vv / bc2;
+        w[local_i] -= lr * (m_hat / (sqrtf(v_hat) + eps));
+        if (wd > 0.0f) w[local_i] -= lr * wd * w[local_i];
+    }
 }
 
 // Token embedding backward: atomicAdd into embedding table rows.

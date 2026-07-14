@@ -62,6 +62,10 @@ _gemm_bias_kernel = _mod.get_function("gemm_bias_fp32")
 _split_heads_kernel = _mod.get_function("split_heads_kernel")
 _merge_heads_qkv_kernel = _mod.get_function("merge_heads_qkv_kernel")
 _fused_attn_fwd_kernel = _mod.get_function("fused_attention_forward_kernel")
+_gemm_bias_qkv_split_kernel = _mod.get_function("gemm_bias_qkv_split_fp32")
+_gemm_bias_gelu_kernel = _mod.get_function("gemm_bias_gelu_fp32")
+_fused_mlp_row_kernel = _mod.get_function("fused_mlp_row_fp32")
+_adamw_update_batched_kernel = _mod.get_function("adamw_update_batched_fp32")
 
 logger.info("PyCUDA kernels compiled for sm_35 (Kepler GT 730)")
 
@@ -124,6 +128,17 @@ def to_device(arr: np.ndarray) -> gpuarray.GPUArray:
 def to_host(arr: gpuarray.GPUArray) -> np.ndarray:
     """Download a device array to NumPy."""
     return arr.get()
+
+
+def to_device_int64(arr: np.ndarray) -> gpuarray.GPUArray:
+    """Upload an int64 NumPy array to the device (offsets tables etc.)."""
+    return gpuarray.to_gpu(np.ascontiguousarray(arr, dtype=np.int64))
+
+
+def to_device_ptrs(gpudata_list) -> gpuarray.GPUArray:
+    """Upload a list of device pointers (from gpuarray.gpudata) as uint64."""
+    ptrs = np.array([int(p) for p in gpudata_list], dtype=np.uint64)
+    return gpuarray.to_gpu(ptrs)
 
 
 def add_arrays(a: gpuarray.GPUArray, b: gpuarray.GPUArray) -> gpuarray.GPUArray:
@@ -216,6 +231,44 @@ def matmul_bias(
     return C
 
 
+def linear_qkv_split(
+    A: gpuarray.GPUArray, W_qkv: gpuarray.GPUArray, bias: gpuarray.GPUArray,
+    tracer=None, name: str = "qkv_split",
+) -> tuple:
+    """Fused Q/K/V projection: (A @ W_qkv + bias) split directly into Q,K,V.
+
+    A is [M, K], W_qkv/bias are sized for N = 3*C_head columns. Returns three
+    contiguous [M, C_head] device arrays without materializing the combined
+    [M, 3*C_head] buffer (one launch instead of gemm_bias + split_qkv).
+    """
+    assert A.flags.c_contiguous and W_qkv.flags.c_contiguous
+    M, K = int(A.shape[0]), int(A.shape[1])
+    N = int(W_qkv.shape[1])
+    assert W_qkv.shape[0] == K and int(bias.size) == N
+    assert N % 3 == 0, f"gemm_bias_qkv_split expects N = 3*C_head, got {N}"
+    C_head = N // 3
+
+    Q = gpuarray.empty((M, C_head), dtype=np.float32)
+    K_out = gpuarray.empty((M, C_head), dtype=np.float32)
+    V = gpuarray.empty((M, C_head), dtype=np.float32)
+
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
+    if tracer is not None and getattr(tracer, "trace_vectorization", False):
+        tracer.log_vectorization(name, (M, K), (K, N), (M, C_head), grid_dim, block_dim)
+
+    _gemm_bias_qkv_split_kernel(
+        A, W_qkv, bias, Q, K_out, V,
+        np.int32(M), np.int32(N), np.int32(K), np.int32(C_head),
+        block=block_dim, grid=grid_dim,
+    )
+    return Q, K_out, V
+
+
 def reduce_sum_axis0(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
     """Sum over axis 0 of a 2D [rows, channels] array. Returns [channels]."""
     assert x.ndim == 2 and x.flags.c_contiguous
@@ -279,6 +332,67 @@ def gelu(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
     threads = 256
     blocks = int(np.ceil(int(n_elements) / threads))
     _gelu_kernel(x, out, n_elements, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return out
+
+
+def matmul_bias_gelu(
+    A: gpuarray.GPUArray, B: gpuarray.GPUArray, bias: gpuarray.GPUArray,
+    tracer=None, name: str = "gemm_bias_gelu",
+) -> tuple:
+    """Fused expand-linear + GELU: returns (hidden, act) where hidden = A@B+bias
+    (pre-activation, needed by gelu_backward) and act = gelu(hidden).
+
+    Saves the standalone gelu_fp32 launch + one re-read of hidden vs. calling
+    matmul_bias() then gelu() separately.
+    """
+    assert A.flags.c_contiguous and B.flags.c_contiguous
+    M, K = int(A.shape[0]), int(A.shape[1])
+    assert B.shape[0] == K and int(bias.size) == int(B.shape[1])
+    N = int(B.shape[1])
+    hidden = gpuarray.empty((M, N), dtype=np.float32)
+    act = gpuarray.empty((M, N), dtype=np.float32)
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
+    if tracer is not None and getattr(tracer, "trace_vectorization", False):
+        tracer.log_vectorization(name, (M, K), (K, N), (M, N), grid_dim, block_dim)
+    _gemm_bias_gelu_kernel(
+        A, B, bias, hidden, act, np.int32(M), np.int32(N), np.int32(K),
+        block=block_dim, grid=grid_dim,
+    )
+    return hidden, act
+
+
+# Row-fused MLP (single kernel, no global hidden buffer) is correct but only a
+# win if per-row GEMV beats two tiled GEMMs + matmul_bias_gelu at the model's
+# actual dims -- benchmark before flipping. Default off; matmul_bias_gelu (2a)
+# ships regardless of this flag's outcome.
+_USE_FUSED_MLP_ROW_KERNEL = False
+
+
+def fused_mlp_row(
+    x: gpuarray.GPUArray, w1: gpuarray.GPUArray, b1: gpuarray.GPUArray,
+    w2: gpuarray.GPUArray, b2: gpuarray.GPUArray,
+) -> gpuarray.GPUArray:
+    """out = GELU(x @ w1 + b1) @ w2 + b2, one kernel, one block per row.
+
+    x is [M, C], w1 is [C, Hd], w2 is [Hd, C]. Keeps the whole hidden row in
+    shared memory instead of round-tripping it through global memory.
+    """
+    assert x.flags.c_contiguous and w1.flags.c_contiguous and w2.flags.c_contiguous
+    M, C = int(x.shape[0]), int(x.shape[1])
+    Hd = int(w1.shape[1])
+    assert w1.shape[0] == C and w2.shape == (Hd, C) and int(b1.size) == Hd and int(b2.size) == C
+    out = gpuarray.empty((M, C), dtype=np.float32)
+    threads = next_pow2(min(max(C, Hd), 256))
+    shared_bytes = (C + Hd) * np.dtype(np.float32).itemsize
+    _fused_mlp_row_kernel(
+        x, w1, b1, w2, b2, out, np.int32(C), np.int32(Hd),
+        block=(threads, 1, 1), grid=(M, 1, 1), shared=shared_bytes,
+    )
     return out
 
 
@@ -380,15 +494,20 @@ def pack_qkv_from_heads(
 
 
 def fused_causal_attention_from_qkv(
-    qkv: gpuarray.GPUArray,
+    ln1_out_d: gpuarray.GPUArray,
+    w_qkv: gpuarray.GPUArray,
+    bias_qkv: gpuarray.GPUArray,
     batch_size: int,
     seq_len: int,
     num_heads: int,
     head_dim: int,
     scale: float,
+    tracer=None,
+    name: str = "qkv",
 ) -> tuple:
-    """Attention from QKV [B*T, 3*C].
+    """QKV projection (fused with the split) + causal attention.
 
+    ``ln1_out_d`` is [B*T, K]; ``w_qkv``/``bias_qkv`` project to N = 3*C.
     Returns (attn_concat [B*T, C], probs flat, q_h, k_h, v_h) with heads
     in [B*NH, T, HD] for the backward path (avoids re-split).
     """
@@ -398,6 +517,8 @@ def fused_causal_attention_from_qkv(
     M, D = T, HD
 
     if _USE_FUSED_ATTENTION_FORWARD:
+        # Phase 2C path needs the combined [B*T, 3*C] buffer for split_heads_from_qkv.
+        qkv = matmul_bias(ln1_out_d, w_qkv, bias_qkv, tracer=tracer, name=name)
         q_h, k_h, v_h = split_heads_from_qkv(qkv, B, T, NH, HD)
         probs = gpuarray.empty((H, M, M), dtype=np.float32)
         out_h = gpuarray.empty((H, M, D), dtype=np.float32)
@@ -413,9 +534,9 @@ def fused_causal_attention_from_qkv(
         attn_concat = merge_heads(out_h, B, T, NH, HD)  # fresh — cached for backward
         return attn_concat, probs.reshape(H * M * M), q_h, k_h, v_h
 
-    # Default: corrected causal_mha + head-layout cache for backward.
-    # q/k/v heads are cached for the full forward — allocate uniquely.
-    q, k, v = split_qkv(qkv, C)
+    # Default: fused gemm+split (no combined [B*T,3*C] buffer) + corrected
+    # causal_mha + head-layout cache for backward.
+    q, k, v = linear_qkv_split(ln1_out_d, w_qkv, bias_qkv, tracer=tracer, name=name)
     attn_concat, probs = causal_self_attention(q, k, v, B, T, NH, HD, scale)
     q_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
     k_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
@@ -767,6 +888,38 @@ def adamw_update(
         w, g, m, v,
         np.float32(lr), np.float32(wd), np.float32(b1), np.float32(b2), np.float32(eps),
         np.float32(bc1), np.float32(bc2), n,
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+
+
+def adamw_update_batched(
+    offsets_d: gpuarray.GPUArray,
+    w_ptrs_d: gpuarray.GPUArray,
+    g_ptrs_d: gpuarray.GPUArray,
+    m_ptrs_d: gpuarray.GPUArray,
+    v_ptrs_d: gpuarray.GPUArray,
+    ntensors: int,
+    total_n: int,
+    lr: float,
+    wd: float,
+    b1: float,
+    b2: float,
+    eps: float,
+    bc1: float,
+    bc2: float,
+) -> None:
+    """One AdamW launch across all params via pointer-array indirection.
+
+    ``offsets_d``/``w_ptrs_d``/``m_ptrs_d``/``v_ptrs_d`` are built once (stable
+    weight/m/v buffers); ``g_ptrs_d`` must be rebuilt each step (fresh grad
+    buffers). See training/gpu_optimizer.py for the pointer-table setup.
+    """
+    threads = 256
+    blocks = min(int(np.ceil(total_n / threads)), 65535)
+    _adamw_update_batched_kernel(
+        offsets_d, np.int32(ntensors), w_ptrs_d, g_ptrs_d, m_ptrs_d, v_ptrs_d,
+        np.float32(lr), np.float32(wd), np.float32(b1), np.float32(b2), np.float32(eps),
+        np.float32(bc1), np.float32(bc2), np.int64(total_n),
         block=(threads, 1, 1), grid=(blocks, 1, 1),
     )
 
