@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from model.trace import TraceContext
+from logging_config import logger
+from paths import (
+    DEFAULT_CHECKPOINT_DIR,
+    DEFAULT_CONFIG_PATH,
+    LEGACY_CONFIG_PATH,
+    resolve_checkpoints_dir,
+)
 
 
 def add_trace_args(parser: argparse.ArgumentParser) -> None:
@@ -23,8 +30,9 @@ def add_trace_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--trace-every", type=int, default=None, help="Emit traces every N steps (default: 10%% of total training steps; ignored for generate/interactive where it defaults to every step)")
 
 
-def add_config_arg(parser: argparse.ArgumentParser, default: str = "setup/training_config.json") -> None:
-    parser.add_argument("--config", type=str, default=default, help="Path to training_config.json")
+def add_config_arg(parser: argparse.ArgumentParser, default: Optional[str] = None) -> None:
+    default_path = str(default or DEFAULT_CONFIG_PATH)
+    parser.add_argument("--config", type=str, default=default_path, help="Path to training_config.json")
 
 
 def add_training_length_args(parser: argparse.ArgumentParser) -> None:
@@ -33,7 +41,10 @@ def add_training_length_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--epochs", type=int, default=None, help="Override config num_epochs (ignored if --steps is given)")
     group.add_argument("--steps", type=int, default=None, help="Total training steps across ALL epochs (overrides --epochs and config num_epochs)")
     group.add_argument("--log-every", type=int, default=100, help="Print a progress line every N steps (default: 100)")
-    group.add_argument("--checkpoint-every", type=int, default=None, help="Save a checkpoint every N steps (default: once per full dataset pass)")
+    group.add_argument(
+        "--checkpoint-every", type=int, default=None,
+        help="Save a checkpoint every N steps (default: min(1000, batches/epoch); override to tune disk I/O vs crash safety)",
+    )
     group.add_argument("--no-prompt", action="store_true", help="Never prompt for learning_rate/steps/epochs; silently use config/CLI defaults")
 
 
@@ -119,8 +130,9 @@ def prompt_model_hyperparams(args: argparse.Namespace, model_config: Dict, hyper
     _ask("gradient_clip", "Gradient clip norm", hyperparams, "gradient_clip", float, hyperparams.get("gradient_clip", 1.0))
 
 
-def add_checkpoint_arg(parser: argparse.ArgumentParser, default: str = "models/run1") -> None:
-    parser.add_argument("--checkpoint", type=str, default=default, help="Checkpoint directory")
+def add_checkpoint_arg(parser: argparse.ArgumentParser, default: Optional[str] = None) -> None:
+    default_ckpt = str(default or DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument("--checkpoint", type=str, default=default_ckpt, help="Checkpoint directory")
 
 
 def add_seed_arg(parser: argparse.ArgumentParser, default: int = 42) -> None:
@@ -137,27 +149,36 @@ def build_tracer(args, default_trace_every: int = 100) -> TraceContext:
 
 
 def load_config(path: str) -> Dict:
-    with open(path, "r", encoding="utf-8") as f:
+    config_path = Path(path)
+    if not config_path.exists():
+        if config_path.resolve() == DEFAULT_CONFIG_PATH.resolve() and LEGACY_CONFIG_PATH.exists():
+            logger.info(
+                "Config not found at %s; falling back to legacy %s",
+                DEFAULT_CONFIG_PATH, LEGACY_CONFIG_PATH,
+            )
+            config_path = LEGACY_CONFIG_PATH
+    with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def list_checkpoints(models_dir: str = "models") -> List[Path]:
-    """Return checkpoint directories under `models_dir` (any dir holding a config.json),
+def list_checkpoints(models_dir: Optional[str] = None) -> List[Path]:
+    """Return checkpoint directories under checkpoints root (any dir holding config.json),
     newest first."""
-    root = Path(models_dir)
+    root = resolve_checkpoints_dir(models_dir)
     if not root.exists():
         return []
     found = [d for d in root.iterdir() if d.is_dir() and (d / "config.json").exists()]
     return sorted(found, key=lambda d: d.stat().st_mtime, reverse=True)
 
 
-def prompt_resume_or_new(models_dir: str = "models") -> Optional[str]:
+def prompt_resume_or_new(models_dir: Optional[str] = None) -> Optional[str]:
     """First-menu-option prompt: resume training from an existing checkpoint, or
     start a fresh run. Returns the checkpoint path to resume from, or None to
     signal 'start fresh' (including when no checkpoints exist or stdin is EOF)."""
     checkpoints = list_checkpoints(models_dir)
+    ckpt_root = resolve_checkpoints_dir(models_dir)
 
-    print(f"\nAvailable checkpoints in '{models_dir}':")
+    print(f"\nAvailable checkpoints in '{ckpt_root}':")
     if checkpoints:
         for i, d in enumerate(checkpoints, 1):
             print(f"  {i}. {d}")
@@ -187,7 +208,7 @@ def prompt_resume_or_new(models_dir: str = "models") -> Optional[str]:
 
 
 def select_checkpoint_interactive(
-    models_dir: str = "models",
+    models_dir: Optional[str] = None,
     allow_new: bool = False,
     default_new_name: str = "run1",
     prompt_label: str = "checkpoint",
@@ -198,8 +219,9 @@ def select_checkpoint_interactive(
     Returns the chosen checkpoint directory as a string path.
     """
     checkpoints = list_checkpoints(models_dir)
+    ckpt_root = resolve_checkpoints_dir(models_dir)
 
-    print(f"\nAvailable checkpoints in '{models_dir}':")
+    print(f"\nAvailable checkpoints in '{ckpt_root}':")
     if checkpoints:
         for i, d in enumerate(checkpoints, 1):
             print(f"  {i}. {d}")
@@ -225,7 +247,7 @@ def select_checkpoint_interactive(
             name = input(f"New checkpoint name [default={default_new_name}]: ").strip() or default_new_name
             if "/" in name or "\\" in name:
                 return name
-            return str(Path(models_dir) / name)
+            return str(ckpt_root / name)
 
         if choice.isdigit() and checkpoints and 1 <= int(choice) <= len(checkpoints):
             return str(checkpoints[int(choice) - 1])

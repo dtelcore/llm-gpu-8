@@ -111,21 +111,39 @@ def _rows_from_structured_export(path: Path) -> List[Tuple[int, float]]:
     return rows
 
 
-def read_runs(log_dir: str = ".", all_runs: bool = False) -> List[List[float]]:
+def read_runs(log_dir: str = "output", all_runs: bool = False) -> List[List[float]]:
     """Return a list of loss-curves (one list of floats per training run found).
-    Looks for logs/training.log first, then falls back to structured metric exports."""
+    Looks for output/logs/training.log first, then falls back to structured metric exports."""
     root = Path(log_dir)
-    logs_subdir = root / "logs"
-    if logs_subdir.exists():
-        log_paths = sorted(logs_subdir.glob("*.log"), key=lambda p: p.stat().st_mtime)
+    log_dirs = []
+    if root.name == "logs":
+        log_dirs.append(root)
+    else:
+        log_dirs.append(root / "logs")
+        if (root / "training.log").exists():
+            log_dirs.append(root)
+
+    for logs_dir in log_dirs:
+        if not logs_dir.exists():
+            continue
+        log_paths = sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime)
         if log_paths:
-            rows = _rows_from_training_log(log_paths[-1])
+            # Prefer aggregate training.log when present.
+            preferred = logs_dir / "training.log"
+            target = preferred if preferred in log_paths else log_paths[-1]
+            rows = _rows_from_training_log(target)
             segments = _segment_by_step_reset(rows)
             if not all_runs:
                 segments = segments[-1:]
-            return [_losses_from_rows(seg) for seg in segments if seg]
+            curves = [_losses_from_rows(seg) for seg in segments if seg]
+            if curves:
+                return curves
 
-    candidates = [root / "training_metrics_latest.jsonl", root / "training_metrics_latest.csv"]
+    candidates = [
+        root / "training_metrics_latest.jsonl",
+        root / "training_metrics_latest.csv",
+        root / "logs" / "training_metrics_latest.jsonl",
+    ]
     latest_path = next((p for p in candidates if p.exists()), None)
     if latest_path is None:
         return []
@@ -202,9 +220,9 @@ def render_landscape(runs: List[List[float]], out_path: Optional[Path], show: bo
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Conceptual 3D loss-landscape trajectory plotter")
-    parser.add_argument("--log-dir", default=".", help="Project root to search for logs/training.log (default: .)")
+    parser.add_argument("--log-dir", default="output", help="Project root or logs dir to search (default: output)")
     parser.add_argument("--all-runs", action="store_true", help="Overlay every run found in the log, not just the latest")
-    parser.add_argument("--out", default="logs/loss_landscape_latest.png", help="Output image path")
+    parser.add_argument("--out", default="output/logs/loss_landscape_latest.png", help="Output image path")
     parser.add_argument("--show", action="store_true", help="Also display the figure interactively")
     args = parser.parse_args()
 

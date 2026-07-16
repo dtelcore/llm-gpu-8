@@ -1,12 +1,12 @@
 """
 train.py
 
-Main training entry point. Loads setup/training_config.json, builds the
+Main training entry point. Loads output/configs/training_config.json, builds the
 tokenizer + PyCUDA-backed GPT model + AdamW optimizer, and runs the
 training loop over the corpus with CLI-gated logit/token/neuron tracing.
 
 Usage:
-    python train.py --config setup/training_config.json --checkpoint models/run1
+    python train.py --config output/configs/training_config.json --checkpoint output/checkpoints/run1
     python train.py --epochs 3 --trace-tokens --trace-logits --trace-every 10
     python train.py --steps 1500   # total steps across ALL epochs, overrides --epochs/config
     python train.py --menu         # wizard: Toy Run or Tiny Stories presets, or custom
@@ -26,17 +26,26 @@ from pathlib import Path
 import numpy as np
 
 import cli_common
-from logging_config import logger
+from logging_config import logger, setup_logging
 from model.config import GPTConfig
 from model.cuda import ops as cuda_ops
 from model.gpt import GPTModel
 from model.weights import ModelParameters
+from paths import (
+    DATA_DIR,
+    DEFAULT_LANDSCAPE_PLOT,
+    DEFAULT_TRAINING_LOG,
+    DEFAULT_TRAINING_PLOT,
+    OUTPUT_CHECKPOINTS,
+    ensure_output_dirs,
+    resolve_checkpoints_dir,
+)
 from tokenizer.tokenizer import CharacterGPTTokenizer
 from training.checkpoint import save_checkpoint
 from training.dataset import WindowedDataset
 from training.loss import softmax_cross_entropy_batch, softmax_cross_entropy_batch_gpu, trace_predictions
 from training.gpu_optimizer import AdamWGPU
-from training.probe import run_probe
+from training.probe import generate_probe_milestones, run_generate_probe, run_probe
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,12 +62,12 @@ def parse_args() -> argparse.Namespace:
              "before training, instead of loading --config from disk",
     )
     parser.add_argument(
-        "--data-dir", type=str, default="data",
+        "--data-dir", type=str, default=str(DATA_DIR),
         help="Directory auto-scanned for .txt datasets when --menu is used (default: data)",
     )
     parser.add_argument(
-        "--models-dir", type=str, default="models",
-        help="Directory scanned for existing checkpoints by --menu/--generate (default: models)",
+        "--models-dir", type=str, default=str(OUTPUT_CHECKPOINTS),
+        help="Directory scanned for existing checkpoints by --menu/--generate (default: output/checkpoints)",
     )
     parser.add_argument(
         "--generate", action="store_true",
@@ -66,9 +75,25 @@ def parse_args() -> argparse.Namespace:
              "interactive generation test menu (same REPL as interactive.py)",
     )
     parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume training from --checkpoint (loads weights, config, vocab, and step counter)",
+    )
+    parser.add_argument(
+        "--no-generate-probe", action="store_true",
+        help="Disable mid-training generation probes at 25%%, 50%%, 75%%, and 100%% of total steps",
+    )
+    parser.add_argument(
+        "--generate-probe-prompt", type=str, default="once upon a",
+        help="Prompt used for mid-training generation probes (default: once upon a)",
+    )
+    parser.add_argument(
+        "--generate-probe-tokens", type=int, default=256,
+        help="Characters to generate for each mid-training probe (default: 256)",
+    )
+    parser.add_argument(
         "--plot", action="store_true",
-        help="After training, render loss/metrics + loss-landscape charts from logs/training.log "
-             "and save them under logs/ (see training_log_plotter.py, loss_landscape_plotter.py)",
+        help="After training, render loss/metrics + loss-landscape charts from output/logs/training.log "
+             "and save them under output/logs/ (see training_log_plotter.py, loss_landscape_plotter.py)",
     )
     return parser.parse_args()
 
@@ -117,6 +142,10 @@ def generate_test_menu(args: argparse.Namespace) -> None:
     """Interactive checkpoint picker + generation REPL, without touching training at all."""
     import interactive as interactive_cli
 
+    ensure_output_dirs()
+    setup_logging(log_filename="generate_menu")
+    logger.info("train.py --generate | models_dir=%s", args.models_dir)
+
     print("=" * 70)
     print("GENERATION TEST MENU")
     print("=" * 70)
@@ -132,16 +161,28 @@ def generate_test_menu(args: argparse.Namespace) -> None:
 
 
 def train(args: argparse.Namespace) -> str:
+    ensure_output_dirs()
+    ckpt_stem = Path(args.checkpoint).name
+    setup_logging(log_filename=f"training_{ckpt_stem}")
+    logger.info("train.py starting | checkpoint=%s | config=%s", args.checkpoint, getattr(args, "config", None))
+
     # menu/models_dir/plot are train.py-only flags; default them so this function
     # also works when called from auto_train.py's smaller argument set.
     resumed = False
     start_step = 0
     tokenizer = gpt_config = params = None
 
-    if getattr(args, "menu", False):
+    if getattr(args, "resume", False):
         from training.checkpoint import load_checkpoint
 
-        models_dir = getattr(args, "models_dir", "models")
+        gpt_config, params, tokenizer, config, state = load_checkpoint(args.checkpoint)
+        start_step = int(state.get("step", 0))
+        resumed = True
+        print(f"-> Resuming '{args.checkpoint}' from step {start_step:,}")
+    elif getattr(args, "menu", False):
+        from training.checkpoint import load_checkpoint
+
+        models_dir = getattr(args, "models_dir", None) or str(OUTPUT_CHECKPOINTS)
         print("\n[Step 0/5] RESUME OR NEW")
         print("-" * 70)
         resume_ckpt = cli_common.prompt_resume_or_new(models_dir)
@@ -193,6 +234,8 @@ def train(args: argparse.Namespace) -> str:
         warmup_steps=hyperparams.get("warmup_steps", 0),
         gradient_clip=hyperparams.get("gradient_clip", 1.0),
     )
+    if resumed:
+        optimizer.t = start_step
 
     dataset = WindowedDataset(config["dataset"]["corpus"], tokenizer, gpt_config.max_len, hyperparams["batch_size"])
     rng = np.random.default_rng(args.seed)
@@ -208,12 +251,30 @@ def train(args: argparse.Namespace) -> str:
         epochs = args.epochs if args.epochs is not None else hyperparams["num_epochs"]
         total_steps = start_step + epochs * steps_per_epoch
 
-    checkpoint_every = args.checkpoint_every or steps_per_epoch
+    # Default to every 1000 steps (capped by epoch length). Never fall back to
+    # steps_per_epoch alone — on TinyStories that is ~26M and silently loses hours of work.
+    if args.checkpoint_every is not None:
+        checkpoint_every = max(1, int(args.checkpoint_every))
+    else:
+        checkpoint_every = min(1000, steps_per_epoch)
     log_every = max(1, args.log_every)
 
     # Logits (and other traces) fire every 10% of total_steps by default;
     # pass --trace-every explicitly to override that cadence.
     tracer = cli_common.build_tracer(args, default_trace_every=max(1, total_steps // 10))
+
+    generate_probe_steps = set()
+    generate_probes_done: set[int] = set()
+    if not getattr(args, "no_generate_probe", False):
+        generate_probe_steps = set(generate_probe_milestones(total_steps))
+        generate_probes_done = {s for s in generate_probe_steps if s <= start_step}
+        if generate_probe_steps:
+            pending = sorted(generate_probe_steps - generate_probes_done)
+            print(f"Generate probes scheduled at steps: {', '.join(f'{s:,}' for s in sorted(generate_probe_steps))}")
+            if generate_probes_done:
+                print(f"  (skipping already-passed milestones: {', '.join(f'{s:,}' for s in sorted(generate_probes_done))})")
+            if pending:
+                print(f"  (pending: {', '.join(f'{s:,}' for s in pending)})")
 
     print("=" * 70)
     print(f"TRAINING: {gpt_config.name} | vocab={gpt_config.vocab_size} | "
@@ -297,6 +358,26 @@ def train(args: argparse.Namespace) -> str:
             window_steps = 0
             window_start_time = now
 
+        if (
+            generate_probe_steps
+            and global_step in generate_probe_steps
+            and global_step not in generate_probes_done
+        ):
+            optimizer.sync_host_weights()
+            ckpt_dir = save_checkpoint(args.checkpoint, params, tokenizer, config, step=global_step, epoch=epoch)
+            run_probe(str(ckpt_dir))
+            run_generate_probe(
+                model,
+                tokenizer,
+                step=global_step,
+                total_steps=total_steps,
+                prompt=args.generate_probe_prompt,
+                max_new_tokens=args.generate_probe_tokens,
+                seed=args.seed,
+                checkpoint_dir=str(ckpt_dir),
+            )
+            generate_probes_done.add(global_step)
+
         if global_step % checkpoint_every == 0 or global_step == total_steps:
             optimizer.sync_host_weights()
             ckpt_dir = save_checkpoint(args.checkpoint, params, tokenizer, config, step=global_step, epoch=epoch)
@@ -305,7 +386,7 @@ def train(args: argparse.Namespace) -> str:
     print(f"\nTraining complete ({global_step:,} steps). Final checkpoint: {args.checkpoint}")
     print(f"\nTest generation with this checkpoint:")
     print(f"  python generate.py --checkpoint {args.checkpoint} --prompt \"once upon a\"")
-    print(f"  python train.py --generate --models-dir {Path(args.checkpoint).parent}")
+    print(f"  python train.py --generate --models-dir {resolve_checkpoints_dir(args.models_dir)}")
 
     if getattr(args, "plot", False):
         _render_post_training_plots()
@@ -315,11 +396,11 @@ def train(args: argparse.Namespace) -> str:
 
 def _render_post_training_plots() -> None:
     """Best-effort: render training_log_plotter + loss_landscape_plotter charts
-    from logs/training.log and save them under logs/. Never raises on failure."""
+    from output/logs/training.log and save them under output/logs/. Never raises on failure."""
     try:
         import training_log_plotter as tlp
 
-        log_path = Path("logs/training.log")
+        log_path = DEFAULT_TRAINING_LOG
         runs = tlp._load_runs([log_path])
         if runs:
             tlp.plot_runs_liveable(
@@ -327,7 +408,7 @@ def _render_post_training_plots() -> None:
                 raw_alpha=0.10, forecast_window=40, forecast_enabled=True,
                 forecast_use_smoothed=True, show_raw_loss=False, show_ema_loss=False,
                 show_raw_metric=True, live=False, refresh_seconds=1.0,
-                source_paths=[log_path], save_path=Path("logs/training_plot_latest.png"),
+                source_paths=[log_path], save_path=DEFAULT_TRAINING_PLOT,
             )
     except Exception as exc:
         logger.warning(f"training_log_plotter failed: {exc}")
@@ -335,8 +416,8 @@ def _render_post_training_plots() -> None:
     try:
         import loss_landscape_plotter as llp
 
-        runs = llp.read_runs(log_dir=".", all_runs=False)
-        llp.render_landscape(runs, out_path=Path("logs/loss_landscape_latest.png"), show=False)
+        runs = llp.read_runs(log_dir="output", all_runs=False)
+        llp.render_landscape(runs, out_path=DEFAULT_LANDSCAPE_PLOT, show=False)
     except Exception as exc:
         logger.warning(f"loss_landscape_plotter failed: {exc}")
 

@@ -1,10 +1,15 @@
 venv/
-logs/
-models/
+output/
 data/
 __pycache__/
 *.log
 *.npz
+data/*.txt
+
+# Legacy artifact dirs (pre-output/ migration)
+logs/
+models/
 
 # Training config may embed full corpora when saved incorrectly — never commit it.
 setup/training_config.json
+output/configs/training_config.json

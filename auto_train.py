@@ -6,7 +6,7 @@ resulting checkpoint as a smoke test. One command for
 "config -> trained weights -> generated text".
 
 Usage:
-    python auto_train.py --config setup/training_config.json --checkpoint models/run1
+    python auto_train.py --config output/configs/training_config.json --checkpoint output/checkpoints/run1
     python auto_train.py --epochs 5 --prompt "once upon a" --trace-logits
     python auto_train.py --steps 1500 --prompt "once upon a"
     python auto_train.py --learning-rate 0.005 --steps 500 --no-prompt   # fully non-interactive
@@ -20,6 +20,8 @@ silently fall back to config/CLI defaults).
 import argparse
 
 import cli_common
+from logging_config import logger, setup_logging
+from paths import DATA_DIR, OUTPUT_CHECKPOINTS, ensure_output_dirs
 from generate import generate as run_generate
 from train import train as run_train
 
@@ -39,14 +41,17 @@ def parse_args() -> argparse.Namespace:
         help="Run the interactive training setup wizard before training. First prompt lets "
              "you resume from an existing checkpoint instead of starting fresh.",
     )
-    parser.add_argument("--data-dir", type=str, default="data", help="Directory auto-scanned for .txt datasets when --menu is used")
-    parser.add_argument("--models-dir", type=str, default="models", help="Directory scanned for existing checkpoints by --menu")
+    parser.add_argument("--data-dir", type=str, default=str(DATA_DIR), help="Directory auto-scanned for .txt datasets when --menu is used")
+    parser.add_argument("--models-dir", type=str, default=str(OUTPUT_CHECKPOINTS), help="Directory scanned for existing checkpoints by --menu (default: output/checkpoints)")
     cli_common.add_trace_args(parser)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    ensure_output_dirs()
+    setup_logging(log_filename="auto_train")
+    logger.info("auto_train.py starting | checkpoint=%s", args.checkpoint)
 
     print("### STAGE 1/2: TRAINING ###")
     checkpoint_dir = run_train(args)

@@ -801,8 +801,8 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--logs", nargs="*", help="Explicit log file paths")
-    parser.add_argument("--log-dir", default="logs",
-                        help="Directory to scan for .log files (logs/training.log by default)")
+    parser.add_argument("--log-dir", default="output/logs",
+                        help="Directory to scan for .log files (output/logs/training.log by default)")
     parser.add_argument("--multi", action="store_true",
                         help="Load ALL logs in log-dir (compare runs)")
     parser.add_argument("--all-runs", action="store_true",

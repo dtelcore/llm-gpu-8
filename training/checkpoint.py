@@ -1,11 +1,12 @@
 """
 training/checkpoint.py
 
-Save/load model weights + tokenizer vocab + config snapshot to models/<run>/.
+Save/load model weights + tokenizer vocab + config snapshot to output/checkpoints/<run>/.
 """
 
 import copy
 import json
+import shutil
 from pathlib import Path
 from typing import Dict
 
@@ -14,6 +15,7 @@ import numpy as np
 from logging_config import logger
 from model.config import GPTConfig
 from model.weights import ModelParameters
+from paths import OUTPUT_CHECKPOINTS, OUTPUT_TOKENIZER, checkpoint_vocab_sidecar, ensure_output_dirs
 from tokenizer.tokenizer import CharacterGPTTokenizer
 
 
@@ -25,11 +27,19 @@ def save_checkpoint(
     step: int,
     epoch: int,
 ) -> Path:
+    ensure_output_dirs()
     out_dir = Path(checkpoint_dir)
+    if len(out_dir.parts) == 1:
+        out_dir = OUTPUT_CHECKPOINTS / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     np.savez(out_dir / "weights.npz", **params.all_params())
-    tokenizer.save_vocab(out_dir / "vocab.json")
+    vocab_path = out_dir / "vocab.json"
+    tokenizer.save_vocab(vocab_path)
+    sidecar = checkpoint_vocab_sidecar(out_dir)
+    OUTPUT_TOKENIZER.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(vocab_path, sidecar)
+    logger.info(f"Tokenizer vocab mirrored to {sidecar}")
 
     # The training corpus can be large (thousands of sentences); keep it out of
     # config.json (which should stay a small, human-readable snapshot) and store

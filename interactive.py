@@ -6,8 +6,8 @@ type continues from the model; trace flags apply to every generation
 you run in the session.
 
 Usage:
-    python interactive.py --checkpoint models/run1
-    python interactive.py --checkpoint models/run1 --trace-tokens --trace-logits --trace-every 1
+    python interactive.py --checkpoint output/checkpoints/run1
+    python interactive.py --checkpoint output/checkpoints/run1 --trace-tokens --trace-logits --trace-every 1
 
 Session commands:
     :temp <value>       set sampling temperature
@@ -21,7 +21,9 @@ import argparse
 import numpy as np
 
 import cli_common
+from logging_config import logger, setup_logging
 from model.gpt import GPTModel
+from paths import ensure_output_dirs
 from training.checkpoint import load_checkpoint
 
 
@@ -38,6 +40,10 @@ def parse_args() -> argparse.Namespace:
 def run_repl(args: argparse.Namespace) -> None:
     """Runs the interactive generation REPL for the checkpoint in `args.checkpoint`.
     Reusable by other CLIs (e.g. train.py --generate) that build their own args."""
+    ensure_output_dirs()
+    setup_logging(log_filename="interactive")
+    logger.info("interactive.py | checkpoint=%s", args.checkpoint)
+
     gpt_config, params, tokenizer, _, _ = load_checkpoint(args.checkpoint)
     model = GPTModel(gpt_config, params)
     tracer = cli_common.build_tracer(args, default_trace_every=1)

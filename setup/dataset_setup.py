@@ -16,6 +16,13 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 from logging_config import logger
+from paths import DATA_DIR
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 
 # ============================================================================
@@ -121,7 +128,7 @@ class DatasetAnalyzer:
 class DatasetLoader:
     """Loads and manages datasets from various sources."""
     
-    def __init__(self, data_dir: str = 'data', auto_discover: bool = True):
+    def __init__(self, data_dir: str = None, auto_discover: bool = True):
         """Initialize loader.
         
         Args:
@@ -131,7 +138,7 @@ class DatasetLoader:
         """
         self.datasets = {}
         self.current_dataset = None
-        self.data_dir = data_dir
+        self.data_dir = str(data_dir or DATA_DIR)
         # Files found under data_dir but not yet read into memory. Kept separate
         # from self.datasets so large corpora (hundreds of MB) aren't loaded just
         # to populate the selection menu -- only the file actually chosen gets read.
@@ -180,7 +187,7 @@ class DatasetLoader:
         raise ValueError(f"Unknown dataset: {dataset_name}. Available: {available}")
     
     def load_from_file(self, filepath: str, dataset_name: Optional[str] = None) -> List[str]:
-        """Load dataset from text file.
+        """Load dataset from text file (one document per line for large corpora).
         
         Args:
             filepath: Path to text file (one sentence per line or one file = one document)
@@ -192,17 +199,16 @@ class DatasetLoader:
         if not os.path.exists(filepath):
             logger.error(f"File not found: {filepath}")
             raise FileNotFoundError(f"File not found: {filepath}")
-        
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Try to split by sentences (periods) or by lines
-        if '\n' in content:
-            corpus = [line.strip() for line in content.split('\n') if line.strip()]
-        else:
-            # Split by periods
-            corpus = [s.strip() + '.' for s in content.split('.') if s.strip()]
-        
+
+        corpus = []
+        basename = os.path.basename(filepath)
+        logger.info(f"Loading corpus from file: {filepath}")
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as handle:
+            for raw_line in tqdm(handle, desc=f"Loading corpus: {basename}", unit="line"):
+                line = raw_line.strip()
+                if line:
+                    corpus.append(line)
+
         if not corpus:
             logger.error(f"No text content found in {filepath}")
             raise ValueError(f"No text content found in {filepath}")
@@ -218,7 +224,7 @@ class DatasetLoader:
         }
         self.current_dataset = name
         
-        logger.info(f"Loaded dataset from file: {filepath} ({len(corpus)} sentences)")
+        logger.info(f"[OK] Loaded custom dataset: {len(corpus):,} documents from {filepath}")
         return corpus
     
     def discover_directory(self, directory: str = 'data',

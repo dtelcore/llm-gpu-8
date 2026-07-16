@@ -24,6 +24,7 @@ if str(_ROOT) not in sys.path:
 
 import numpy as np
 from logging_config import logger
+from paths import DATA_DIR, DEFAULT_CONFIG_PATH, OUTPUT_CONFIGS, ensure_output_dirs
 
 from setup.model_config import ModelConfigBuilder, estimate_vram_footprint, load_or_create_config
 from setup.dataset_setup import DatasetLoader, DatasetAnalyzer, load_dataset_interactive, recommend_dataset_for_config
@@ -85,7 +86,7 @@ HYPERPARAMETER_PRESETS = {
 class TrainingSetup:
     """Orchestrates complete training setup."""
     
-    def __init__(self, data_dir: str = 'data'):
+    def __init__(self, data_dir: str = None):
         """Initialize setup orchestrator.
         
         Args:
@@ -98,12 +99,13 @@ class TrainingSetup:
         self.dataset_name = None
         self.hyperparams = None
         self.init_scales = None
-        self.data_dir = data_dir
+        self.data_dir = str(data_dir or DATA_DIR)
         self.scale_preset = None
         self.preset_dataset = None
-        self.setup_dir = Path('setup')
+        ensure_output_dirs()
+        self.setup_dir = OUTPUT_CONFIGS
         self.config_file = self.setup_dir / 'training_config.json'
-        logger.info(f"TrainingSetup initialized (data_dir={data_dir!r})")
+        logger.info(f"TrainingSetup initialized (data_dir={self.data_dir!r}, config_file={self.config_file})")
     
     def run_interactive_setup(self, use_presets: bool = True) -> Dict:
         """Run complete interactive setup.
@@ -396,7 +398,7 @@ class TrainingSetup:
 # QUICK START FUNCTION
 # ============================================================================
 
-def quickstart_training_setup(interactive: bool = True, data_dir: str = 'data') -> Dict:
+def quickstart_training_setup(interactive: bool = True, data_dir: str = None) -> Dict:
     """Quick start training setup.
     
     Args:

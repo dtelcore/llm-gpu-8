@@ -5,8 +5,8 @@ Load a trained checkpoint and sample text from it, with optional
 CLI-gated token/logit/neuron/vectorization tracing.
 
 Usage:
-    python generate.py --checkpoint models/run1 --prompt "once upon a" --max-new-tokens 100
-    python generate.py --checkpoint models/run1 --prompt "the" --trace-tokens --trace-logits --trace-every 1
+    python generate.py --checkpoint output/checkpoints/run1 --prompt "once upon a" --max-new-tokens 100
+    python generate.py --checkpoint output/checkpoints/run1 --prompt "the" --trace-tokens --trace-logits --trace-every 1
 """
 
 import argparse
@@ -14,7 +14,9 @@ import argparse
 import numpy as np
 
 import cli_common
+from logging_config import logger, setup_logging
 from model.gpt import GPTModel
+from paths import ensure_output_dirs
 from training.checkpoint import load_checkpoint
 
 
@@ -30,6 +32,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def generate(args: argparse.Namespace) -> str:
+    ensure_output_dirs()
+    setup_logging(log_filename="generate")
+    logger.info("generate.py | checkpoint=%s | prompt=%r", args.checkpoint, args.prompt)
+
     gpt_config, params, tokenizer, _, _ = load_checkpoint(args.checkpoint)
     model = GPTModel(gpt_config, params)
     tracer = cli_common.build_tracer(args, default_trace_every=1)
