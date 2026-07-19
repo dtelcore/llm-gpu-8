@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", type=str, default="the", help="Prompt for the post-training smoke sample")
     parser.add_argument("--max-new-tokens", type=int, default=80, help="Characters to generate for the smoke sample")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for the smoke sample")
+    parser.add_argument("--top-k", type=int, default=None, help="Top-K filter for the smoke sample")
+    parser.add_argument("--top-p", type=float, default=None, help="Nucleus (top-p) filter for the smoke sample")
     parser.add_argument(
         "--menu", action="store_true",
         help="Run the interactive training setup wizard before training. First prompt lets "

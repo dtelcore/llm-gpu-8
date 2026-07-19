@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--plot", action="store_true",
-        help="After training, render loss/metrics + loss-landscape charts from output/logs/training.log "
+        help="After training, render loss/metrics + honest loss-trajectory charts from output/logs/training.log "
              "and save them under output/logs/ (see training_log_plotter.py, loss_landscape_plotter.py)",
     )
     return parser.parse_args()
@@ -409,6 +409,7 @@ def _render_post_training_plots() -> None:
                 forecast_use_smoothed=True, show_raw_loss=False, show_ema_loss=False,
                 show_raw_metric=True, live=False, refresh_seconds=1.0,
                 source_paths=[log_path], save_path=DEFAULT_TRAINING_PLOT,
+                show=False,
             )
     except Exception as exc:
         logger.warning(f"training_log_plotter failed: {exc}")

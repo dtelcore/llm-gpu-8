@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     cli_common.add_seed_arg(parser)
     parser.add_argument("--temperature", type=float, default=0.8, help="Initial sampling temperature")
     parser.add_argument("--max-new-tokens", type=int, default=80, help="Initial characters generated per turn")
+    parser.add_argument("--top-k", type=int, default=None, help="Only sample from top K characters")
+    parser.add_argument("--top-p", type=float, default=None, help="Nucleus sampling threshold (e.g. 0.9)")
     cli_common.add_trace_args(parser)
     return parser.parse_args()
 
@@ -51,12 +53,14 @@ def run_repl(args: argparse.Namespace) -> None:
 
     temperature = args.temperature
     max_new_tokens = args.max_new_tokens
+    top_k = getattr(args, "top_k", None)
+    top_p = getattr(args, "top_p", None)
     trace_enabled = tracer.any_enabled
 
     print("=" * 70)
     print(f"INTERACTIVE GENERATION -- checkpoint: {args.checkpoint}")
     print(f"Model: {gpt_config.name} | vocab={gpt_config.vocab_size} | max_len={gpt_config.max_len}")
-    print("Type a prompt and press Enter. Commands: :temp N  :tokens N  :trace on|off  :quit")
+    print("Type a prompt and press Enter. Commands: :temp N  :tokens N  :topk N  :topp N  :trace on|off  :quit")
     print("=" * 70)
 
     while True:
@@ -78,6 +82,16 @@ def run_repl(args: argparse.Namespace) -> None:
             max_new_tokens = int(prompt.split(maxsplit=1)[1])
             print(f"[max_new_tokens -> {max_new_tokens}]")
             continue
+        if prompt.startswith(":topk "):
+            raw = prompt.split(maxsplit=1)[1].strip().lower()
+            top_k = None if raw in ("none", "off", "0") else int(raw)
+            print(f"[top_k -> {top_k}]")
+            continue
+        if prompt.startswith(":topp "):
+            raw = prompt.split(maxsplit=1)[1].strip().lower()
+            top_p = None if raw in ("none", "off", "1", "1.0") else float(raw)
+            print(f"[top_p -> {top_p}]")
+            continue
         if prompt.startswith(":trace "):
             trace_enabled = prompt.split(maxsplit=1)[1].strip().lower() == "on"
             print(f"[tracing -> {'on' if trace_enabled else 'off'}]")
@@ -96,6 +110,8 @@ def run_repl(args: argparse.Namespace) -> None:
             prompt_ids,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
             tracer=active_tracer,
             tokenizer=tokenizer if active_tracer is not None else None,
             rng=rng,

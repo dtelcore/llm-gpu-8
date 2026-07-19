@@ -3,15 +3,13 @@
 """
 Training log plotter — enhanced edition.
 
-Key improvements over v1:
-  • Terminal summary table printed on load (loss, Δloss, PPL, forecast, tok/s, progress)
-  • In-chart "latest value" annotations on each run's loss curve
-  • Progress bar annotation showing steps completed vs total
-  • Legend entries include the current smoothed value
-  • Forecast region shaded rather than just a dashed line
-  • Metric panel shows mean ± std alongside the curve
-  • --save PATH writes the figure to disk instead of (or alongside) showing it
-  • --multi flag compares all logs in the directory, not just the latest
+Key behaviors:
+  • Prefers aggregate training.log / richest log; plots the longest substantive run
+  • Drops smoke runs (<50 points) unless --keep-short / --all-runs
+  • Breaks curves across large step gaps (no fake bridges)
+  • Terminal summary table (loss, Δloss, PPL, forecast, tok/s, progress)
+  • Live mode only reprints the summary when step/loss changes
+  • --save writes PNG without blocking on a GUI window
 """
 
 import argparse
@@ -46,7 +44,13 @@ def _terminal_box_chars() -> Dict[str, str]:
             "tl": "+", "tr": "+", "bl": "+", "br": "+",
             "ml": "+", "mr": "+", "h": "-", "v": "|", "dash": "-",
         }
+
+
 KV_RE = re.compile(r"([a-zA-Z0-9_/]+)=([^\s]+)")
+
+# Ignore smoke / tiny probes by default (same policy as loss_landscape_plotter).
+DEFAULT_MIN_POINTS = 50
+DEFAULT_MAX_STEP_GAP = 2000
 
 # ── palette (tab10-inspired but hand-picked for readability on dark bg) ──────
 _COLORS = [
@@ -187,17 +191,21 @@ def _rows_from_text_log(path: Path, use_cache: bool = False) -> List[Tuple[int, 
 
 
 def _segment_by_step_reset(
-    rows: List[Tuple[int, int, Dict[str, Optional[float]]]]
+    rows: List[Tuple[int, int, Dict[str, Optional[float]]]],
+    max_step_gap: int = DEFAULT_MAX_STEP_GAP,
 ) -> List[List[Tuple[int, int, Dict[str, Optional[float]]]]]:
-    """Split rows into contiguous runs: a step <= the previous step means a new
-    training run started (logs/training.log accumulates every run ever launched)."""
+    """Split rows into contiguous runs.
+
+    A new segment starts when the step counter resets OR jumps forward by more
+    than `max_step_gap` (avoids bridging disconnected runs in an aggregate log).
+    """
     if not rows:
         return []
     segments: List[List[Tuple[int, int, Dict[str, Optional[float]]]]] = []
     current: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
     prev_step = 0
     for step, total_steps, row in rows:
-        if current and step <= prev_step:
+        if current and (step <= prev_step or step - prev_step > max_step_gap):
             segments.append(current)
             current = []
         current.append((step, total_steps, row))
@@ -205,6 +213,27 @@ def _segment_by_step_reset(
     if current:
         segments.append(current)
     return segments
+
+
+def _filter_runs(runs: List[RunSeries], all_runs: bool, min_points: int) -> List[RunSeries]:
+    substantive = [r for r in runs if len(r.steps) >= min_points]
+    if not substantive:
+        substantive = [r for r in runs if len(r.steps) >= 2]
+    if not substantive:
+        return []
+    if all_runs:
+        return substantive
+    # Prefer the richest trajectory, not the chronologically last (short resumes
+    # / smokes otherwise hide the real training run).
+    best = max(substantive, key=lambda r: len(r.steps))
+    # Drop "_runN" suffix when only one series is shown.
+    clean = re.sub(r"_run\d+$", "", best.name)
+    if clean != best.name:
+        best = RunSeries(
+            name=clean, path=best.path, steps=best.steps,
+            total_steps=best.total_steps, metrics=best.metrics,
+        )
+    return [best]
 
 
 def _derive_ppl(metrics: Dict[str, List[Optional[float]]]) -> None:
@@ -220,7 +249,13 @@ def _derive_ppl(metrics: Dict[str, List[Optional[float]]]) -> None:
     metrics["ppl"] = ppl
 
 
-def _parse_log_file(path: Path, all_runs: bool = False, use_cache: bool = False) -> List[RunSeries]:
+def _parse_log_file(
+    path: Path,
+    all_runs: bool = False,
+    use_cache: bool = False,
+    min_points: int = DEFAULT_MIN_POINTS,
+    max_step_gap: int = DEFAULT_MAX_STEP_GAP,
+) -> List[RunSeries]:
     """Parse a log/metrics file into one RunSeries per contiguous training run found
     in it. Text logs (like logs/training.log) may contain many runs concatenated;
     structured .jsonl/.csv exports are treated as a single run."""
@@ -231,14 +266,12 @@ def _parse_log_file(path: Path, all_runs: bool = False, use_cache: bool = False)
         _derive_ppl(metrics)
         run = _canonicalize_run(RunSeries(name=path.stem, path=path, steps=steps,
                                           total_steps=total_steps, metrics=metrics))
-        return [run]
+        return _filter_runs([run], all_runs=all_runs, min_points=min_points)
 
     rows = _rows_from_text_log(path, use_cache=use_cache)
-    segments = _segment_by_step_reset(rows)
+    segments = _segment_by_step_reset(rows, max_step_gap=max_step_gap)
     if not segments:
         return []
-    if not all_runs:
-        segments = segments[-1:]
 
     runs: List[RunSeries] = []
     for idx, segment in enumerate(segments):
@@ -255,7 +288,7 @@ def _parse_log_file(path: Path, all_runs: bool = False, use_cache: bool = False)
             steps=steps, total_steps=total_steps, metrics=metrics,
         ))
         runs.append(run)
-    return runs
+    return _filter_runs(runs, all_runs=all_runs, min_points=min_points)
 
 
 def _canonicalize_run(run: RunSeries) -> RunSeries:
@@ -292,12 +325,28 @@ def _canonicalize_run(run: RunSeries) -> RunSeries:
     )
 
 
-def _load_runs(paths: List[Path], all_runs: bool = False, use_cache: bool = False) -> List[RunSeries]:
+def _load_runs(
+    paths: List[Path],
+    all_runs: bool = False,
+    use_cache: bool = False,
+    min_points: int = DEFAULT_MIN_POINTS,
+    max_step_gap: int = DEFAULT_MAX_STEP_GAP,
+) -> List[RunSeries]:
     runs: List[RunSeries] = []
     for path in paths:
         if path.exists():
-            runs.extend(_parse_log_file(path, all_runs=all_runs, use_cache=use_cache))
-    return runs
+            runs.extend(_parse_log_file(
+                path,
+                all_runs=all_runs,
+                use_cache=use_cache,
+                min_points=min_points,
+                max_step_gap=max_step_gap,
+            ))
+    if all_runs or len(paths) > 1:
+        return runs
+    # Single-file default path already filtered inside _parse_log_file; if multiple
+    # files somehow yielded multiple runs, keep the longest.
+    return _filter_runs(runs, all_runs=False, min_points=min_points) if runs else []
 
 
 # ── math helpers ─────────────────────────────────────────────────────────────
@@ -544,10 +593,50 @@ def _draw_progress_bar(ax, run: RunSeries) -> None:
 
 # ── loss panel ────────────────────────────────────────────────────────────────
 
+def _plot_with_gaps(ax, steps: Sequence[int], values: np.ndarray, *,
+                    max_step_gap: int, color: str, lw: float, alpha: float,
+                    label: Optional[str] = None, linestyle: str = "-",
+                    zorder: int = 3) -> None:
+    """Plot a series but break the line across large step gaps."""
+    if not steps or len(values) == 0:
+        return
+    seg_x: List[float] = []
+    seg_y: List[float] = []
+    first = True
+    prev_step = None
+    for step, val in zip(steps, values):
+        if np.isnan(val):
+            if len(seg_x) >= 2:
+                ax.plot(seg_x, seg_y, color=color, lw=lw, alpha=alpha,
+                        label=label if first else None, linestyle=linestyle, zorder=zorder)
+                first = False
+            seg_x, seg_y = [], []
+            prev_step = step
+            continue
+        if prev_step is not None and step - prev_step > max_step_gap and seg_x:
+            if len(seg_x) >= 2:
+                ax.plot(seg_x, seg_y, color=color, lw=lw, alpha=alpha,
+                        label=label if first else None, linestyle=linestyle, zorder=zorder)
+                first = False
+            seg_x, seg_y = [], []
+        seg_x.append(float(step))
+        seg_y.append(float(val))
+        prev_step = step
+    if len(seg_x) >= 2:
+        ax.plot(seg_x, seg_y, color=color, lw=lw, alpha=alpha,
+                label=label if first else None, linestyle=linestyle, zorder=zorder)
+    elif len(seg_x) == 1:
+        ax.scatter(seg_x, seg_y, color=color, s=18, zorder=zorder,
+                   label=label if first else None)
+
+
 def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha: float,
                     raw_alpha: float, forecast_window: int, forecast_enabled: bool,
-                    forecast_use_smoothed: bool, show_raw: bool, show_ema: bool) -> None:
+                    forecast_use_smoothed: bool, show_raw: bool, show_ema: bool,
+                    max_step_gap: int = DEFAULT_MAX_STEP_GAP) -> None:
     ax.clear()
+    primary_idx = int(np.argmax([len(r.steps) for r in runs])) if runs else 0
+
     for i, run in enumerate(runs):
         color = _COLORS[i % len(_COLORS)]
         label = _short_name(run.name)
@@ -555,13 +644,17 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
         ma = _rolling_mean(raw, smooth_window)
 
         if show_raw:
-            ax.plot(run.steps, _to_arr(raw), color=color, lw=0.8,
-                    alpha=min(raw_alpha, 0.12), zorder=1)
+            _plot_with_gaps(
+                ax, run.steps, _to_arr(raw), max_step_gap=max_step_gap,
+                color=color, lw=0.8, alpha=min(raw_alpha, 0.12), zorder=1,
+            )
 
         last_val = _nan_safe(ma)
         legend_label = f"{label}  [{last_val:.4f}]" if last_val is not None else label
-        ax.plot(run.steps, ma, color=color, lw=2.2, alpha=0.97,
-                label=legend_label, zorder=3)
+        _plot_with_gaps(
+            ax, run.steps, ma, max_step_gap=max_step_gap,
+            color=color, lw=2.2, alpha=0.97, label=legend_label, zorder=3,
+        )
 
         # annotate last value on curve
         if last_val is not None:
@@ -572,9 +665,22 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
                 fontsize=8, color=color, va="center",
             )
 
+        # Mark min smoothed loss on the primary (longest) run.
+        if i == primary_idx:
+            valid_idx = np.where(~np.isnan(ma))[0]
+            if len(valid_idx):
+                min_i = int(valid_idx[np.argmin(ma[valid_idx])])
+                ax.scatter(
+                    [run.steps[min_i]], [ma[min_i]],
+                    color="#7EC87E", s=36, zorder=6, marker="o",
+                    label=f"min  [{ma[min_i]:.4f} @ {run.steps[min_i]:,}]",
+                )
+
         if show_ema:
-            ax.plot(run.steps, _ema(raw, ema_alpha), color=color, lw=1.0,
-                    alpha=0.55, linestyle=":", zorder=2)
+            _plot_with_gaps(
+                ax, run.steps, _ema(raw, ema_alpha), max_step_gap=max_step_gap,
+                color=color, lw=1.0, alpha=0.55, linestyle=":", zorder=2,
+            )
 
         # val loss
         val_raw = run.metrics.get("val_loss", [])
@@ -582,8 +688,10 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
             val_ma = _rolling_mean(val_raw, smooth_window)
             val_last = _nan_safe(val_ma)
             vl_label = f"{label} val  [{val_last:.4f}]" if val_last is not None else f"{label} val"
-            ax.plot(run.steps, val_ma, color=color, lw=1.5,
-                    linestyle="--", alpha=0.85, label=vl_label, zorder=3)
+            _plot_with_gaps(
+                ax, run.steps, val_ma, max_step_gap=max_step_gap,
+                color=color, lw=1.5, alpha=0.85, label=vl_label, linestyle="--", zorder=3,
+            )
 
         # forecast
         if forecast_enabled:
@@ -613,13 +721,14 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
     ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0))
 
     if runs:
-        _draw_progress_bar(ax, runs[0])
+        _draw_progress_bar(ax, runs[primary_idx])
 
 
 # ── metric panel ──────────────────────────────────────────────────────────────
 
 def _draw_metric_axis(ax, runs: Sequence[RunSeries], metric_name: str,
-                      smooth_window: int, raw_alpha: float, show_raw: bool) -> None:
+                      smooth_window: int, raw_alpha: float, show_raw: bool,
+                      max_step_gap: int = DEFAULT_MAX_STEP_GAP) -> None:
     ax.clear()
     drawn = 0
     for i, run in enumerate(runs):
@@ -633,8 +742,10 @@ def _draw_metric_axis(ax, runs: Sequence[RunSeries], metric_name: str,
         ma = _rolling_mean(values, smooth_window)
 
         if show_raw:
-            ax.plot(run.steps, arr, color=color, lw=0.8,
-                    alpha=min(raw_alpha, 0.14), zorder=1)
+            _plot_with_gaps(
+                ax, run.steps, arr, max_step_gap=max_step_gap,
+                color=color, lw=0.8, alpha=min(raw_alpha, 0.14), zorder=1,
+            )
 
         last_val = _nan_safe(ma)
         valid = arr[~np.isnan(arr)]
@@ -643,8 +754,10 @@ def _draw_metric_axis(ax, runs: Sequence[RunSeries], metric_name: str,
             stats = f"  μ={valid.mean():.2g}  σ={valid.std():.2g}"
         legend_label = (f"{label}  [{last_val:.4g}]{stats}"
                         if last_val is not None else label)
-        ax.plot(run.steps, ma, color=color, lw=2.0, alpha=0.97,
-                label=legend_label, zorder=3)
+        _plot_with_gaps(
+            ax, run.steps, ma, max_step_gap=max_step_gap,
+            color=color, lw=2.0, alpha=0.97, label=legend_label, zorder=3,
+        )
 
         if last_val is not None:
             ax.annotate(
@@ -672,7 +785,8 @@ def _render_figure(fig, runs: Sequence[RunSeries], metric_name: str,
                    smooth_window: int, ema_alpha: float, raw_alpha: float,
                    forecast_window: int, forecast_enabled: bool,
                    forecast_use_smoothed: bool, show_raw_loss: bool,
-                   show_ema_loss: bool, show_raw_metric: bool) -> None:
+                   show_ema_loss: bool, show_raw_metric: bool,
+                   max_step_gap: int = DEFAULT_MAX_STEP_GAP) -> None:
     if len(fig.axes) < 4:
         fig.clf()
         ax_loss, ax_ppl, ax_lr, ax_metric = fig.subplots(
@@ -684,18 +798,33 @@ def _render_figure(fig, runs: Sequence[RunSeries], metric_name: str,
 
     _draw_loss_axis(ax_loss, runs, smooth_window, ema_alpha, raw_alpha,
                     forecast_window, forecast_enabled, forecast_use_smoothed,
-                    show_raw_loss, show_ema_loss)
-    _draw_metric_axis(ax_ppl, runs, "perplexity", smooth_window, raw_alpha, show_raw_metric)
-    _draw_metric_axis(ax_lr, runs, "learning_rate", smooth_window, raw_alpha, show_raw_metric)
+                    show_raw_loss, show_ema_loss, max_step_gap=max_step_gap)
+    _draw_metric_axis(ax_ppl, runs, "perplexity", smooth_window, raw_alpha, show_raw_metric,
+                      max_step_gap=max_step_gap)
+    _draw_metric_axis(ax_lr, runs, "learning_rate", smooth_window, raw_alpha, show_raw_metric,
+                      max_step_gap=max_step_gap)
     _draw_metric_axis(ax_metric, runs, metric_name, smooth_window,
-                      raw_alpha, show_raw_metric)
+                      raw_alpha, show_raw_metric, max_step_gap=max_step_gap)
     fig.canvas.draw_idle()
 
 
 # ── file discovery ─────────────────────────────────────────────────────────────
 
+def _count_train_lines(path: Path, sample_bytes: int = 2_000_000) -> int:
+    """Cheap richness estimate: count step= lines near the end of the file."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > sample_bytes:
+                f.seek(-sample_bytes, 2)
+            data = f.read().decode("utf-8", errors="ignore")
+        return data.count("step=")
+    except Exception:
+        return 0
+
+
 def _find_default_logs(log_dir: Path) -> List[Path]:
-    """Return training logs, preferring .log files under log_dir."""
+    """Return training logs, preferring richer .log files under log_dir."""
     log_paths: List[Path] = []
     if log_dir.exists():
         log_paths = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime)
@@ -713,15 +842,26 @@ def _find_default_logs(log_dir: Path) -> List[Path]:
     return fallback
 
 
+def _pick_default_log(paths: List[Path]) -> List[Path]:
+    """Prefer aggregate training.log, else the richest log by step= density."""
+    if not paths:
+        return []
+    for p in paths:
+        if p.name == "training.log":
+            return [p]
+    ranked = sorted(paths, key=lambda p: (_count_train_lines(p), p.stat().st_mtime), reverse=True)
+    return [ranked[0]]
+
+
 def _pick_logs_interactively(paths: List[Path]) -> List[Path]:
     if not paths:
         return []
     print("Available logs:")
     for i, p in enumerate(paths, 1):
         print(f"  {i}. {p.name}")
-    raw = input("Select log numbers (comma-separated, blank = latest): ").strip()
+    raw = input("Select log numbers (comma-separated, blank = best default): ").strip()
     if not raw:
-        return [paths[-1]]
+        return _pick_default_log(paths)
     selected = []
     for part in raw.split(","):
         try:
@@ -730,7 +870,7 @@ def _pick_logs_interactively(paths: List[Path]) -> List[Path]:
                 selected.append(paths[idx])
         except Exception:
             pass
-    return selected or [paths[-1]]
+    return selected or _pick_default_log(paths)
 
 
 # ── main loop ──────────────────────────────────────────────────────────────────
@@ -752,6 +892,9 @@ def plot_runs_liveable(
     source_paths: List[Path],
     save_path: Optional[Path],
     all_runs: bool = False,
+    min_points: int = DEFAULT_MIN_POINTS,
+    max_step_gap: int = DEFAULT_MAX_STEP_GAP,
+    show: bool = True,
 ) -> None:
     _apply_style()
     plt.ion() if live else plt.ioff()
@@ -759,27 +902,52 @@ def plot_runs_liveable(
     fig.suptitle("Training run monitor", fontsize=14, color="#e2e6f0",
                  fontweight="semibold", y=0.98)
 
+    last_summary_key: Optional[Tuple] = None
+
     while True:
-        current_runs = _load_runs(source_paths, all_runs=all_runs, use_cache=live) if live else list(runs)
+        current_runs = (
+            _load_runs(
+                source_paths,
+                all_runs=all_runs,
+                use_cache=live,
+                min_points=min_points,
+                max_step_gap=max_step_gap,
+            )
+            if live else list(runs)
+        )
         if not current_runs:
             print("No valid training logs found.", file=sys.stderr)
             return
 
-        print_summary(current_runs, smooth_window, forecast_window)
+        # Live mode: only reprint the summary when the latest step/loss changes.
+        summary_key = tuple(
+            (r.name, r.steps[-1] if r.steps else 0,
+             r.metrics.get("loss", [None])[-1] if r.metrics.get("loss") else None)
+            for r in current_runs
+        )
+        if not live or summary_key != last_summary_key:
+            print_summary(current_runs, smooth_window, forecast_window)
+            last_summary_key = summary_key
 
         _render_figure(
             fig, current_runs, metric_name, smooth_window, ema_alpha, raw_alpha,
             forecast_window, forecast_enabled, forecast_use_smoothed,
             show_raw_loss, show_ema_loss, show_raw_metric,
+            max_step_gap=max_step_gap,
         )
 
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight",
                         facecolor=fig.get_facecolor())
-            print(f"Saved -> {save_path}")
+            if not live:
+                print(f"Saved -> {save_path}")
 
         if not live:
-            plt.show()
+            # Headless save (e.g. train.py --plot / --save without --show) must not block.
+            if show or not save_path:
+                plt.show()
+            else:
+                plt.close(fig)
             return
 
         plt.pause(max(0.05, refresh_seconds))
@@ -806,8 +974,14 @@ def main() -> None:
     parser.add_argument("--multi", action="store_true",
                         help="Load ALL logs in log-dir (compare runs)")
     parser.add_argument("--all-runs", action="store_true",
-                        help="Show every training run found in the log (logs/training.log "
-                             "accumulates every run ever launched); default is latest run only")
+                        help="Show every non-smoke training run found in the log; "
+                             "default is the longest substantive run only")
+    parser.add_argument("--keep-short", action="store_true",
+                        help="Include short smoke runs (< min-points)")
+    parser.add_argument("--min-points", type=int, default=DEFAULT_MIN_POINTS,
+                        help="Drop runs with fewer logged points")
+    parser.add_argument("--max-step-gap", type=int, default=DEFAULT_MAX_STEP_GAP,
+                        help="Break curves across step gaps larger than this")
     parser.add_argument("--metric", default="tok/s",
                         help="Metric shown in the bottom panel")
     parser.add_argument("--smooth-window", type=int, default=21,
@@ -836,7 +1010,12 @@ def main() -> None:
                         help="Refresh interval in live mode")
     parser.add_argument("--save", metavar="PATH",
                         help="Save the figure to this path (PNG/PDF/SVG)")
+    parser.add_argument("--show", action="store_true",
+                        help="Display the figure window (implied when --save is omitted)")
     args = parser.parse_args()
+
+    min_points = 2 if args.keep_short else max(2, args.min_points)
+    max_step_gap = max(1, args.max_step_gap)
 
     if args.logs:
         paths = [Path(p) for p in args.logs]
@@ -847,11 +1026,19 @@ def main() -> None:
         elif args.multi:
             paths = all_paths
         else:
-            paths = [all_paths[-1]] if all_paths else []
+            paths = _pick_default_log(all_paths)
 
-    runs = _load_runs(paths, all_runs=args.all_runs)
+    runs = _load_runs(
+        paths,
+        all_runs=args.all_runs,
+        min_points=min_points,
+        max_step_gap=max_step_gap,
+    )
     if not runs:
         raise SystemExit("No valid training logs found.")
+
+    # Show by default unless we're only saving to disk.
+    do_show = args.show or args.save is None
 
     plot_runs_liveable(
         runs=runs,
@@ -870,6 +1057,9 @@ def main() -> None:
         refresh_seconds=max(0.05, args.refresh_seconds),
         source_paths=paths,
         save_path=Path(args.save) if args.save else None,
+        min_points=min_points,
+        max_step_gap=max_step_gap,
+        show=do_show and not args.live,
     )
 
 

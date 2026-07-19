@@ -727,12 +727,14 @@ class GPTModel:
         prompt_ids: List[int],
         max_new_tokens: int,
         temperature: float = 1.0,
+        top_k: int = None,
+        top_p: float = None,
         tracer: TraceContext = None,
         tokenizer=None,
         rng: np.random.Generator = None,
     ) -> List[int]:
-        """Autoregressive sampling. If `tracer` and `tokenizer` are both given,
-        emits token/logit traces on the steps selected by tracer.trace_every."""
+        """Autoregressive sampling with temperature and optional top-k / top-p filters.
+        If `tracer` and `tokenizer` are both given, emits traces on tracer.trace_every steps."""
         rng = rng or np.random.default_rng()
         ids = list(prompt_ids)
         for step in range(max_new_tokens):
@@ -747,9 +749,9 @@ class GPTModel:
                 tracer.dump_tokens(window, tokenizer, label=f"generate step {step} (context)")
                 tracer.dump_logits(last_logits, tokenizer, label=f"generate step {step}")
 
-            scaled = last_logits / max(temperature, 1e-6)
-            probs = _softmax_1d(scaled)
-            next_id = int(rng.choice(len(probs), p=probs))
+            next_id = _sample_next_id(
+                last_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
+            )
             ids.append(next_id)
         return ids
 
@@ -782,3 +784,42 @@ def _softmax_1d(x: np.ndarray) -> np.ndarray:
     shifted = x - np.max(x)
     exp = np.exp(shifted)
     return exp / np.sum(exp)
+
+
+def _sample_next_id(
+    logits: np.ndarray,
+    temperature: float = 1.0,
+    top_k: int = None,
+    top_p: float = None,
+    rng: np.random.Generator = None,
+) -> int:
+    """Temperature + optional top-k / nucleus (top-p) filtering, then multinomial sample."""
+    rng = rng or np.random.default_rng()
+    scaled = logits / max(temperature, 1e-6)
+    probs = _softmax_1d(scaled)
+
+    if top_k is not None and top_k > 0:
+        k = min(int(top_k), len(probs))
+        kth = np.partition(probs, -k)[-k]
+        probs = probs.copy()
+        probs[probs < kth] = 0.0
+
+    if top_p is not None and 0.0 < float(top_p) < 1.0:
+        probs = probs.copy()
+        order = np.argsort(probs)[::-1]
+        sorted_probs = probs[order]
+        cumulative = np.cumsum(sorted_probs)
+        # Drop mass past the nucleus; keep at least the highest-prob token.
+        remove = cumulative > float(top_p)
+        if np.any(remove):
+            remove[1:] = remove[:-1].copy()
+            remove[0] = False
+            probs[order[remove]] = 0.0
+
+    total = float(np.sum(probs))
+    if total <= 0.0:
+        probs = _softmax_1d(scaled)
+    else:
+        probs = probs / total
+
+    return int(rng.choice(len(probs), p=probs))

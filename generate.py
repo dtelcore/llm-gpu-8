@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", type=str, default="the", help="Seed text to continue")
     parser.add_argument("--max-new-tokens", type=int, default=80, help="Number of characters to generate")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--top-k", type=int, default=None, help="Only sample from top K characters (e.g. 15)")
+    parser.add_argument("--top-p", type=float, default=None, help="Nucleus sampling threshold (e.g. 0.9)")
     cli_common.add_trace_args(parser)
     return parser.parse_args()
 
@@ -34,7 +36,10 @@ def parse_args() -> argparse.Namespace:
 def generate(args: argparse.Namespace) -> str:
     ensure_output_dirs()
     setup_logging(log_filename="generate")
-    logger.info("generate.py | checkpoint=%s | prompt=%r", args.checkpoint, args.prompt)
+    logger.info(
+        "generate.py | checkpoint=%s | prompt=%r | temp=%s | top_k=%s | top_p=%s",
+        args.checkpoint, args.prompt, args.temperature, args.top_k, args.top_p,
+    )
 
     gpt_config, params, tokenizer, _, _ = load_checkpoint(args.checkpoint)
     model = GPTModel(gpt_config, params)
@@ -54,6 +59,8 @@ def generate(args: argparse.Namespace) -> str:
         prompt_ids,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
         tracer=tracer,
         tokenizer=tokenizer if tracer.any_enabled else None,
         rng=rng,
