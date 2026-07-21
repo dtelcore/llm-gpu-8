@@ -24,6 +24,11 @@ from logging_config import logger, setup_logging
 from paths import DATA_DIR, OUTPUT_CHECKPOINTS, ensure_output_dirs
 from generate import generate as run_generate
 from train import train as run_train
+from training.probe import (
+    DEFAULT_GENERATE_PROBE_TEMPERATURE,
+    DEFAULT_GENERATE_PROBE_TOP_K,
+    DEFAULT_GENERATE_PROBE_TOP_P,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,9 +40,18 @@ def parse_args() -> argparse.Namespace:
     cli_common.add_model_hyperparam_args(parser)
     parser.add_argument("--prompt", type=str, default="the", help="Prompt for the post-training smoke sample")
     parser.add_argument("--max-new-tokens", type=int, default=80, help="Characters to generate for the smoke sample")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for the smoke sample")
-    parser.add_argument("--top-k", type=int, default=None, help="Top-K filter for the smoke sample")
-    parser.add_argument("--top-p", type=float, default=None, help="Nucleus (top-p) filter for the smoke sample")
+    parser.add_argument(
+        "--temperature", type=float, default=DEFAULT_GENERATE_PROBE_TEMPERATURE,
+        help=f"Sampling temperature (default: {DEFAULT_GENERATE_PROBE_TEMPERATURE})",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_GENERATE_PROBE_TOP_K,
+        help=f"Top-K filter (default: {DEFAULT_GENERATE_PROBE_TOP_K})",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=DEFAULT_GENERATE_PROBE_TOP_P,
+        help=f"Nucleus (top-p) filter (default: {DEFAULT_GENERATE_PROBE_TOP_P})",
+    )
     parser.add_argument(
         "--menu", action="store_true",
         help="Run the interactive training setup wizard before training. First prompt lets "

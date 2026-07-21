@@ -45,7 +45,14 @@ from training.checkpoint import save_checkpoint
 from training.dataset import WindowedDataset
 from training.loss import softmax_cross_entropy_batch, softmax_cross_entropy_batch_gpu, trace_predictions
 from training.gpu_optimizer import AdamWGPU
-from training.probe import generate_probe_milestones, run_generate_probe, run_probe
+from training.probe import (
+    DEFAULT_GENERATE_PROBE_TEMPERATURE,
+    DEFAULT_GENERATE_PROBE_TOP_K,
+    DEFAULT_GENERATE_PROBE_TOP_P,
+    generate_probe_milestones,
+    run_generate_probe,
+    run_probe,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,6 +96,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--generate-probe-tokens", type=int, default=256,
         help="Characters to generate for each mid-training probe (default: 256)",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=DEFAULT_GENERATE_PROBE_TEMPERATURE,
+        help=f"Sampling temperature for generate probes / --generate (default: {DEFAULT_GENERATE_PROBE_TEMPERATURE})",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_GENERATE_PROBE_TOP_K,
+        help=f"Top-K sampling for generate probes / --generate (default: {DEFAULT_GENERATE_PROBE_TOP_K})",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=DEFAULT_GENERATE_PROBE_TOP_P,
+        help=f"Nucleus (top-p) sampling for generate probes / --generate (default: {DEFAULT_GENERATE_PROBE_TOP_P})",
     )
     parser.add_argument(
         "--plot", action="store_true",
@@ -154,7 +173,11 @@ def generate_test_menu(args: argparse.Namespace) -> None:
     )
     args.checkpoint = checkpoint
     if not hasattr(args, "temperature"):
-        args.temperature = 0.8
+        args.temperature = DEFAULT_GENERATE_PROBE_TEMPERATURE
+    if not hasattr(args, "top_k"):
+        args.top_k = DEFAULT_GENERATE_PROBE_TOP_K
+    if not hasattr(args, "top_p"):
+        args.top_p = DEFAULT_GENERATE_PROBE_TOP_P
     if not hasattr(args, "max_new_tokens"):
         args.max_new_tokens = 80
     interactive_cli.run_repl(args)
@@ -373,6 +396,9 @@ def train(args: argparse.Namespace) -> str:
                 total_steps=total_steps,
                 prompt=args.generate_probe_prompt,
                 max_new_tokens=args.generate_probe_tokens,
+                temperature=getattr(args, "temperature", DEFAULT_GENERATE_PROBE_TEMPERATURE),
+                top_k=getattr(args, "top_k", DEFAULT_GENERATE_PROBE_TOP_K),
+                top_p=getattr(args, "top_p", DEFAULT_GENERATE_PROBE_TOP_P),
                 seed=args.seed,
                 checkpoint_dir=str(ckpt_dir),
             )
@@ -385,7 +411,13 @@ def train(args: argparse.Namespace) -> str:
 
     print(f"\nTraining complete ({global_step:,} steps). Final checkpoint: {args.checkpoint}")
     print(f"\nTest generation with this checkpoint:")
-    print(f"  python generate.py --checkpoint {args.checkpoint} --prompt \"once upon a\"")
+    temp = getattr(args, "temperature", DEFAULT_GENERATE_PROBE_TEMPERATURE)
+    top_k = getattr(args, "top_k", DEFAULT_GENERATE_PROBE_TOP_K)
+    top_p = getattr(args, "top_p", DEFAULT_GENERATE_PROBE_TOP_P)
+    print(
+        f"  python generate.py --checkpoint {args.checkpoint} --prompt \"once upon a\" "
+        f"--max-new-tokens 256 --temperature {temp} --top-k {top_k} --top-p {top_p}"
+    )
     print(f"  python train.py --generate --models-dir {resolve_checkpoints_dir(args.models_dir)}")
 
     if getattr(args, "plot", False):

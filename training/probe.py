@@ -18,7 +18,9 @@ from training.loss import softmax_cross_entropy
 
 DEFAULT_GENERATE_PROBE_PROMPT = "once upon a"
 DEFAULT_GENERATE_PROBE_MAX_NEW_TOKENS = 256
-DEFAULT_GENERATE_PROBE_TEMPERATURE = 0.8
+DEFAULT_GENERATE_PROBE_TEMPERATURE = 0.6
+DEFAULT_GENERATE_PROBE_TOP_K = 10
+DEFAULT_GENERATE_PROBE_TOP_P = 0.9
 GENERATE_PROBE_FRACTIONS = (0.25, 0.50, 0.75, 1.0)
 
 
@@ -75,6 +77,8 @@ def run_generate_probe(
     prompt: str = DEFAULT_GENERATE_PROBE_PROMPT,
     max_new_tokens: int = DEFAULT_GENERATE_PROBE_MAX_NEW_TOKENS,
     temperature: float = DEFAULT_GENERATE_PROBE_TEMPERATURE,
+    top_k: Optional[int] = DEFAULT_GENERATE_PROBE_TOP_K,
+    top_p: Optional[float] = DEFAULT_GENERATE_PROBE_TOP_P,
     seed: int = 42,
     checkpoint_dir: Optional[str] = None,
 ) -> str:
@@ -82,7 +86,8 @@ def run_generate_probe(
     fraction = step / max(total_steps, 1)
     header = (
         f"[GenerateProbe] step={step:,}/{total_steps:,} "
-        f"({fraction * 100:.0f}% of total) | prompt={prompt!r}"
+        f"({fraction * 100:.0f}% of total) | prompt={prompt!r} "
+        f"| temp={temperature} | top_k={top_k} | top_p={top_p}"
     )
     if checkpoint_dir:
         header += f" | checkpoint={checkpoint_dir}"
@@ -104,6 +109,8 @@ def run_generate_probe(
         prompt_ids,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
         rng=rng,
     )
     text = tokenizer.decode(generated_ids)
