@@ -5,6 +5,8 @@ Training log plotter — enhanced edition.
 
 Key behaviors:
   • Prefers aggregate training.log / richest log; plots the longest substantive run
+  • By default only the last 1000 lines of each text log are read (fast load + recent-scale axes);
+    use --tail-lines 0 for the full file
   • Drops smoke runs (<50 points) unless --keep-short / --all-runs
   • Breaks curves across large step gaps (no fake bridges)
   • Terminal summary table (loss, Δloss, PPL, forecast, tok/s, progress)
@@ -51,6 +53,8 @@ KV_RE = re.compile(r"([a-zA-Z0-9_/]+)=([^\s]+)")
 # Ignore smoke / tiny probes by default (same policy as loss_landscape_plotter).
 DEFAULT_MIN_POINTS = 50
 DEFAULT_MAX_STEP_GAP = 2000
+# Cap how much of a growing aggregate log we read/parse for plots.
+DEFAULT_TAIL_LINES = 1000
 
 # ── palette (tab10-inspired but hand-picked for readability on dark bg) ──────
 _COLORS = [
@@ -87,41 +91,67 @@ def _safe_float(value: str) -> Optional[float]:
         return None
 
 
-def _rows_from_structured(path: Path) -> Tuple[List[int], Dict[str, List[Optional[float]]], int]:
+def _rows_from_structured(
+    path: Path,
+    tail_lines: int = DEFAULT_TAIL_LINES,
+) -> Tuple[List[int], Dict[str, List[Optional[float]]], int]:
     """Parse .jsonl/.csv metric exports into (steps, metrics, total_steps). One run only
-    (these formats are per-run exports, unlike the shared logs/training.log)."""
+    (these formats are per-run exports, unlike the shared logs/training.log).
+
+    When tail_lines > 0, only the last N records are kept (same window policy as text logs).
+    """
     steps: List[int] = []
     metrics: Dict[str, List[Optional[float]]] = {}
     total_steps = 0
 
     if path.suffix == ".jsonl":
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
+        if tail_lines > 0:
+            line_iter: Sequence[str] = _read_tail_lines(path, tail_lines)
+            close_after = False
+        else:
+            line_iter = path.open("r", encoding="utf-8")
+            close_after = True
+        try:
+            for line in line_iter:
                 try:
                     data = json.loads(line)
                     step = int(data.get("step", 0))
-                    if not step: continue
+                    if not step:
+                        continue
                     steps.append(step)
                     total_steps = max(total_steps, step)
                     for k, v in data.items():
-                        if k == "step": continue
-                        metrics.setdefault(k, []).append(_safe_float(str(v)) if v is not None else None)
+                        if k == "step":
+                            continue
+                        metrics.setdefault(k, []).append(
+                            _safe_float(str(v)) if v is not None else None
+                        )
                 except Exception:
                     pass
+        finally:
+            if close_after:
+                line_iter.close()  # type: ignore[union-attr]
     elif path.suffix == ".csv":
         with path.open("r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
                     step = int(row.get("step", 0))
-                    if not step: continue
+                    if not step:
+                        continue
                     steps.append(step)
                     total_steps = max(total_steps, step)
                     for k, v in row.items():
-                        if k == "step": continue
+                        if k == "step":
+                            continue
                         metrics.setdefault(k, []).append(_safe_float(v) if v else None)
                 except Exception:
                     pass
+        if tail_lines > 0 and len(steps) > tail_lines:
+            keep_from = len(steps) - tail_lines
+            steps = steps[keep_from:]
+            metrics = {k: v[keep_from:] for k, v in metrics.items()}
+            total_steps = max(steps) if steps else 0
 
     max_len = len(steps)
     for k in metrics:
@@ -146,19 +176,73 @@ def _parse_log_line(line: str) -> Optional[Tuple[int, int, Dict[str, Optional[fl
 
 # Cache of already-parsed rows per text log path, keyed so live refreshes only
 # need to read/parse bytes appended since the last poll instead of re-reading
-# the whole (potentially huge, ever-growing) file each time.
+# the whole (potentially huge, ever-growing) file each time. Only used when
+# tail_lines == 0 (full-file mode); tailed reads are cheap enough to redo.
 _TEXT_LOG_CACHE: Dict[Path, Dict[str, Any]] = {}
 
 
-def _rows_from_text_log(path: Path, use_cache: bool = False) -> List[Tuple[int, int, Dict[str, Optional[float]]]]:
+def _read_tail_lines(path: Path, max_lines: int) -> List[str]:
+    """Return up to the last `max_lines` lines of a text file.
+
+    Seeks from the end in chunks so large aggregate logs do not need a full
+    sequential read. When max_lines <= 0, reads the entire file.
+    """
+    if max_lines <= 0:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            return f.readlines()
+
+    chunk_size = 65_536
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        end = f.tell()
+        if end == 0:
+            return []
+        data = b""
+        pos = end
+        # Need max_lines newlines to get max_lines complete lines; +1 covers a
+        # leading partial line that we may drop after decoding.
+        while pos > 0 and data.count(b"\n") <= max_lines:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            data = f.read(read_size) + data
+        text = data.decode("utf-8", errors="ignore")
+
+    lines = text.splitlines()
+    if pos > 0 and lines:
+        # Started mid-line: drop the truncated first fragment.
+        lines = lines[1:]
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return lines
+
+
+def _rows_from_text_log(
+    path: Path,
+    use_cache: bool = False,
+    tail_lines: int = DEFAULT_TAIL_LINES,
+) -> List[Tuple[int, int, Dict[str, Optional[float]]]]:
     """Parse a plaintext log (e.g. logs/training.log) into (step, total_steps, kv-row)
     tuples, one per line matching `step=N/TOTAL`. Any line with that pattern counts,
     whether or not it's tagged "[train]" -- keeps this resilient to log format tweaks.
 
-    When use_cache is True (live mode), only bytes appended since the previous
-    call are read and parsed; previously parsed rows are reused as-is."""
-    if not use_cache:
+    By default only the last `tail_lines` file lines are considered (fast load and
+    recent-window axis scaling). Pass tail_lines=0 to parse the whole file.
+
+    When use_cache is True and tail_lines==0 (live + full-file mode), only bytes
+    appended since the previous call are read and parsed; previously parsed rows
+    are reused as-is. Tailed reads skip the cache and re-scan the small window.
+    """
+    if tail_lines > 0:
         rows: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
+        for line in _read_tail_lines(path, tail_lines):
+            parsed = _parse_log_line(line)
+            if parsed:
+                rows.append(parsed)
+        return rows
+
+    if not use_cache:
+        rows = []
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 parsed = _parse_log_line(line)
@@ -215,7 +299,12 @@ def _segment_by_step_reset(
     return segments
 
 
-def _filter_runs(runs: List[RunSeries], all_runs: bool, min_points: int) -> List[RunSeries]:
+def _filter_runs(
+    runs: List[RunSeries],
+    all_runs: bool,
+    min_points: int,
+    prefer_latest: bool = False,
+) -> List[RunSeries]:
     substantive = [r for r in runs if len(r.steps) >= min_points]
     if not substantive:
         substantive = [r for r in runs if len(r.steps) >= 2]
@@ -223,9 +312,13 @@ def _filter_runs(runs: List[RunSeries], all_runs: bool, min_points: int) -> List
         return []
     if all_runs:
         return substantive
-    # Prefer the richest trajectory, not the chronologically last (short resumes
-    # / smokes otherwise hide the real training run).
-    best = max(substantive, key=lambda r: len(r.steps))
+    # Default: richest trajectory (short resumes must not hide a long run).
+    # With a tailed recent window, prefer the chronologically last segment so a
+    # live resume is not outranked by an earlier chunk still inside the tail.
+    if prefer_latest:
+        best = substantive[-1]
+    else:
+        best = max(substantive, key=lambda r: len(r.steps))
     # Drop "_runN" suffix when only one series is shown.
     clean = re.sub(r"_run\d+$", "", best.name)
     if clean != best.name:
@@ -255,20 +348,24 @@ def _parse_log_file(
     use_cache: bool = False,
     min_points: int = DEFAULT_MIN_POINTS,
     max_step_gap: int = DEFAULT_MAX_STEP_GAP,
+    tail_lines: int = DEFAULT_TAIL_LINES,
 ) -> List[RunSeries]:
     """Parse a log/metrics file into one RunSeries per contiguous training run found
     in it. Text logs (like logs/training.log) may contain many runs concatenated;
     structured .jsonl/.csv exports are treated as a single run."""
     if path.suffix in (".jsonl", ".csv"):
-        steps, metrics, total_steps = _rows_from_structured(path)
+        steps, metrics, total_steps = _rows_from_structured(path, tail_lines=tail_lines)
         if not steps:
             return []
         _derive_ppl(metrics)
         run = _canonicalize_run(RunSeries(name=path.stem, path=path, steps=steps,
                                           total_steps=total_steps, metrics=metrics))
-        return _filter_runs([run], all_runs=all_runs, min_points=min_points)
+        return _filter_runs(
+            [run], all_runs=all_runs, min_points=min_points,
+            prefer_latest=tail_lines > 0,
+        )
 
-    rows = _rows_from_text_log(path, use_cache=use_cache)
+    rows = _rows_from_text_log(path, use_cache=use_cache, tail_lines=tail_lines)
     segments = _segment_by_step_reset(rows, max_step_gap=max_step_gap)
     if not segments:
         return []
@@ -288,7 +385,10 @@ def _parse_log_file(
             steps=steps, total_steps=total_steps, metrics=metrics,
         ))
         runs.append(run)
-    return _filter_runs(runs, all_runs=all_runs, min_points=min_points)
+    return _filter_runs(
+        runs, all_runs=all_runs, min_points=min_points,
+        prefer_latest=tail_lines > 0,
+    )
 
 
 def _canonicalize_run(run: RunSeries) -> RunSeries:
@@ -331,6 +431,7 @@ def _load_runs(
     use_cache: bool = False,
     min_points: int = DEFAULT_MIN_POINTS,
     max_step_gap: int = DEFAULT_MAX_STEP_GAP,
+    tail_lines: int = DEFAULT_TAIL_LINES,
 ) -> List[RunSeries]:
     runs: List[RunSeries] = []
     for path in paths:
@@ -341,12 +442,15 @@ def _load_runs(
                 use_cache=use_cache,
                 min_points=min_points,
                 max_step_gap=max_step_gap,
+                tail_lines=tail_lines,
             ))
     if all_runs or len(paths) > 1:
         return runs
     # Single-file default path already filtered inside _parse_log_file; if multiple
-    # files somehow yielded multiple runs, keep the longest.
-    return _filter_runs(runs, all_runs=False, min_points=min_points) if runs else []
+    # files somehow yielded multiple runs, keep the longest (or latest when tailed).
+    return _filter_runs(
+        runs, all_runs=False, min_points=min_points, prefer_latest=tail_lines > 0,
+    ) if runs else []
 
 
 # ── math helpers ─────────────────────────────────────────────────────────────
@@ -894,6 +998,7 @@ def plot_runs_liveable(
     all_runs: bool = False,
     min_points: int = DEFAULT_MIN_POINTS,
     max_step_gap: int = DEFAULT_MAX_STEP_GAP,
+    tail_lines: int = DEFAULT_TAIL_LINES,
     show: bool = True,
 ) -> None:
     _apply_style()
@@ -909,9 +1014,10 @@ def plot_runs_liveable(
             _load_runs(
                 source_paths,
                 all_runs=all_runs,
-                use_cache=live,
+                use_cache=live and tail_lines <= 0,
                 min_points=min_points,
                 max_step_gap=max_step_gap,
+                tail_lines=tail_lines,
             )
             if live else list(runs)
         )
@@ -982,6 +1088,9 @@ def main() -> None:
                         help="Drop runs with fewer logged points")
     parser.add_argument("--max-step-gap", type=int, default=DEFAULT_MAX_STEP_GAP,
                         help="Break curves across step gaps larger than this")
+    parser.add_argument("--tail-lines", type=int, default=DEFAULT_TAIL_LINES,
+                        help="Only parse the last N lines of each log (0 = entire file). "
+                             "Keeps load time and axis scaling focused on recent training.")
     parser.add_argument("--metric", default="tok/s",
                         help="Metric shown in the bottom panel")
     parser.add_argument("--smooth-window", type=int, default=21,
@@ -1016,6 +1125,7 @@ def main() -> None:
 
     min_points = 2 if args.keep_short else max(2, args.min_points)
     max_step_gap = max(1, args.max_step_gap)
+    tail_lines = max(0, args.tail_lines)
 
     if args.logs:
         paths = [Path(p) for p in args.logs]
@@ -1033,6 +1143,7 @@ def main() -> None:
         all_runs=args.all_runs,
         min_points=min_points,
         max_step_gap=max_step_gap,
+        tail_lines=tail_lines,
     )
     if not runs:
         raise SystemExit("No valid training logs found.")
@@ -1059,6 +1170,7 @@ def main() -> None:
         save_path=Path(args.save) if args.save else None,
         min_points=min_points,
         max_step_gap=max_step_gap,
+        tail_lines=tail_lines,
         show=do_show and not args.live,
     )
 
