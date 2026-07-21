@@ -1,0 +1,47 @@
+{
+  "model": {
+    "name": "Collab Toy (T4 smoke)",
+    "vocab_size": null,
+    "max_len": 16,
+    "embedding_dim": 32,
+    "num_heads": 4,
+    "num_layers": 2,
+    "dropout_prob": 0.0,
+    "init_scale": 0.02,
+    "description": "Tiny model for Colab Free T4 end-to-end smoke train/generate."
+  },
+  "dataset": {
+    "name": "tiny_english",
+    "corpus": [
+      "the quick brown fox jumps over the lazy dog",
+      "machine learning trains models on large datasets",
+      "artificial intelligence mimics human intelligence",
+      "neural networks learn patterns from data",
+      "deep learning uses multiple layers for feature extraction",
+      "cuda kernels accelerate matrix multiplications on the gpu",
+      "transformers attend to relevant tokens in the sequence",
+      "gradient descent updates weights to minimize loss",
+      "validation holdout measures generalization during training",
+      "character level language models predict the next symbol"
+    ],
+    "vocab_size": 40
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "Collab Toy",
+    "learning_rate": 0.01,
+    "weight_decay": 0.0,
+    "batch_size": 4,
+    "num_epochs": 2,
+    "warmup_steps": 5,
+    "gradient_clip": 1.0,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08
+  },
+  "metadata": {
+    "created": "collab-toy",
+    "target": "colab-t4"
+  }
+}
