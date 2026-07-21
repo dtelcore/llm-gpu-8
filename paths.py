@@ -17,7 +17,7 @@ directory-based checkpoint bundles):
 """
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -42,6 +42,10 @@ DEFAULT_LANDSCAPE_PLOT = OUTPUT_LOGS / "loss_landscape_latest.png"
 LEGACY_LOGS_DIR = PROJECT_ROOT / "logs"
 LEGACY_MODELS_DIR = PROJECT_ROOT / "models"
 LEGACY_CONFIG_PATH = SETUP_DIR / "training_config.json"
+
+QUARTER_FRACTIONS = (0.25, 0.50, 0.75, 1.0)
+QUARTER_NAMES = ("quarter_25", "quarter_50", "quarter_75", "quarter_100")
+BEST_DIR_NAME = "best"
 
 
 def ensure_output_dirs() -> None:
@@ -74,3 +78,39 @@ def checkpoint_vocab_sidecar(checkpoint_dir: Union[str, Path]) -> Path:
     """Path for a vocab.json copy under output/tokenizer/ for a checkpoint run."""
     stem = Path(checkpoint_dir).name
     return OUTPUT_TOKENIZER / f"{stem}_vocab.json"
+
+
+def quarter_name_for_fraction(fraction: float) -> str:
+    """Map 0.25/0.50/0.75/1.0 → quarter_25/…/quarter_100."""
+    pct = int(round(fraction * 100))
+    return f"quarter_{pct}"
+
+
+def quarter_dir(run_dir: Union[str, Path], fraction: float) -> Path:
+    return Path(run_dir) / quarter_name_for_fraction(fraction)
+
+
+def best_dir(run_dir: Union[str, Path]) -> Path:
+    return Path(run_dir) / BEST_DIR_NAME
+
+
+def run_root_for_checkpoint(checkpoint_dir: Union[str, Path]) -> Path:
+    """If checkpoint is a nested quarter_*/best under a run, return the run root;
+    otherwise return the checkpoint dir itself."""
+    path = Path(checkpoint_dir)
+    # Peel nested quarter_*/best even when the parent run root is not yet fully
+    # materialized (fresh promote / partial trees).
+    if path.name in QUARTER_NAMES or path.name == BEST_DIR_NAME:
+        return path.parent
+    return path
+
+
+def list_quarter_dirs(run_dir: Union[str, Path]) -> List[Path]:
+    """Return existing quarter_* dirs under a run, in milestone order."""
+    root = Path(run_dir)
+    found = []
+    for name in QUARTER_NAMES:
+        d = root / name
+        if d.is_dir() and (d / "config.json").exists():
+            found.append(d)
+    return found

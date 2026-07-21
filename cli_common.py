@@ -161,14 +161,124 @@ def load_config(path: str) -> Dict:
         return json.load(f)
 
 
+def _checkpoint_label(path: Path) -> str:
+    """Human-readable label with step / metrics when available."""
+    step = None
+    state_path = path / "state.json"
+    if state_path.exists():
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                step = json.load(f).get("step")
+        except (OSError, json.JSONDecodeError, TypeError):
+            step = None
+
+    extras = []
+    if step is not None:
+        extras.append(f"step={step:,}" if isinstance(step, int) else f"step={step}")
+
+    metrics_path = path / "metrics.json"
+    if metrics_path.exists():
+        try:
+            with open(metrics_path, "r", encoding="utf-8") as f:
+                metrics = json.load(f)
+            if metrics.get("val_loss") is not None:
+                extras.append(f"val_loss={float(metrics['val_loss']):.4f}")
+            elif metrics.get("loss") is not None:
+                extras.append(f"loss={float(metrics['loss']):.4f}")
+            quality = metrics.get("quality") or {}
+            if isinstance(quality, dict) and quality.get("aggregate") is not None:
+                extras.append(f"quality={float(quality['aggregate']):.3f}")
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    suffix = f" [{', '.join(extras)}]" if extras else ""
+    return f"{path}{suffix}"
+
+
 def list_checkpoints(models_dir: Optional[str] = None) -> List[Path]:
-    """Return checkpoint directories under checkpoints root (any dir holding config.json),
-    newest first."""
+    """Return resumable checkpoint dirs: each run root (latest), plus best/ and
+    quarter_* nested under it. Newest run roots first; nested entries follow
+    their parent in order latest-implied → best → quarter_25…100."""
+    from paths import BEST_DIR_NAME, QUARTER_NAMES
+
     root = resolve_checkpoints_dir(models_dir)
     if not root.exists():
         return []
-    found = [d for d in root.iterdir() if d.is_dir() and (d / "config.json").exists()]
-    return sorted(found, key=lambda d: d.stat().st_mtime, reverse=True)
+
+    run_dirs = [
+        d for d in root.iterdir()
+        if d.is_dir() and (d / "config.json").exists()
+    ]
+    run_dirs = sorted(run_dirs, key=lambda d: d.stat().st_mtime, reverse=True)
+
+    found: List[Path] = []
+    for run in run_dirs:
+        found.append(run)
+        best = run / BEST_DIR_NAME
+        if best.is_dir() and (best / "config.json").exists():
+            found.append(best)
+        for name in QUARTER_NAMES:
+            q = run / name
+            if q.is_dir() and (q / "config.json").exists():
+                found.append(q)
+    return found
+
+
+def add_probe_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("generate probes (quarterly milestones)")
+    group.add_argument(
+        "--no-generate-probe", action="store_true",
+        help="Skip mid-training text generation at quarterly milestones "
+             "(still saves quarter_XX/, val metrics, and full traces)",
+    )
+    group.add_argument(
+        "--generate-probe-prompt", type=str, default="once upon a",
+        help="Prompt used for mid-training generation probes (default: once upon a)",
+    )
+    group.add_argument(
+        "--generate-probe-tokens", type=int, default=256,
+        help="Characters to generate for each mid-training probe (default: 256)",
+    )
+
+
+def add_quality_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("generation quality trial")
+    group.add_argument(
+        "--quality-trial", action="store_true",
+        help="After training, run sequential inter-quarter generation quality trial and prompt to promote best/",
+    )
+    group.add_argument(
+        "--no-quality-trial", action="store_true",
+        help="Never run the post-training quality trial (default when --no-prompt)",
+    )
+    group.add_argument(
+        "--quality-prompt", type=str, default=None,
+        help="Prompt for quality trial generations (default: --generate-probe-prompt)",
+    )
+    group.add_argument(
+        "--quality-weights", type=str, default=None,
+        help="Comma weights spelling=1,punctuation=1,grammar=1,semantics=1",
+    )
+    group.add_argument(
+        "--compare-quarters", action="store_true",
+        help="Skip training: run quality trial on --checkpoint run (latest/quarters) and exit",
+    )
+    group.add_argument(
+        "--set-best", type=str, default=None,
+        help="Non-interactively promote a quarter (e.g. quarter_50) as best/ under the run",
+    )
+
+
+def should_run_quality_trial(args: argparse.Namespace) -> bool:
+    """Default: on for interactive runs, off for --no-prompt; explicit flags win."""
+    if getattr(args, "no_quality_trial", False):
+        return False
+    if getattr(args, "quality_trial", False):
+        return True
+    if getattr(args, "no_prompt", False):
+        return False
+    # Interactive menus default to offering the trial after training.
+    return bool(getattr(args, "menu", False))
 
 
 def prompt_resume_or_new(models_dir: Optional[str] = None) -> Optional[str]:
@@ -178,10 +288,10 @@ def prompt_resume_or_new(models_dir: Optional[str] = None) -> Optional[str]:
     checkpoints = list_checkpoints(models_dir)
     ckpt_root = resolve_checkpoints_dir(models_dir)
 
-    print(f"\nAvailable checkpoints in '{ckpt_root}':")
+    print(f"\nAvailable checkpoints in '{ckpt_root}' (latest / best / quarters):")
     if checkpoints:
         for i, d in enumerate(checkpoints, 1):
-            print(f"  {i}. {d}")
+            print(f"  {i}. {_checkpoint_label(d)}")
     else:
         print("  (none found)")
     print("  n. Start a new training run")
@@ -221,10 +331,10 @@ def select_checkpoint_interactive(
     checkpoints = list_checkpoints(models_dir)
     ckpt_root = resolve_checkpoints_dir(models_dir)
 
-    print(f"\nAvailable checkpoints in '{ckpt_root}':")
+    print(f"\nAvailable checkpoints in '{ckpt_root}' (latest / best / quarters):")
     if checkpoints:
         for i, d in enumerate(checkpoints, 1):
-            print(f"  {i}. {d}")
+            print(f"  {i}. {_checkpoint_label(d)}")
     else:
         print("  (none found)")
     if allow_new:

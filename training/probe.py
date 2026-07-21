@@ -7,12 +7,13 @@ Post-checkpoint sanity checks and mid-training generation probes.
 - run_generate_probe: sample text at training milestones (25/50/75/100% of total steps).
 """
 
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from logging_config import logger
-from model.gpt import GPTModel
+from model.trace import TraceContext
+from paths import QUARTER_FRACTIONS, quarter_name_for_fraction
 from training.checkpoint import load_checkpoint
 from training.loss import softmax_cross_entropy
 
@@ -21,24 +22,58 @@ DEFAULT_GENERATE_PROBE_MAX_NEW_TOKENS = 256
 DEFAULT_GENERATE_PROBE_TEMPERATURE = 0.6
 DEFAULT_GENERATE_PROBE_TOP_K = 10
 DEFAULT_GENERATE_PROBE_TOP_P = 0.9
-GENERATE_PROBE_FRACTIONS = (0.25, 0.50, 0.75, 1.0)
+GENERATE_PROBE_FRACTIONS = QUARTER_FRACTIONS
 
 
 def generate_probe_milestones(total_steps: int) -> List[int]:
     """Return sorted unique step numbers at 25%, 50%, 75%, and 100% of total_steps."""
+    return [step for step, _ in milestone_steps_with_fractions(total_steps)]
+
+
+def milestone_steps_with_fractions(total_steps: int) -> List[Tuple[int, float]]:
+    """Return sorted (step, fraction) pairs for quarterly milestones."""
     if total_steps < 1:
         return []
-    milestones: Set[int] = set()
+    by_step: Dict[int, float] = {}
     for fraction in GENERATE_PROBE_FRACTIONS:
         if fraction == 1.0:
-            milestones.add(total_steps)
+            step = total_steps
         else:
-            milestones.add(max(1, int(total_steps * fraction)))
-    return sorted(milestones)
+            step = max(1, int(total_steps * fraction))
+        # Prefer the larger fraction if two map to the same step (tiny runs).
+        by_step[step] = max(by_step.get(step, 0.0), fraction)
+    return sorted(by_step.items(), key=lambda x: x[0])
+
+
+def milestone_fraction_map(total_steps: int) -> Dict[int, float]:
+    return {step: frac for step, frac in milestone_steps_with_fractions(total_steps)}
+
+
+def quarter_dir_name_for_step(step: int, total_steps: int) -> Optional[str]:
+    frac = milestone_fraction_map(total_steps).get(step)
+    if frac is None:
+        return None
+    return quarter_name_for_fraction(frac)
+
+
+def make_full_tracer() -> TraceContext:
+    """Force all trace channels on for quarterly diagnostics."""
+    tracer = TraceContext(
+        verbose=True,
+        trace_logits=True,
+        trace_tokens=True,
+        trace_neurons=True,
+        trace_vectorization=True,
+        trace_every=1,
+    )
+    tracer.active_step = True
+    return tracer
 
 
 def run_probe(checkpoint_dir: str, sample_text: str = "the quick brown fox") -> bool:
     """Returns True if the checkpoint reloads cleanly and produces finite loss/logits."""
+    from model.gpt import GPTModel
+
     try:
         gpt_config, params, tokenizer, _, _ = load_checkpoint(checkpoint_dir)
     except Exception as exc:
@@ -69,7 +104,7 @@ def run_probe(checkpoint_dir: str, sample_text: str = "the quick brown fox") -> 
 
 
 def run_generate_probe(
-    model: GPTModel,
+    model,
     tokenizer,
     *,
     step: int,
@@ -81,6 +116,7 @@ def run_generate_probe(
     top_p: Optional[float] = DEFAULT_GENERATE_PROBE_TOP_P,
     seed: int = 42,
     checkpoint_dir: Optional[str] = None,
+    tracer: Optional[TraceContext] = None,
 ) -> str:
     """Sample text from the in-memory model at a training milestone and log/print it."""
     fraction = step / max(total_steps, 1)
@@ -112,6 +148,8 @@ def run_generate_probe(
         top_k=top_k,
         top_p=top_p,
         rng=rng,
+        tracer=tracer,
+        tokenizer=tokenizer if tracer is not None else None,
     )
     text = tokenizer.decode(generated_ids)
 

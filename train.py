@@ -5,12 +5,18 @@ Main training entry point. Loads output/configs/training_config.json, builds the
 tokenizer + PyCUDA-backed GPT model + AdamW optimizer, and runs the
 training loop over the corpus with CLI-gated logit/token/neuron tracing.
 
+v0.1.0: quarterly milestones save latest + quarter_XX/, force full traces,
+val holdout metrics, and optional sequential generation-quality trial for
+manual best/ promotion. Resume from latest, best/, or any quarter_*.
+
 Usage:
     python train.py --config output/configs/training_config.json --checkpoint output/checkpoints/run1
     python train.py --epochs 3 --trace-tokens --trace-logits --trace-every 10
     python train.py --steps 1500   # total steps across ALL epochs, overrides --epochs/config
     python train.py --menu         # wizard: Toy Run or Tiny Stories presets, or custom
     python train.py --generate     # skip training; pick a checkpoint and enter a generation test menu
+    python train.py --compare-quarters --checkpoint output/checkpoints/run1
+    python train.py --set-best quarter_50 --checkpoint output/checkpoints/run1
 
 If --learning-rate/--steps/--epochs/model-hyperparameters (--embedding-dim,
 --num-heads, --num-layers, --max-len, --dropout, --batch-size, --weight-decay,
@@ -22,6 +28,7 @@ silently fall back to config/CLI defaults).
 import argparse
 import time
 from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -30,6 +37,7 @@ from logging_config import logger, setup_logging
 from model.config import GPTConfig
 from model.cuda import ops as cuda_ops
 from model.gpt import GPTModel
+from model.trace import TraceContext
 from model.weights import ModelParameters
 from paths import (
     DATA_DIR,
@@ -39,20 +47,29 @@ from paths import (
     OUTPUT_CHECKPOINTS,
     ensure_output_dirs,
     resolve_checkpoints_dir,
+    run_root_for_checkpoint,
 )
 from tokenizer.tokenizer import CharacterGPTTokenizer
-from training.checkpoint import save_checkpoint
+from training.checkpoint import promote_best, save_checkpoint
 from training.dataset import WindowedDataset
+from training.eval import (
+    ensure_train_val_split,
+    evaluate_val_loss,
+    perplexity_from_loss,
+)
 from training.loss import softmax_cross_entropy_batch, softmax_cross_entropy_batch_gpu, trace_predictions
 from training.gpu_optimizer import AdamWGPU
 from training.probe import (
     DEFAULT_GENERATE_PROBE_TEMPERATURE,
     DEFAULT_GENERATE_PROBE_TOP_K,
     DEFAULT_GENERATE_PROBE_TOP_P,
-    generate_probe_milestones,
+    make_full_tracer,
+    milestone_fraction_map,
     run_generate_probe,
     run_probe,
 )
+from training.quality import compare_quarters, parse_quality_weights, score_generation
+from version import __version__
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +80,8 @@ def parse_args() -> argparse.Namespace:
     cli_common.add_training_length_args(parser)
     cli_common.add_model_hyperparam_args(parser)
     cli_common.add_trace_args(parser)
+    cli_common.add_probe_args(parser)
+    cli_common.add_quality_args(parser)
     parser.add_argument(
         "--menu", action="store_true",
         help="Run the interactive training setup wizard (model/dataset/init/hyperparams) "
@@ -84,18 +103,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume", action="store_true",
         help="Resume training from --checkpoint (loads weights, config, vocab, and step counter)",
-    )
-    parser.add_argument(
-        "--no-generate-probe", action="store_true",
-        help="Disable mid-training generation probes at 25%%, 50%%, 75%%, and 100%% of total steps",
-    )
-    parser.add_argument(
-        "--generate-probe-prompt", type=str, default="once upon a",
-        help="Prompt used for mid-training generation probes (default: once upon a)",
-    )
-    parser.add_argument(
-        "--generate-probe-tokens", type=int, default=256,
-        help="Characters to generate for each mid-training probe (default: 256)",
     )
     parser.add_argument(
         "--temperature", type=float, default=DEFAULT_GENERATE_PROBE_TEMPERATURE,
@@ -157,16 +164,44 @@ def _iter_batches_forever(dataset: WindowedDataset, rng: np.random.Generator):
             yield batch, epoch
 
 
+def _force_quarter_traces(tracer: TraceContext) -> Dict:
+    """Enable all trace channels for this step; returns prior flag snapshot to restore."""
+    snapshot = {
+        "trace_logits": tracer.trace_logits,
+        "trace_tokens": tracer.trace_tokens,
+        "trace_neurons": tracer.trace_neurons,
+        "trace_vectorization": tracer.trace_vectorization,
+        "trace_every": tracer.trace_every,
+        "active_step": tracer.active_step,
+    }
+    tracer.trace_logits = True
+    tracer.trace_tokens = True
+    tracer.trace_neurons = True
+    tracer.trace_vectorization = True
+    tracer.trace_every = 1
+    tracer.active_step = True
+    return snapshot
+
+
+def _restore_traces(tracer: TraceContext, snapshot: Dict) -> None:
+    tracer.trace_logits = snapshot["trace_logits"]
+    tracer.trace_tokens = snapshot["trace_tokens"]
+    tracer.trace_neurons = snapshot["trace_neurons"]
+    tracer.trace_vectorization = snapshot["trace_vectorization"]
+    tracer.trace_every = snapshot["trace_every"]
+    tracer.active_step = snapshot["active_step"]
+
+
 def generate_test_menu(args: argparse.Namespace) -> None:
     """Interactive checkpoint picker + generation REPL, without touching training at all."""
     import interactive as interactive_cli
 
     ensure_output_dirs()
     setup_logging(log_filename="generate_menu")
-    logger.info("train.py --generate | models_dir=%s", args.models_dir)
+    logger.info("train.py --generate | models_dir=%s | version=%s", args.models_dir, __version__)
 
     print("=" * 70)
-    print("GENERATION TEST MENU")
+    print(f"GENERATION TEST MENU  (v{__version__})")
     print("=" * 70)
     checkpoint = cli_common.select_checkpoint_interactive(
         models_dir=args.models_dir, allow_new=False, prompt_label="checkpoint to generate from",
@@ -183,17 +218,140 @@ def generate_test_menu(args: argparse.Namespace) -> None:
     interactive_cli.run_repl(args)
 
 
+def run_quality_trial_for_args(args: argparse.Namespace, run_dir: Optional[str] = None) -> None:
+    """Run sequential quarter comparison / optional best promotion from CLI args."""
+    root = run_root_for_checkpoint(run_dir or args.checkpoint)
+    prompt = getattr(args, "quality_prompt", None) or getattr(args, "generate_probe_prompt", "once upon a")
+    weights = parse_quality_weights(getattr(args, "quality_weights", None))
+    interactive = not getattr(args, "no_prompt", False) and not getattr(args, "set_best", None)
+    compare_quarters(
+        str(root),
+        prompt=prompt,
+        max_new_tokens=getattr(args, "generate_probe_tokens", 256),
+        temperature=getattr(args, "temperature", DEFAULT_GENERATE_PROBE_TEMPERATURE),
+        top_k=getattr(args, "top_k", DEFAULT_GENERATE_PROBE_TOP_K),
+        top_p=getattr(args, "top_p", DEFAULT_GENERATE_PROBE_TOP_P),
+        seed=args.seed,
+        weights=weights,
+        interactive_promote=interactive,
+        set_best=getattr(args, "set_best", None),
+    )
+
+
+def _handle_quarterly_milestone(
+    *,
+    args: argparse.Namespace,
+    model: GPTModel,
+    params: ModelParameters,
+    tokenizer,
+    config: Dict,
+    optimizer,
+    run_dir: Path,
+    global_step: int,
+    total_steps: int,
+    epoch: int,
+    fraction: float,
+    avg_recent_loss: Optional[float],
+    val_dataset: Optional[WindowedDataset],
+    do_generate_probe: bool = True,
+) -> None:
+    """Save latest + quarter_XX, val eval, probe, full-trace generate, quality score."""
+    from paths import quarter_name_for_fraction
+
+    quarter_name = quarter_name_for_fraction(fraction)
+    quarter_path = run_dir / quarter_name
+
+    print(f"\n[Quarterly] step={global_step:,}/{total_steps:,} ({fraction * 100:.0f}%) -> {quarter_name}")
+    logger.info(
+        "Quarterly milestone step=%s/%s fraction=%.2f quarter=%s",
+        global_step, total_steps, fraction, quarter_name,
+    )
+
+    optimizer.sync_host_weights()
+
+    val_loss, val_ppl = evaluate_val_loss(model, val_dataset, seed=args.seed)
+    train_ppl = perplexity_from_loss(avg_recent_loss) if avg_recent_loss is not None else None
+
+    metrics: Dict = {
+        "step": global_step,
+        "epoch": epoch,
+        "fraction": fraction,
+        "quarter": quarter_name,
+        "loss": avg_recent_loss,
+        "ppl": train_ppl,
+        "val_loss": val_loss,
+        "val_ppl": val_ppl,
+    }
+
+    save_checkpoint(str(run_dir), params, tokenizer, config, step=global_step, epoch=epoch, metrics=metrics)
+    save_checkpoint(str(quarter_path), params, tokenizer, config, step=global_step, epoch=epoch, metrics=metrics)
+
+    run_probe(str(quarter_path))
+
+    generated = ""
+    if do_generate_probe:
+        full_tracer = make_full_tracer()
+        generated = run_generate_probe(
+            model,
+            tokenizer,
+            step=global_step,
+            total_steps=total_steps,
+            prompt=args.generate_probe_prompt,
+            max_new_tokens=args.generate_probe_tokens,
+            temperature=getattr(args, "temperature", DEFAULT_GENERATE_PROBE_TEMPERATURE),
+            top_k=getattr(args, "top_k", DEFAULT_GENERATE_PROBE_TOP_K),
+            top_p=getattr(args, "top_p", DEFAULT_GENERATE_PROBE_TOP_P),
+            seed=args.seed,
+            checkpoint_dir=str(quarter_path),
+            tracer=full_tracer,
+        )
+
+    if generated:
+        from training.checkpoint import save_metrics
+
+        weights = parse_quality_weights(getattr(args, "quality_weights", None))
+        scores = score_generation(generated, prompt=args.generate_probe_prompt, weights=weights)
+        metrics["quality"] = scores.as_dict()
+        save_metrics(run_dir, metrics)
+        save_metrics(quarter_path, metrics)
+        print(
+            f"[Quality] {quarter_name} aggregate={scores.aggregate:.3f} "
+            f"(spell={scores.spelling:.3f} punct={scores.punctuation:.3f} "
+            f"gram={scores.grammar:.3f} sem={scores.semantics:.3f})"
+        )
+        logger.info(
+            "[quality] step=%s quarter=%s aggregate=%.4f spelling=%.4f punctuation=%.4f "
+            "grammar=%.4f semantics=%.4f",
+            global_step, quarter_name, scores.aggregate, scores.spelling,
+            scores.punctuation, scores.grammar, scores.semantics,
+        )
+
+    if val_loss is not None:
+        logger.info(
+            f"[train] step={global_step}/{total_steps} epoch={epoch} "
+            f"loss={avg_recent_loss if avg_recent_loss is not None else float('nan'):.4f} "
+            f"ppl={train_ppl if train_ppl is not None else float('nan'):.4f} "
+            f"val_loss={val_loss:.4f} val_ppl={val_ppl:.4f}"
+        )
+        print(f"[Val] loss={val_loss:.4f} ppl={val_ppl:.4f}")
+
+
 def train(args: argparse.Namespace) -> str:
     ensure_output_dirs()
     ckpt_stem = Path(args.checkpoint).name
     setup_logging(log_filename=f"training_{ckpt_stem}")
-    logger.info("train.py starting | checkpoint=%s | config=%s", args.checkpoint, getattr(args, "config", None))
+    logger.info(
+        "train.py starting | version=%s | checkpoint=%s | config=%s",
+        __version__, args.checkpoint, getattr(args, "config", None),
+    )
+    print(f"llm-gpu-8 training v{__version__}")
 
     # menu/models_dir/plot are train.py-only flags; default them so this function
     # also works when called from auto_train.py's smaller argument set.
     resumed = False
     start_step = 0
     tokenizer = gpt_config = params = None
+    run_dir = run_root_for_checkpoint(args.checkpoint)
 
     if getattr(args, "resume", False):
         from training.checkpoint import load_checkpoint
@@ -201,7 +359,11 @@ def train(args: argparse.Namespace) -> str:
         gpt_config, params, tokenizer, config, state = load_checkpoint(args.checkpoint)
         start_step = int(state.get("step", 0))
         resumed = True
-        print(f"-> Resuming '{args.checkpoint}' from step {start_step:,}")
+        run_dir = run_root_for_checkpoint(args.checkpoint)
+        # Continue writing latest/quarters into the parent run root.
+        args.checkpoint = str(run_dir)
+        print(f"-> Resuming '{args.checkpoint}' from step {start_step:,} "
+              f"(source={state.get('version', '?')}; writing latest into run root)")
     elif getattr(args, "menu", False):
         from training.checkpoint import load_checkpoint
 
@@ -212,11 +374,13 @@ def train(args: argparse.Namespace) -> str:
 
         if resume_ckpt:
             gpt_config, params, tokenizer, config, state = load_checkpoint(resume_ckpt)
-            args.checkpoint = resume_ckpt
+            run_dir = run_root_for_checkpoint(resume_ckpt)
+            args.checkpoint = str(run_dir)
             start_step = int(state.get("step", 0))
             resumed = True
             print(f"-> Resuming '{resume_ckpt}' from step {start_step:,} "
-                  f"(model architecture is fixed by the checkpoint; only training-length/LR "
+                  f"(writing latest into '{run_dir}'; "
+                  f"model architecture is fixed by the checkpoint; only training-length/LR "
                   f"prompts still apply)")
         else:
             from setup.training_setup import quickstart_training_setup
@@ -228,9 +392,13 @@ def train(args: argparse.Namespace) -> str:
                 models_dir=models_dir, allow_new=True,
                 default_new_name="run1", prompt_label="checkpoint to save to",
             )
+            run_dir = run_root_for_checkpoint(args.checkpoint)
+            args.checkpoint = str(run_dir)
             print(f"-> Training will checkpoint to '{args.checkpoint}'")
     else:
         config = cli_common.load_config(args.config)
+        run_dir = run_root_for_checkpoint(args.checkpoint)
+        args.checkpoint = str(run_dir)
 
     hyperparams = config["hyperparameters"]
 
@@ -240,6 +408,9 @@ def train(args: argparse.Namespace) -> str:
         cli_common.prompt_model_hyperparams(args, config["model"], hyperparams)
         tokenizer, gpt_config = build_tokenizer_and_config(config)
         params = ModelParameters(gpt_config, init_scales=config.get("weight_initialization", {}), seed=args.seed)
+
+    # 90/10 val holdout (stable across resume when val_corpus.json is present).
+    train_corpus, val_corpus = ensure_train_val_split(config, seed=args.seed)
 
     model = GPTModel(gpt_config, params)
 
@@ -260,7 +431,15 @@ def train(args: argparse.Namespace) -> str:
     if resumed:
         optimizer.t = start_step
 
-    dataset = WindowedDataset(config["dataset"]["corpus"], tokenizer, gpt_config.max_len, hyperparams["batch_size"])
+    dataset = WindowedDataset(train_corpus, tokenizer, gpt_config.max_len, hyperparams["batch_size"])
+    val_dataset = None
+    if val_corpus:
+        try:
+            val_dataset = WindowedDataset(val_corpus, tokenizer, gpt_config.max_len, hyperparams["batch_size"])
+        except ValueError as exc:
+            logger.warning("Val dataset too small for windows; skipping val eval: %s", exc)
+            val_dataset = None
+
     rng = np.random.default_rng(args.seed)
     steps_per_epoch = dataset.num_batches()
 
@@ -286,39 +465,53 @@ def train(args: argparse.Namespace) -> str:
     # pass --trace-every explicitly to override that cadence.
     tracer = cli_common.build_tracer(args, default_trace_every=max(1, total_steps // 10))
 
-    generate_probe_steps = set()
-    generate_probes_done: set[int] = set()
-    if not getattr(args, "no_generate_probe", False):
-        generate_probe_steps = set(generate_probe_milestones(total_steps))
-        generate_probes_done = {s for s in generate_probe_steps if s <= start_step}
-        if generate_probe_steps:
-            pending = sorted(generate_probe_steps - generate_probes_done)
-            print(f"Generate probes scheduled at steps: {', '.join(f'{s:,}' for s in sorted(generate_probe_steps))}")
-            if generate_probes_done:
-                print(f"  (skipping already-passed milestones: {', '.join(f'{s:,}' for s in sorted(generate_probes_done))})")
-            if pending:
-                print(f"  (pending: {', '.join(f'{s:,}' for s in pending)})")
+    milestone_fracs = milestone_fraction_map(total_steps)
+    quarterly_steps = set(milestone_fracs.keys())
+    quarterly_done: set[int] = {s for s in quarterly_steps if s <= start_step}
+    do_generate_probe = not getattr(args, "no_generate_probe", False)
+    if quarterly_steps:
+        pending = sorted(quarterly_steps - quarterly_done)
+        print(f"Quarterly milestones at steps: {', '.join(f'{s:,}' for s in sorted(quarterly_steps))}")
+        if quarterly_done:
+            print(f"  (skipping already-passed milestones: {', '.join(f'{s:,}' for s in sorted(quarterly_done))})")
+        if pending:
+            print(f"  (pending: {', '.join(f'{s:,}' for s in pending)})")
+        if not do_generate_probe:
+            print("  (generate probes disabled via --no-generate-probe; still saving quarters + val/traces)")
 
     print("=" * 70)
-    print(f"TRAINING: {gpt_config.name} | vocab={gpt_config.vocab_size} | "
+    print(f"TRAINING v{__version__}: {gpt_config.name} | vocab={gpt_config.vocab_size} | "
           f"params={params.param_count():,} | windows={dataset.num_windows()} | "
           f"batches/epoch={steps_per_epoch} | total_steps={total_steps} | "
-          f"checkpoint_every={checkpoint_every} steps | trace_every={tracer.trace_every} steps")
+          f"checkpoint_every={checkpoint_every} steps | trace_every={tracer.trace_every} steps | "
+          f"val_sentences={len(val_corpus)}")
     print("=" * 70)
-    logger.info(f"Training started: {gpt_config} total_steps={total_steps} start_step={start_step}")
+    logger.info(
+        f"Training started: {gpt_config} total_steps={total_steps} start_step={start_step} "
+        f"version={__version__} run_dir={run_dir}"
+    )
 
     global_step = start_step
     window_loss_sum = 0.0
     window_steps = 0
     window_start_time = time.time()
     train_start_time = window_start_time
+    avg_recent_loss: Optional[float] = None
 
     for batch, epoch in _iter_batches_forever(dataset, rng):
         if global_step >= total_steps:
             break
 
+        next_step = global_step + 1
+        is_quarter = next_step in quarterly_steps and next_step not in quarterly_done
+        trace_snapshot = None
+        if is_quarter:
+            # Force full traces on the training forward for this milestone step.
+            trace_snapshot = _force_quarter_traces(tracer)
+        else:
+            tracer.update_step(global_step)
+
         step_start_time = time.time()
-        tracer.update_step(global_step)
 
         xs = np.stack([x for x, _ in batch])
         ys = np.stack([y for _, y in batch])
@@ -373,6 +566,7 @@ def train(args: argparse.Namespace) -> str:
             # Tagged + keyed for training_log_plotter.py / loss_landscape_plotter.py to parse.
             logger.info(
                 f"[train] step={global_step}/{total_steps} epoch={epoch} loss={avg_recent_loss:.4f} "
+                f"ppl={perplexity_from_loss(avg_recent_loss):.4f} "
                 f"step_ms={avg_step_ms:.1f} tok_s={tokens_per_sec:.0f} lr={optimizer.current_lr():.6g} "
                 f"device_used_mb={used_mb:.0f} vram_free_mb={free_mb:.0f} "
                 f"elapsed_s={elapsed:.2f} eta_s={eta_seconds:.2f}"
@@ -381,49 +575,69 @@ def train(args: argparse.Namespace) -> str:
             window_steps = 0
             window_start_time = now
 
-        if (
-            generate_probe_steps
-            and global_step in generate_probe_steps
-            and global_step not in generate_probes_done
-        ):
-            optimizer.sync_host_weights()
-            ckpt_dir = save_checkpoint(args.checkpoint, params, tokenizer, config, step=global_step, epoch=epoch)
-            run_probe(str(ckpt_dir))
-            run_generate_probe(
-                model,
-                tokenizer,
-                step=global_step,
+        if is_quarter:
+            fraction = milestone_fracs[global_step]
+            _handle_quarterly_milestone(
+                args=args,
+                model=model,
+                params=params,
+                tokenizer=tokenizer,
+                config=config,
+                optimizer=optimizer,
+                run_dir=run_dir,
+                global_step=global_step,
                 total_steps=total_steps,
-                prompt=args.generate_probe_prompt,
-                max_new_tokens=args.generate_probe_tokens,
-                temperature=getattr(args, "temperature", DEFAULT_GENERATE_PROBE_TEMPERATURE),
-                top_k=getattr(args, "top_k", DEFAULT_GENERATE_PROBE_TOP_K),
-                top_p=getattr(args, "top_p", DEFAULT_GENERATE_PROBE_TOP_P),
-                seed=args.seed,
-                checkpoint_dir=str(ckpt_dir),
+                epoch=epoch,
+                fraction=fraction,
+                avg_recent_loss=avg_recent_loss if avg_recent_loss is not None else float(batch_loss),
+                val_dataset=val_dataset,
+                do_generate_probe=do_generate_probe,
             )
-            generate_probes_done.add(global_step)
-
-        if global_step % checkpoint_every == 0 or global_step == total_steps:
+            quarterly_done.add(global_step)
+            if trace_snapshot is not None:
+                _restore_traces(tracer, trace_snapshot)
+        elif global_step % checkpoint_every == 0 or global_step == total_steps:
             optimizer.sync_host_weights()
-            ckpt_dir = save_checkpoint(args.checkpoint, params, tokenizer, config, step=global_step, epoch=epoch)
+            metrics = {
+                "step": global_step,
+                "epoch": epoch,
+                "loss": avg_recent_loss if avg_recent_loss is not None else float(batch_loss),
+                "ppl": perplexity_from_loss(avg_recent_loss if avg_recent_loss is not None else float(batch_loss)),
+            }
+            ckpt_dir = save_checkpoint(
+                str(run_dir), params, tokenizer, config,
+                step=global_step, epoch=epoch, metrics=metrics,
+            )
             run_probe(str(ckpt_dir))
 
-    print(f"\nTraining complete ({global_step:,} steps). Final checkpoint: {args.checkpoint}")
+    print(f"\nTraining complete ({global_step:,} steps). Final checkpoint: {run_dir}")
     print(f"\nTest generation with this checkpoint:")
     temp = getattr(args, "temperature", DEFAULT_GENERATE_PROBE_TEMPERATURE)
     top_k = getattr(args, "top_k", DEFAULT_GENERATE_PROBE_TOP_K)
     top_p = getattr(args, "top_p", DEFAULT_GENERATE_PROBE_TOP_P)
     print(
-        f"  python generate.py --checkpoint {args.checkpoint} --prompt \"once upon a\" "
+        f"  python generate.py --checkpoint {run_dir} --prompt \"once upon a\" "
         f"--max-new-tokens 256 --temperature {temp} --top-k {top_k} --top-p {top_p}"
     )
     print(f"  python train.py --generate --models-dir {resolve_checkpoints_dir(args.models_dir)}")
+    print(f"  python train.py --compare-quarters --checkpoint {run_dir}")
+
+    if getattr(args, "set_best", None) and not getattr(args, "compare_quarters", False):
+        # Non-interactive promote without full trial generation if requested mid-flow.
+        source = run_dir / args.set_best
+        if (source / "config.json").exists():
+            promote_best(run_dir, source, meta={"step": global_step})
+            print(f"Promoted {args.set_best} -> {run_dir / 'best'}")
+        else:
+            run_quality_trial_for_args(args, str(run_dir))
+    elif cli_common.should_run_quality_trial(args):
+        print("\n### QUALITY TRIAL ###")
+        run_quality_trial_for_args(args, str(run_dir))
 
     if getattr(args, "plot", False):
         _render_post_training_plots()
 
-    return args.checkpoint
+    return str(run_dir)
 
 
 def _render_post_training_plots() -> None:
@@ -457,9 +671,41 @@ def _render_post_training_plots() -> None:
 
 def main() -> None:
     args = parse_args()
+    print(f"llm-gpu-8 v{__version__}")
+
     if args.generate:
         generate_test_menu(args)
         return
+
+    if getattr(args, "compare_quarters", False):
+        ensure_output_dirs()
+        setup_logging(log_filename="quality_trial")
+        run_quality_trial_for_args(args)
+        return
+
+    # --set-best alone (no train intent): promote without re-training.
+    # With --compare-quarters handled above; here copy bundle only.
+    train_intent = (
+        getattr(args, "resume", False)
+        or getattr(args, "menu", False)
+        or args.steps is not None
+        or args.epochs is not None
+        or getattr(args, "quality_trial", False)
+    )
+    if getattr(args, "set_best", None) and not train_intent:
+        ensure_output_dirs()
+        setup_logging(log_filename="quality_trial")
+        root = run_root_for_checkpoint(args.checkpoint)
+        source = root / args.set_best
+        if not (source / "config.json").exists():
+            source = Path(args.set_best)
+        if (source / "config.json").exists():
+            promote_best(root, source, meta={"source_name": source.name})
+            print(f"Promoted '{source}' -> {root / 'best'}")
+        else:
+            print(f"Cannot promote: '{args.set_best}' not found under {root}")
+        return
+
     train(args)
 
 
