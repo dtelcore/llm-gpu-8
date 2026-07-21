@@ -5,7 +5,8 @@ Training log plotter — enhanced edition.
 
 Key behaviors:
   • Prefers aggregate training.log / richest log; plots the longest substantive run
-  • By default only the last 1000 lines of each text log are read (fast load + recent-scale axes);
+  • Sliding window: by default keep only the most recent 1000 training steps
+    (re-read on every live refresh; axes lock to that window);
     use --tail-lines 0 for the full file
   • Drops smoke runs (<50 points) unless --keep-short / --all-runs
   • Breaks curves across large step gaps (no fake bridges)
@@ -53,7 +54,7 @@ KV_RE = re.compile(r"([a-zA-Z0-9_/]+)=([^\s]+)")
 # Ignore smoke / tiny probes by default (same policy as loss_landscape_plotter).
 DEFAULT_MIN_POINTS = 50
 DEFAULT_MAX_STEP_GAP = 2000
-# Cap how much of a growing aggregate log we read/parse for plots.
+# Sliding plot window: most recent N training steps (step counter span).
 DEFAULT_TAIL_LINES = 1000
 
 # ── palette (tab10-inspired but hand-picked for readability on dark bg) ──────
@@ -182,7 +183,7 @@ _TEXT_LOG_CACHE: Dict[Path, Dict[str, Any]] = {}
 
 
 def _read_tail_lines(path: Path, max_lines: int) -> List[str]:
-    """Return up to the last `max_lines` lines of a text file.
+    """Return up to the last `max_lines` raw text lines of a file.
 
     Seeks from the end in chunks so large aggregate logs do not need a full
     sequential read. When max_lines <= 0, reads the entire file.
@@ -217,32 +218,89 @@ def _read_tail_lines(path: Path, max_lines: int) -> List[str]:
     return lines
 
 
+def _latest_contiguous_rows(
+    rows: List[Tuple[int, int, Dict[str, Optional[float]]]],
+    max_step_gap: int = DEFAULT_MAX_STEP_GAP,
+) -> List[Tuple[int, int, Dict[str, Optional[float]]]]:
+    """Return the trailing contiguous segment (no reset / huge forward jump)."""
+    if not rows:
+        return []
+    segments = _segment_by_step_reset(rows, max_step_gap=max_step_gap)
+    return segments[-1] if segments else []
+
+
+def _rows_from_text_log_tail(
+    path: Path,
+    max_step_span: int,
+) -> List[Tuple[int, int, Dict[str, Optional[float]]]]:
+    """Scan backwards from EOF until the tip run covers `max_step_span` steps.
+
+    Returns only rows in (last_step - max_step_span, last_step] of the latest
+    contiguous run. Re-running on each live refresh slides that window forward.
+    """
+    if max_step_span <= 0:
+        return []
+
+    chunk_size = 65_536
+    max_rows = max(4_000, max_step_span * 4)
+    parsed: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
+
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        pos = f.tell()
+        if pos == 0:
+            return []
+        leftover = b""
+        while pos > 0 and len(parsed) < max_rows:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            chunk = f.read(read_size) + leftover
+            if pos > 0:
+                nl = chunk.find(b"\n")
+                if nl < 0:
+                    leftover = chunk
+                    continue
+                leftover = chunk[: nl + 1]
+                chunk = chunk[nl + 1 :]
+            else:
+                leftover = b""
+
+            text = chunk.decode("utf-8", errors="ignore")
+            chunk_rows: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
+            for line in text.splitlines():
+                row = _parse_log_line(line)
+                if row:
+                    chunk_rows.append(row)
+            parsed = chunk_rows + parsed
+
+            tip = _latest_contiguous_rows(parsed)
+            if tip and tip[-1][0] - tip[0][0] >= max_step_span:
+                break
+
+    tip = _latest_contiguous_rows(parsed)
+    if not tip:
+        return []
+    last_step = tip[-1][0]
+    lo = last_step - max_step_span
+    return [row for row in tip if row[0] > lo]
+
+
 def _rows_from_text_log(
     path: Path,
     use_cache: bool = False,
     tail_lines: int = DEFAULT_TAIL_LINES,
 ) -> List[Tuple[int, int, Dict[str, Optional[float]]]]:
-    """Parse a plaintext log (e.g. logs/training.log) into (step, total_steps, kv-row)
-    tuples, one per line matching `step=N/TOTAL`. Any line with that pattern counts,
-    whether or not it's tagged "[train]" -- keeps this resilient to log format tweaks.
+    """Parse a plaintext log into (step, total_steps, kv-row) tuples.
 
-    By default only the last `tail_lines` file lines are considered (fast load and
-    recent-window axis scaling). Pass tail_lines=0 to parse the whole file.
-
-    When use_cache is True and tail_lines==0 (live + full-file mode), only bytes
-    appended since the previous call are read and parsed; previously parsed rows
-    are reused as-is. Tailed reads skip the cache and re-scan the small window.
+    By default only the most recent `tail_lines` training steps are kept.
+    Pass tail_lines=0 for the whole file. Live+full-file mode can use_cache.
     """
     if tail_lines > 0:
-        rows: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
-        for line in _read_tail_lines(path, tail_lines):
-            parsed = _parse_log_line(line)
-            if parsed:
-                rows.append(parsed)
-        return rows
+        return _rows_from_text_log_tail(path, tail_lines)
 
     if not use_cache:
-        rows = []
+        rows: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 parsed = _parse_log_line(line)
@@ -253,7 +311,6 @@ def _rows_from_text_log(
     cache = _TEXT_LOG_CACHE.get(path)
     size = path.stat().st_size
     if cache is None or size < cache["offset"]:
-        # First load, or file shrank/rotated -- reparse from scratch.
         cache = {"offset": 0, "rows": [], "leftover": ""}
 
     if size > cache["offset"]:
@@ -262,8 +319,6 @@ def _rows_from_text_log(
             chunk = cache["leftover"] + f.read()
             cache["offset"] = size
         lines = chunk.split("\n")
-        # Last element may be a partial line if the writer hasn't flushed a
-        # trailing newline yet; stash it and prepend on the next read.
         cache["leftover"] = lines.pop() if lines else ""
         for line in lines:
             parsed = _parse_log_line(line)
@@ -272,6 +327,25 @@ def _rows_from_text_log(
 
     _TEXT_LOG_CACHE[path] = cache
     return cache["rows"]
+
+
+def _trim_run_to_step_window(run: RunSeries, max_step_span: int) -> RunSeries:
+    """Keep only samples in (last_step - max_step_span, last_step]."""
+    if max_step_span <= 0 or not run.steps:
+        return run
+    lo = run.steps[-1] - max_step_span
+    keep_from = next((i for i, step in enumerate(run.steps) if step > lo), None)
+    if keep_from is None:
+        return run
+    if keep_from == 0:
+        return run
+    return RunSeries(
+        name=run.name,
+        path=run.path,
+        steps=run.steps[keep_from:],
+        total_steps=run.total_steps,
+        metrics={k: v[keep_from:] for k, v in run.metrics.items()},
+    )
 
 
 def _segment_by_step_reset(
@@ -289,7 +363,7 @@ def _segment_by_step_reset(
     current: List[Tuple[int, int, Dict[str, Optional[float]]]] = []
     prev_step = 0
     for step, total_steps, row in rows:
-        if current and (step <= prev_step or step - prev_step > max_step_gap):
+        if current and (step < prev_step or step - prev_step > max_step_gap):
             segments.append(current)
             current = []
         current.append((step, total_steps, row))
@@ -360,12 +434,37 @@ def _parse_log_file(
         _derive_ppl(metrics)
         run = _canonicalize_run(RunSeries(name=path.stem, path=path, steps=steps,
                                           total_steps=total_steps, metrics=metrics))
+        if tail_lines > 0:
+            run = _trim_run_to_step_window(run, tail_lines)
         return _filter_runs(
             [run], all_runs=all_runs, min_points=min_points,
             prefer_latest=tail_lines > 0,
         )
 
     rows = _rows_from_text_log(path, use_cache=use_cache, tail_lines=tail_lines)
+    if not rows:
+        return []
+
+    # Sliding-window mode: tip contiguous run already trimmed to last N steps.
+    if tail_lines > 0 and not all_runs:
+        steps = [s for s, _, _ in rows]
+        # Use the tip row's declared total so progress/forecast aren't polluted
+        # by older runs that shared the aggregate log.
+        total_steps = rows[-1][1]
+        metrics: Dict[str, List[Optional[float]]] = {}
+        keys = sorted({k for _, _, row in rows for k in row})
+        for key in keys:
+            metrics[key] = [row.get(key) for _, _, row in rows]
+        _derive_ppl(metrics)
+        run = _canonicalize_run(RunSeries(
+            name=path.stem, path=path,
+            steps=steps, total_steps=total_steps, metrics=metrics,
+        ))
+        run = _trim_run_to_step_window(run, tail_lines)
+        if len(run.steps) < 2:
+            return []
+        return [run]
+
     segments = _segment_by_step_reset(rows, max_step_gap=max_step_gap)
     if not segments:
         return []
@@ -373,8 +472,8 @@ def _parse_log_file(
     runs: List[RunSeries] = []
     for idx, segment in enumerate(segments):
         steps = [s for s, _, _ in segment]
-        total_steps = max((t for _, t, _ in segment), default=0)
-        metrics: Dict[str, List[Optional[float]]] = {}
+        total_steps = segment[-1][1]
+        metrics = {}
         keys = sorted({k for _, _, row in segment for k in row})
         for key in keys:
             metrics[key] = [row.get(key) for _, _, row in segment]
@@ -384,6 +483,8 @@ def _parse_log_file(
             name=f"{path.stem}{run_idx_suffix}", path=path,
             steps=steps, total_steps=total_steps, metrics=metrics,
         ))
+        if tail_lines > 0:
+            run = _trim_run_to_step_window(run, tail_lines)
         runs.append(run)
     return _filter_runs(
         runs, all_runs=all_runs, min_points=min_points,
@@ -415,7 +516,7 @@ def _canonicalize_run(run: RunSeries) -> RunSeries:
         key: [deduped[step].get(key) for step in steps_sorted]
         for key in metric_keys
     }
-    total_steps = max(run.total_steps, steps_sorted[-1] if steps_sorted else 0)
+    total_steps = run.total_steps or (steps_sorted[-1] if steps_sorted else 0)
     return RunSeries(
         name=run.name,
         path=run.path,
@@ -671,6 +772,52 @@ def _style_ax(ax) -> None:
     ax.set_axisbelow(True)
 
 
+def _lock_xlim_to_runs(ax, runs: Sequence[RunSeries], pad_frac: float = 0.02) -> None:
+    """Force x-axis to the plotted step window so forecast/progress cannot stretch it."""
+    steps = [s for run in runs for s in run.steps]
+    if not steps:
+        return
+    lo = float(min(steps))
+    hi = float(max(steps))
+    pad = max(1.0, (hi - lo) * pad_frac) if hi > lo else 1.0
+    ax.set_xlim(lo - pad, hi + pad)
+
+
+def _lock_ylim_from_values(
+    ax,
+    values: Sequence[float],
+    *,
+    pad_frac: float = 0.15,
+    floor_zero: bool = False,
+) -> None:
+    """Lock y-axis to series data only (forecast/artists are ignored)."""
+    arr = np.asarray([float(v) for v in values if v is not None and np.isfinite(v)], dtype=float)
+    if arr.size == 0:
+        return
+
+    last = float(arr[-1])
+    if arr.size >= 12:
+        # Percentile band resists one-off spikes; always keep the tip visible.
+        lo = float(np.percentile(arr, 5))
+        hi = float(np.percentile(arr, 95))
+        lo = min(lo, last)
+        hi = max(hi, last)
+    else:
+        lo = float(arr.min())
+        hi = float(arr.max())
+
+    if hi <= lo:
+        pad = max(0.02, abs(lo) * pad_frac + 1e-4)
+        lo, hi = lo - pad, hi + pad
+    else:
+        pad = max((hi - lo) * pad_frac, abs(hi) * 0.02, 0.01)
+        lo, hi = lo - pad, hi + pad
+
+    if floor_zero:
+        lo = max(0.0, lo)
+    ax.set_ylim(lo, hi)
+
+
 # ── progress bar ──────────────────────────────────────────────────────────────
 
 def _draw_progress_bar(ax, run: RunSeries) -> None:
@@ -740,16 +887,21 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
                     max_step_gap: int = DEFAULT_MAX_STEP_GAP) -> None:
     ax.clear()
     primary_idx = int(np.argmax([len(r.steps) for r in runs])) if runs else 0
+    y_for_scale: List[float] = []
+    forecasts_to_draw: List[Tuple[str, float, float, float, float]] = []
 
     for i, run in enumerate(runs):
         color = _COLORS[i % len(_COLORS)]
         label = _short_name(run.name)
         raw = run.metrics.get("loss", [None] * len(run.steps))
         ma = _rolling_mean(raw, smooth_window)
+        y_for_scale.extend(float(v) for v in ma if np.isfinite(v))
 
         if show_raw:
+            raw_arr = _to_arr(raw)
+            y_for_scale.extend(float(v) for v in raw_arr if np.isfinite(v))
             _plot_with_gaps(
-                ax, run.steps, _to_arr(raw), max_step_gap=max_step_gap,
+                ax, run.steps, raw_arr, max_step_gap=max_step_gap,
                 color=color, lw=0.8, alpha=min(raw_alpha, 0.12), zorder=1,
             )
 
@@ -760,7 +912,6 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
             color=color, lw=2.2, alpha=0.97, label=legend_label, zorder=3,
         )
 
-        # annotate last value on curve
         if last_val is not None:
             ax.annotate(
                 f"{last_val:.4f}",
@@ -769,7 +920,6 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
                 fontsize=8, color=color, va="center",
             )
 
-        # Mark min smoothed loss on the primary (longest) run.
         if i == primary_idx:
             valid_idx = np.where(~np.isnan(ma))[0]
             if len(valid_idx):
@@ -781,15 +931,17 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
                 )
 
         if show_ema:
+            ema = _ema(raw, ema_alpha)
+            y_for_scale.extend(float(v) for v in ema if np.isfinite(v))
             _plot_with_gaps(
-                ax, run.steps, _ema(raw, ema_alpha), max_step_gap=max_step_gap,
+                ax, run.steps, ema, max_step_gap=max_step_gap,
                 color=color, lw=1.0, alpha=0.55, linestyle=":", zorder=2,
             )
 
-        # val loss
         val_raw = run.metrics.get("val_loss", [])
         if any(v is not None for v in val_raw):
             val_ma = _rolling_mean(val_raw, smooth_window)
+            y_for_scale.extend(float(v) for v in val_ma if np.isfinite(v))
             val_last = _nan_safe(val_ma)
             vl_label = f"{label} val  [{val_last:.4f}]" if val_last is not None else f"{label} val"
             _plot_with_gaps(
@@ -797,44 +949,52 @@ def _draw_loss_axis(ax, runs: Sequence[RunSeries], smooth_window: int, ema_alpha
                 color=color, lw=1.5, alpha=0.85, label=vl_label, linestyle="--", zorder=3,
             )
 
-        # forecast
         if forecast_enabled:
             fc = _loss_forecast(run, smooth_window, forecast_window, forecast_use_smoothed)
             if fc and fc["target_step"] > fc["observed_step"]:
                 lv = fc["last_smoothed"]
                 pred = fc["predicted_loss"]
-                ts = fc["target_step"]
                 obs = fc["observed_step"]
-                ax.plot([obs, ts], [lv, pred], color=color,
-                        linestyle="-.", lw=1.2, alpha=0.6, zorder=2)
-                # shaded forecast region
-                ax.fill_betweenx([min(lv, pred), max(lv, pred)],
-                                  obs, ts, color=color, alpha=0.06, zorder=1)
-                ax.scatter([ts], [pred], color=color, s=28, zorder=5, marker="D")
-                ax.annotate(
-                    f"→ {pred:.4f}",
-                    xy=(ts, pred), xytext=(6, 0),
-                    textcoords="offset points",
-                    fontsize=7.5, color=color, alpha=0.75, va="center",
-                )
+                span = max(1.0, float(run.steps[-1] - run.steps[0])) if len(run.steps) > 1 else 100.0
+                ts = min(fc["target_step"], obs + max(50.0, 0.15 * span))
+                if ts != fc["target_step"] and fc.get("slope") is not None:
+                    pred = fc["slope"] * ts + (lv - fc["slope"] * obs)
+                forecasts_to_draw.append((color, obs, ts, lv, pred))
 
     ax.set_title("training loss", pad=8)
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
     _style_ax(ax)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0))
+    _lock_xlim_to_runs(ax, runs)
+    _lock_ylim_from_values(ax, y_for_scale, floor_zero=True)
 
+    # Draw forecast after ylim lock; clamp marker into the visible band.
+    y_lo, y_hi = ax.get_ylim()
+    for color, obs, ts, lv, pred in forecasts_to_draw:
+        pred_draw = float(np.clip(pred, y_lo, y_hi))
+        ax.plot([obs, ts], [lv, pred_draw], color=color,
+                linestyle="-.", lw=1.2, alpha=0.6, zorder=2)
+        ax.fill_betweenx([min(lv, pred_draw), max(lv, pred_draw)],
+                          obs, ts, color=color, alpha=0.06, zorder=1)
+        ax.scatter([ts], [pred_draw], color=color, s=28, zorder=5, marker="D")
+        ax.annotate(
+            f"→ {pred:.4f}",
+            xy=(ts, pred_draw), xytext=(6, 0),
+            textcoords="offset points",
+            fontsize=7.5, color=color, alpha=0.75, va="center",
+        )
+
+    ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0))
     if runs:
         _draw_progress_bar(ax, runs[primary_idx])
 
-
-# ── metric panel ──────────────────────────────────────────────────────────────
 
 def _draw_metric_axis(ax, runs: Sequence[RunSeries], metric_name: str,
                       smooth_window: int, raw_alpha: float, show_raw: bool,
                       max_step_gap: int = DEFAULT_MAX_STEP_GAP) -> None:
     ax.clear()
     drawn = 0
+    y_for_scale: List[float] = []
     for i, run in enumerate(runs):
         color = _COLORS[i % len(_COLORS)]
         label = _short_name(run.name)
@@ -844,8 +1004,10 @@ def _draw_metric_axis(ax, runs: Sequence[RunSeries], metric_name: str,
         drawn += 1
         arr = _to_arr(values)
         ma = _rolling_mean(values, smooth_window)
+        y_for_scale.extend(float(v) for v in ma if np.isfinite(v))
 
         if show_raw:
+            y_for_scale.extend(float(v) for v in arr if np.isfinite(v))
             _plot_with_gaps(
                 ax, run.steps, arr, max_step_gap=max_step_gap,
                 color=color, lw=0.8, alpha=min(raw_alpha, 0.14), zorder=1,
@@ -876,6 +1038,11 @@ def _draw_metric_axis(ax, runs: Sequence[RunSeries], metric_name: str,
     ax.set_ylabel(metric_name)
     _style_ax(ax)
     if drawn:
+        _lock_xlim_to_runs(ax, runs)
+        floor_zero = metric_name.lower() in {
+            "perplexity", "ppl", "tok/s", "tok_s", "learning_rate", "lr",
+        }
+        _lock_ylim_from_values(ax, y_for_scale, floor_zero=floor_zero)
         ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0))
     else:
         ax.text(0.5, 0.5, f"metric '{metric_name}' not found",
@@ -1089,8 +1256,9 @@ def main() -> None:
     parser.add_argument("--max-step-gap", type=int, default=DEFAULT_MAX_STEP_GAP,
                         help="Break curves across step gaps larger than this")
     parser.add_argument("--tail-lines", type=int, default=DEFAULT_TAIL_LINES,
-                        help="Only parse the last N lines of each log (0 = entire file). "
-                             "Keeps load time and axis scaling focused on recent training.")
+                        help="Sliding window: keep only the most recent N training "
+                             "steps (re-read on every --live refresh; axes lock to "
+                             "that window). 0 = entire file.")
     parser.add_argument("--metric", default="tok/s",
                         help="Metric shown in the bottom panel")
     parser.add_argument("--smooth-window", type=int, default=21,
