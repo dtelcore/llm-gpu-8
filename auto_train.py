@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=str, default=str(DATA_DIR), help="Directory auto-scanned for .txt datasets when --menu is used")
     parser.add_argument("--models-dir", type=str, default=str(OUTPUT_CHECKPOINTS), help="Directory scanned for existing checkpoints by --menu (default: output/checkpoints)")
     cli_common.add_trace_args(parser)
+    cli_common.add_runtime_observability_args(parser)
     return parser.parse_args()
 
 

@@ -45,10 +45,12 @@ from paths import (
     DEFAULT_TRAINING_LOG,
     DEFAULT_TRAINING_PLOT,
     OUTPUT_CHECKPOINTS,
+    OUTPUT_LOGS,
     ensure_output_dirs,
     resolve_checkpoints_dir,
     run_root_for_checkpoint,
 )
+from tools.tracing.runtime_metrics import memory_timeline, runtime_metrics
 from tokenizer.tokenizer import CharacterGPTTokenizer
 from training.checkpoint import promote_best, save_checkpoint
 from training.dataset import WindowedDataset
@@ -80,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     cli_common.add_training_length_args(parser)
     cli_common.add_model_hyperparam_args(parser)
     cli_common.add_trace_args(parser)
+    cli_common.add_runtime_observability_args(parser)
     cli_common.add_probe_args(parser)
     cli_common.add_quality_args(parser)
     parser.add_argument(
@@ -465,6 +468,19 @@ def train(args: argparse.Namespace) -> str:
     # pass --trace-every explicitly to override that cadence.
     tracer = cli_common.build_tracer(args, default_trace_every=max(1, total_steps // 10))
 
+    # Stage 3.1 observability (opt-in; zero overhead when both flags off).
+    want_timeline = bool(getattr(args, "memory_timeline", False))
+    want_metrics = bool(getattr(args, "runtime_metrics", False)) or want_timeline
+    timeline_path = None
+    if want_metrics:
+        runtime_metrics.enable()
+        runtime_metrics.reset_window()
+        print("Runtime metrics enabled (SyncMeter + richer [train] fields)")
+    if want_timeline:
+        timeline_path = OUTPUT_LOGS / f"memory_timeline_{run_dir.name}.jsonl"
+        memory_timeline.enable(log_path=str(timeline_path))
+        print(f"Memory timeline enabled -> {timeline_path}")
+
     milestone_fracs = milestone_fraction_map(total_steps)
     quarterly_steps = set(milestone_fracs.keys())
     quarterly_done: set[int] = {s for s in quarterly_steps if s <= start_step}
@@ -512,6 +528,8 @@ def train(args: argparse.Namespace) -> str:
             tracer.update_step(global_step)
 
         step_start_time = time.time()
+        if want_metrics or want_timeline:
+            memory_timeline.set_step(global_step + 1)
 
         xs = np.stack([x for x, _ in batch])
         ys = np.stack([y for _, y in batch])
@@ -557,11 +575,26 @@ def train(args: argparse.Namespace) -> str:
             used_mb = (total_bytes - free_bytes) / (1024 ** 2)
             free_mb = free_bytes / (1024 ** 2)
 
+            metrics_extra = ""
+            if want_metrics:
+                tensors = list(params.device_weights.values()) + list(params.device_biases.values())
+                param_norm = cuda_ops.param_global_norm(tensors)
+                sync_snap = runtime_metrics.snapshot()
+                scratch_peak = memory_timeline.scratch_peak_mb() if want_timeline else (
+                    cuda_ops.scratch_pool.resident_bytes() / (1024.0 ** 2)
+                )
+                metrics_extra = (
+                    f" grad_norm={global_norm:.4f} param_norm={param_norm:.4f} "
+                    f"sync_count={sync_snap['sync_count']} sync_ms={sync_snap['sync_ms']:.2f} "
+                    f"scratch_peak_mb={scratch_peak:.1f}"
+                )
+
             print(
                 f"Step {global_step:>7,}/{total_steps:,} | epoch={epoch} | avg_loss={avg_recent_loss:.4f} | "
                 f"lr={optimizer.current_lr():.6g} | step={step_time_ms:.1f}ms | avg_step={avg_step_ms:.1f}ms | "
                 f"{tokens_per_sec:.0f} tok/s | vram_used={used_mb:.0f}MB | vram_free={free_mb:.0f}MB | "
                 f"elapsed={_fmt_duration(elapsed)} | eta={_fmt_duration(eta_seconds)}"
+                + (f" |{metrics_extra}" if metrics_extra else "")
             )
             # Tagged + keyed for training_log_plotter.py / loss_landscape_plotter.py to parse.
             logger.info(
@@ -570,7 +603,10 @@ def train(args: argparse.Namespace) -> str:
                 f"step_ms={avg_step_ms:.1f} tok_s={tokens_per_sec:.0f} lr={optimizer.current_lr():.6g} "
                 f"device_used_mb={used_mb:.0f} vram_free_mb={free_mb:.0f} "
                 f"elapsed_s={elapsed:.2f} eta_s={eta_seconds:.2f}"
+                + metrics_extra
             )
+            if want_metrics:
+                runtime_metrics.reset_window()
             window_loss_sum = 0.0
             window_steps = 0
             window_start_time = now
@@ -609,6 +645,18 @@ def train(args: argparse.Namespace) -> str:
                 step=global_step, epoch=epoch, metrics=metrics,
             )
             run_probe(str(ckpt_dir))
+
+    if want_timeline and timeline_path is not None:
+        summary = memory_timeline.summary()
+        print(
+            f"\nMemory timeline: {timeline_path} | "
+            f"allocs={summary['allocations']} reuses={summary['reuses']} | "
+            f"peak_pool={summary['peak_pool_mb']:.1f} MB"
+        )
+        print(f"  Review: python -m tools.tracing.memory_timeline --input {timeline_path}")
+        memory_timeline.disable()
+    if want_metrics:
+        runtime_metrics.disable()
 
     print(f"\nTraining complete ({global_step:,} steps). Final checkpoint: {run_dir}")
     print(f"\nTest generation with this checkpoint:")

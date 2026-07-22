@@ -97,6 +97,42 @@ def _batched_attention_host(
     return attn_concat, probs_h, q_h, k_h, v_h
 
 
+def _interleaved_to_heads_host(x: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int):
+    """[B*T, NH*HD] -> [B*NH, T, HD]."""
+    return (
+        x.reshape(batch_size, seq_len, num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+        .reshape(batch_size * num_heads, seq_len, head_dim)
+        .astype(np.float32, copy=False)
+    )
+
+
+def _heads_to_interleaved_host(heads: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int):
+    """[B*NH, T, HD] -> [B*T, NH*HD]."""
+    return (
+        heads.reshape(batch_size, num_heads, seq_len, head_dim)
+        .transpose(0, 2, 1, 3)
+        .reshape(batch_size * seq_len, num_heads * head_dim)
+        .astype(np.float32, copy=False)
+    )
+
+
+def _causal_attention_decode_host(q_h: np.ndarray, k_h: np.ndarray, v_h: np.ndarray, scale: float):
+    """Last-query causal attention. q [BH,1,hd], k/v [BH,T,hd] → out [BH,1,hd]."""
+    scores = np.matmul(q_h, np.swapaxes(k_h, -1, -2)) * float(scale)
+    scores = scores - np.max(scores, axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs = probs / np.sum(probs, axis=-1, keepdims=True)
+    return np.matmul(probs, v_h).astype(np.float32)
+
+
+def _kv_state_nbytes(kv_state: Dict) -> int:
+    total = 0
+    for layer in kv_state.get("layers", []):
+        total += int(layer["k"].nbytes) + int(layer["v"].nbytes)
+    return total
+
+
 class GPTModel:
     def __init__(self, config: GPTConfig, params: ModelParameters) -> None:
         self.config = config
@@ -194,6 +230,9 @@ class GPTModel:
             cache["logits_d"] = logits_d
             logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
             cache["logits"] = logits
+            from model.cuda.fp16_storage import compress_cache_fp16, fp16_storage_enabled
+            if fp16_storage_enabled():
+                compress_cache_fp16(cache)
             return logits, cache
 
         tok_emb = w["token_embedding"][token_ids_batch]  # [B, T, C]
@@ -250,9 +289,14 @@ class GPTModel:
         return logits, cache
 
     def forward(self, token_ids: np.ndarray, tracer: TraceContext = None) -> Tuple[np.ndarray, Dict]:
-        """Single-sequence forward (wraps forward_batch with B=1)."""
+        """Single-sequence forward (wraps forward_batch with B=1).
+
+        Returns logits shaped [T, V]. The cache stays in the batched contract
+        (``B=1``, ``T``, ``batched=True``) so ``backward`` / ``backward_batch_gpu``
+        share one representation with training and benches.
+        """
         logits, cache = self.forward_batch(np.asarray(token_ids).reshape(1, -1), tracer=tracer)
-        return logits[0], _squeeze_batch_cache(cache)
+        return logits[0], cache
 
     def _attention_forward_batch(
         self, ln1_out_d, ln1_out_host: np.ndarray, prefix: str,
@@ -346,6 +390,9 @@ class GPTModel:
     def backward_batch_gpu(self, cache: Dict, dlogits_d) -> Dict:
         """Full backward on GPU. dlogits_d: [B*T, V] device array."""
         import pycuda.gpuarray as gpuarray
+        from model.cuda.fp16_storage import expand_cache_fp32
+
+        expand_cache_fp32(cache)
 
         cfg = self.config
         dw, db = self.params.device_weights, self.params.device_biases
@@ -732,20 +779,30 @@ class GPTModel:
         tracer: TraceContext = None,
         tokenizer=None,
         rng: np.random.Generator = None,
+        use_kv_cache: bool = True,
     ) -> List[int]:
         """Autoregressive sampling with temperature and optional top-k / top-p filters.
-        If `tracer` and `tokenizer` are both given, emits traces on tracer.trace_every steps."""
+
+        When ``use_kv_cache`` is True (default), prompt is prefilled once and each
+        new token is decoded incrementally against cached K/V. Training path is
+        untouched. If ``tracer`` and ``tokenizer`` are both given, emits traces
+        on tracer.trace_every steps.
+        """
         rng = rng or np.random.default_rng()
         ids = list(prompt_ids)
+        if not use_kv_cache:
+            return self._generate_no_kv(
+                ids, max_new_tokens, temperature, top_k, top_p, tracer, tokenizer, rng,
+            )
+
+        logits, kv_state = self._prefill_kv(ids[-self.config.max_len :], tracer=tracer)
         for step in range(max_new_tokens):
             if tracer is not None:
                 tracer.update_step(step)
 
-            window = ids[-self.config.max_len :]
-            logits, _ = self.forward(np.asarray(window), tracer=tracer)
             last_logits = logits[-1]
-
             if tracer is not None and tokenizer is not None:
+                window = ids[-self.config.max_len :]
                 tracer.dump_tokens(window, tokenizer, label=f"generate step {step} (context)")
                 tracer.dump_logits(last_logits, tokenizer, label=f"generate step {step}")
 
@@ -753,30 +810,161 @@ class GPTModel:
                 last_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
             )
             ids.append(next_id)
+
+            if kv_state["T"] >= self.config.max_len:
+                logits, kv_state = self._prefill_kv(ids[-self.config.max_len :], tracer=tracer)
+            else:
+                logits, kv_state = self._decode_kv(next_id, kv_state, tracer=tracer)
         return ids
 
+    def _generate_no_kv(
+        self, ids, max_new_tokens, temperature, top_k, top_p, tracer, tokenizer, rng,
+    ) -> List[int]:
+        """Legacy full-recompute generate (KV cache disabled)."""
+        for step in range(max_new_tokens):
+            if tracer is not None:
+                tracer.update_step(step)
+            window = ids[-self.config.max_len :]
+            logits, _ = self.forward(np.asarray(window), tracer=tracer)
+            last_logits = logits[-1]
+            if tracer is not None and tokenizer is not None:
+                tracer.dump_tokens(window, tokenizer, label=f"generate step {step} (context)")
+                tracer.dump_logits(last_logits, tokenizer, label=f"generate step {step}")
+            next_id = _sample_next_id(
+                last_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
+            )
+            ids.append(next_id)
+        return ids
 
+    def _extract_kv_state(self, cache: Dict) -> Dict:
+        """Pull per-layer K/V from a forward cache into host generate-only state."""
+        H, hd = self.config.num_heads, self.config.head_dim
+        B = int(cache["B"])
+        T = int(cache["T"])
+        layers = []
+        for layer_cache in cache["layers"]:
+            attn = layer_cache["attn"]
+            if attn.get("gpu") and "k_d" in attn:
+                k = cuda_ops.to_host(attn["k_d"]).astype(np.float32, copy=False)
+                v = cuda_ops.to_host(attn["v_d"]).astype(np.float32, copy=False)
+            else:
+                # Host path stores [B, H, T, hd]
+                k = attn["k_h"].reshape(B * H, T, hd).astype(np.float32, copy=False)
+                v = attn["v_h"].reshape(B * H, T, hd).astype(np.float32, copy=False)
+            layers.append({"k": np.ascontiguousarray(k), "v": np.ascontiguousarray(v)})
+        return {"layers": layers, "T": T, "B": B}
+
+    def _prefill_kv(self, token_ids, tracer: TraceContext = None):
+        """Full forward over ``token_ids``; return (logits [T,V], kv_state)."""
+        logits, cache = self.forward(np.asarray(token_ids, dtype=np.int64), tracer=tracer)
+        return logits, self._extract_kv_state(cache)
+
+    def _decode_kv(self, token_id: int, kv_state: Dict, tracer: TraceContext = None):
+        """Incremental single-token forward appending to host K/V caches.
+
+        Mirrors the training residual_layernorm fusion so logits stay close to
+        full recompute. Returns (logits [1, V], updated kv_state).
+        """
+        cfg = self.config
+        dw = self.params.device_weights
+        db = self.params.device_biases
+        B, T_past = int(kv_state["B"]), int(kv_state["T"])
+        if B != 1:
+            raise ValueError("KV decode currently supports B=1 generate only")
+        H, hd = cfg.num_heads, cfg.head_dim
+        scale = 1.0 / np.sqrt(hd)
+        pos = T_past
+        if pos >= cfg.max_len:
+            raise ValueError("KV decode position exceeds max_len; caller should re-prefill")
+
+        tok_emb = cuda_ops.to_host(dw["token_embedding"])
+        pos_emb = cuda_ops.to_host(dw["position_embedding"])
+        h = (tok_emb[int(token_id)] + pos_emb[pos]).astype(np.float32).reshape(1, cfg.embedding_dim)
+        h_d = cuda_ops.to_device(h)
+
+        new_layers = []
+        pending_ln1 = None
+        h_final_d = None
+        for layer in range(cfg.num_layers):
+            prefix = f"layer_{layer}"
+            past = kv_state["layers"][layer]
+
+            if pending_ln1 is None:
+                ln1_out_d, _, _ = cuda_ops.layernorm_with_cache(
+                    h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"],
+                )
+            else:
+                ln1_out_d = pending_ln1
+                pending_ln1 = None
+
+            q_i, k_i, v_i = cuda_ops.linear_qkv_split(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                tracer=tracer, name=f"{prefix}.qkv",
+            )
+            q_h = _interleaved_to_heads_host(cuda_ops.to_host(q_i), 1, 1, H, hd)
+            k_new = _interleaved_to_heads_host(cuda_ops.to_host(k_i), 1, 1, H, hd)
+            v_new = _interleaved_to_heads_host(cuda_ops.to_host(v_i), 1, 1, H, hd)
+
+            k_all = np.concatenate([past["k"], k_new], axis=1)
+            v_all = np.concatenate([past["v"], v_new], axis=1)
+            attn_heads = _causal_attention_decode_host(q_h, k_all, v_all, scale)
+            attn_concat_d = cuda_ops.to_device(_heads_to_interleaved_host(attn_heads, 1, 1, H, hd))
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+
+            h_d, ln2_out_d, _, _ = cuda_ops.residual_layernorm_with_cache(
+                h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"],
+            )
+            mlp_out_d, _ = self._mlp_forward_batch(ln2_out_d, None, prefix, tracer=tracer)
+
+            if layer + 1 < cfg.num_layers:
+                next_prefix = f"layer_{layer + 1}"
+                h_d, ln1_n, _, _ = cuda_ops.residual_layernorm_with_cache(
+                    h_d, mlp_out_d,
+                    dw[f"{next_prefix}.ln1_gamma"], db[f"{next_prefix}.ln1_beta"],
+                )
+                pending_ln1 = ln1_n
+            else:
+                h_d, h_final_d, _, _ = cuda_ops.residual_layernorm_with_cache(
+                    h_d, mlp_out_d, dw["final_ln_gamma"], db["final_ln_beta"],
+                )
+
+            if tracer is not None and tracer.trace_neurons and tracer.active_step:
+                tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
+
+            new_layers.append({"k": k_all, "v": v_all})
+
+        logits_d = layers.linear(
+            h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
+        )
+        logits = cuda_ops.to_host(logits_d).reshape(1, cfg.vocab_size)
+        return logits, {"layers": new_layers, "T": T_past + 1, "B": B}
 def _squeeze_batch_cache(cache: Dict) -> Dict:
-    """Convert B=1 batched cache to legacy shapes for single-seq consumers."""
+    """Legacy helper: previously squeezed B=1 caches for single-seq consumers.
+
+    Stage 3.1 exit: batch cache (``B``, ``T``, ``batched=True``) is the stable
+    internal contract. ``forward()`` no longer calls this. Kept for any external
+    callers; GPU path no longer strips ``B``/``T``.
+    """
     if cache.get("B", 1) != 1:
         return cache
     out = dict(cache)
-    out["ids"] = cache["ids"][0]
-    out["batched"] = False
+    # Keep B/T/batched for backward_batch_gpu / backward_batch.
+    out["batched"] = True
     if cache.get("gpu"):
-        out.pop("B", None)
-        out.pop("T", None)
         return out
-    for layer_cache in out["layers"]:
-        attn = layer_cache["attn"]
-        B, H, T, hd = attn["B"], attn["q_h"].shape[1], attn["T"], attn["q_h"].shape[3]
-        attn["q_h"] = attn["q_h"][0]
-        attn["k_h"] = attn["k_h"][0]
-        attn["v_h"] = attn["v_h"][0]
-        attn["probs_h"] = attn["probs_h"][0]
-        del attn["B"]
-    out.pop("B", None)
-    out.pop("T", None)
+    # Host attention caches may still store per-batch head tensors [B,H,T,hd].
+    for layer_cache in out.get("layers", []):
+        attn = layer_cache.get("attn")
+        if not attn or "q_h" not in attn:
+            continue
+        if getattr(attn["q_h"], "ndim", 0) == 4 and attn["q_h"].shape[0] == 1:
+            attn["q_h"] = attn["q_h"][0]
+            attn["k_h"] = attn["k_h"][0]
+            attn["v_h"] = attn["v_h"][0]
+            attn["probs_h"] = attn["probs_h"][0]
     return out
 
 

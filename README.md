@@ -1,32 +1,35 @@
 # llm-gpu-8
 
-**Version:** 0.1.0  
+**Version:** 0.1.1-dev  
 **Repo:** [github.com/dtelcore/llm-gpu-8](https://github.com/dtelcore/llm-gpu-8)  
-**Stack:** NumPy + PyCUDA character-level GPT, trained end-to-end on a Kepler **GT 730** (CC 3.5)
+**Stack:** NumPy + PyCUDA character-level GPT — a compact **transformer runtime** targeting Kepler **GT 730** (CC 3.5)
 
-A from-scratch training workspace aimed at real GPU training on old Kepler hardware where modern PyTorch CUDA builds fail (`no kernel image`). Forward, loss, and AdamW run on device; backward is analytic NumPy with a persistent GPU weight mirror so PCIe is not flooded every matmul.
+A from-scratch training workspace for real GPU training on old Kepler hardware where modern PyTorch CUDA builds fail (`no kernel image`). Live path: **GPU forward → GPU loss → GPU manual backward → GPU AdamW**. NumPy remains the reference / fallback for verification.
 
 ---
 
 ## Table of contents
 
 1. [Why this project](#why-this-project)
-2. [Features (v0.1.0)](#features-v010)
-3. [Hardware & software](#hardware--software)
-4. [Architecture](#architecture)
-5. [Repository layout](#repository-layout)
-6. [Setup](#setup)
-7. [Quick start](#quick-start)
-8. [Training](#training)
-9. [Generation & sampling](#generation--sampling)
-10. [Quarterly checkpoints & quality trial](#quarterly-checkpoints--quality-trial)
-11. [Tracing & diagnostics](#tracing--diagnostics)
-12. [Plotting & benchmarks](#plotting--benchmarks)
-13. [Configuration & presets](#configuration--presets)
-14. [Notable run: BiggerTest256256](#notable-run-biggertest256256)
-15. [Changelog](#changelog)
-16. [Versioning](#versioning)
-17. [Related docs](#related-docs)
+2. [Stage 3 — Runtime engineering](#stage-3--runtime-engineering)
+3. [Features](#features)
+4. [Hardware & software](#hardware--software)
+5. [Architecture](#architecture)
+6. [Repository layout](#repository-layout)
+7. [Setup](#setup)
+8. [Quick start](#quick-start)
+9. [Training](#training)
+10. [Observability (Stage 3.1)](#observability-stage-31)
+11. [Verification / parity](#verification--parity)
+12. [Generation & sampling](#generation--sampling)
+13. [Quarterly checkpoints & quality trial](#quarterly-checkpoints--quality-trial)
+14. [Tracing & diagnostics](#tracing--diagnostics)
+15. [Plotting & benchmarks](#plotting--benchmarks)
+16. [Configuration & presets](#configuration--presets)
+17. [Notable run: BiggerTest256256](#notable-run-biggertest256256)
+18. [Changelog](#changelog)
+19. [Versioning](#versioning)
+20. [Related docs](#related-docs)
 
 ---
 
@@ -34,27 +37,174 @@ A from-scratch training workspace aimed at real GPU training on old Kepler hardw
 
 Kepler GT 730 (CC 3.5) is unsupported by current PyTorch CUDA wheels. This repo builds a **minimal, inspectable** GPT training stack on **PyCUDA + custom kernels** so you can:
 
-- Train a character LM on TinyStories-scale text with batch/seq sizes that fit ~4 GB DDR3
-- Inspect logits, tokens, neurons, and GEMM launches mid-run
+- Train a character LM on TinyStories-scale text with batch/seq sizes that fit ~4 GB DDR3 (tighter when the GPU also drives a display)
+- Inspect logits, tokens, neurons, GEMM launches, **ScratchPool memory**, and **host sync stalls**
 - Checkpoint, resume, and compare generation quality at quarterly milestones
-- Keep all runtime artifacts under a single `output/` tree
+- Prove CUDA math against a NumPy reference before aggressive memory/execution changes
 
 Predecessor context and CUDA bring-up notes live in [`setup/cuda_activate.md`](setup/cuda_activate.md) (toolkit pins, MSVC 14.2, `arch=compute_35`).
 
 ---
 
-## Features (v0.1.0)
+## Stage 3 — Runtime engineering
+
+Stages 1–2 (implement the math; move it onto GPU) are done. **Stage 3** follows:
+
+```text
+Measurement → Understanding → Optimization
+```
+
+not the reverse. Five pillars:
+
+| Pillar | Question |
+|--------|----------|
+| **Memory** | How do I move and store less data? |
+| **Execution** | How do I execute the same math faster? |
+| **Model** | How do I make better use of the same compute? (tokenizer, positions, …) |
+| **Observability** | What is the runtime actually doing? |
+| **Verification** | Did an optimization preserve correctness? |
+
+### Stage 3.1 exit — what exists vs Not yet
+
+**Stage 3.1 is measurable + verified + baselined — not optimized.**
+
+Empirical answer from the BiggerTest metrics window (step **111100**):
+
+> Is the GT 730 limited by transfers or by the transformer workload?  
+> **Not transfers.** Sync ≈ **0.018%** of step time. ScratchPool peak ≈ **28 MB** of ~**844 MB** device use. Next chapter = **memory efficiency** (activations) and **model efficiency** (KV cache, BPE) — not more CUDA plumbing.
+
+```text
+llm-gpu-8 v0.1.1-dev
+
+Exists
+├── Runtime
+│   ├── CUDA forward / loss / manual backward / GPU AdamW
+│   ├── ScratchPool telemetry (pool lifetime)
+│   └── Generate KV cache (prefill + incremental decode)
+├── Observability
+│   ├── training metrics (--runtime-metrics)
+│   ├── sync timing (to_host / to_device)
+│   └── memory timeline (--memory-timeline)
+├── Verification
+│   ├── NumPy reference path
+│   └── CUDA parity suite (tests/parity)
+└── Scientific control
+    ├── output/baselines/stage31_baseline.json
+    ├── output/baselines/stage32_kv_generate.json
+    ├── output/baselines/stage33_bpe_protocol.json
+    ├── output/baselines/stage34_activation_account.json
+    ├── output/baselines/stage35_fp16_storage.json
+    ├── output/baselines/stage36_allocator.json
+    ├── output/baselines/stage37_timeline.json
+    └── output/reports/evolution.html
+
+Exists (Stage 3.2–3.8 additions)
+├── Generate KV cache + tools/bench_generate.py
+├── tokenizer/bpe.py (experiment; char remains BiggerTest default)
+├── Activation accounting (tools/tracing/activation_account.py)
+├── FP16 activation storage (model/cuda/fp16_storage.py)
+├── LifetimeAllocator (model/cuda/allocator.py)
+├── Software kernel timeline (tools/tracing/runtime_metrics.kernel_timeline)
+└── Evolution HTML report (tools/reports/evolution_report.py)
+
+Not yet
+├── deeper activation checkpointing / recompute
+├── native FP16 compute kernels (storage path exists)
+└── CUDA Graph capture (software timeline exists)
+```
+
+**Scientific control (BiggerTest telemetry, not a contended microbench):**
+
+[`output/baselines/stage31_baseline.json`](output/baselines/stage31_baseline.json)
+
+| Signal @ step 111100 | Value |
+|----------------------|------:|
+| tok/s | 586 |
+| step_ms | 1747.9 |
+| device_used_mb | 844 |
+| scratch_peak_mb | 28.1 |
+| sync_ms (window) | 64.7 / 200 steps ≈ 0.32 ms/step |
+| grad_norm / param_norm | ≈ 0.029 |
+| train loss / ppl | 0.9305 / 2.54 |
+
+**Evidence-backed demotions (do not prioritize next):**
+
+- Further **weight-sync** / PCIe transfer work — sync ≪ step time  
+- **ScratchPool redesign** — peak ~28 MB; activations dominate VRAM  
+
+Principle for later milestones: every change must answer (1) Did the runtime get better? (2) Did correctness hold?
+
+**Next:** stabilization — compare against the release snapshot before new features.
+
+### Stabilization release discipline
+
+```text
+Change → Parity → Benchmark → Baseline comparison → Longer training validation → Release
+```
+
+**Known-good snapshot:** [`output/releases/v0.1.1/`](output/releases/v0.1.1/)  
+Rebuild with: `python tools/releases/make_snapshot.py --tag v0.1.1`
+
+| Gate | Requirement |
+|------|-------------|
+| Correctness | Parity suite **10/10** (blocker) |
+| Runtime | No material regression vs stage31 train / stage32 generate |
+| Memory | Compare stage34/35/36 artifacts (activations, FP16, allocator reuse) |
+| Observability | Timeline sample + evolution report present |
+
+### Architecture (as shipped)
+
+```text
+Training:   Dataset → Tokenizer → GPU forward → GPU loss → GPU manual backward → GPU AdamW → Checkpoint
+Generation: Prompt → Tokenizer → Transformer prefill → KV cache → Incremental decode
+```
+
+| Pillar | Current state |
+|--------|----------------|
+| Runtime | CUDA transformer engine |
+| Memory | telemetry + FP16 storage + lifetime reuse |
+| Model | GPT + tokenizer experiments (char default) |
+| Observability | metrics, timeline, reports |
+| Verification | NumPy reference + parity |
+
+### Runtime modes
+
+```text
+Training:
+  GPU forward → loss → backward → AdamW
+
+Generation:
+  Prompt encoding
+  → transformer prefill
+  → KV cache
+  → incremental decode
+```
+
+KV cache is generate-only (default on; `--no-kv-cache` to disable). Training path unchanged.
+
+Future package map (**docs only** until built):
+
+```text
+Shipped:  tools/tracing/   tests/parity/   tools/bench_generate.py   output/baselines/
+Future:   training/allocator.py   model/cuda/graph.py   tokenizer/bpe.py
+```
+
+---
+
+## Features
 
 | Area | What you get |
 |------|----------------|
 | Model | Character GPT: embeddings → N× (LN → MHA → residual → LN → MLP → residual) → LN → LM head |
-| GPU path | Fused / tiled GEMM, fused residual LayerNorm, fused causal MHA path, GPU AdamW |
-| Host path | Analytic NumPy backward; `ModelParameters` keeps a persistent device weight mirror |
-| Training | Interactive wizard (`--menu`), resume, step/epoch overrides, val 90/10 holdout |
-| Checkpoints | Run-root “latest” + `quarter_25/50/75/100/` + optional `best/` promotion |
-| Quality | Heuristic spelling / punctuation / grammar / semantics scores + sequential quarter trial |
-| Sampling | Temperature, top-k, top-p; mid-training generate probes |
-| Tooling | Log plotter (sliding window), loss-landscape plotter, step/MLP/profile benches |
+| GPU path | Tiled GEMM, fused residual LayerNorm, causal MHA, **GPU manual backward**, GPU AdamW |
+| Host path | NumPy analytic backward as **reference / fallback**; persistent device weight mirror |
+| Training | Wizard, resume, step/epoch overrides, val 90/10 holdout |
+| Checkpoints | Latest + `quarter_*` + optional `best/` |
+| Quality | Heuristic generation scores + quarter trial |
+| Observability | `--runtime-metrics`, `--memory-timeline`, kernel timeline (off by default) |
+| Verification | `python -m tests.parity.run_parity` |
+| Generation | KV cache on by default (`--no-kv-cache` to disable) |
+| Reports | `python tools/reports/evolution_report.py` → `output/reports/evolution.html` |
 
 ---
 
@@ -63,7 +213,7 @@ Predecessor context and CUDA bring-up notes live in [`setup/cuda_activate.md`](s
 | Component | Typical / target |
 |-----------|------------------|
 | GPU | NVIDIA GeForce GT 730 (GK208), **CC 3.5** |
-| VRAM | ~4 GB DDR3 |
+| VRAM | ~4 GB DDR3 (less free when shared with the display) |
 | Driver | 475.14 era (CUDA runtime ≤ 11.4) |
 | Toolkit | CUDA **10.1** (with MSVC 14.2 / VS Build Tools for PyCUDA compile) |
 | Python | **3.8** venv at project `venv/` |
@@ -76,27 +226,33 @@ Larger configs (e.g. 256d / 8 heads / 4 layers / T=256, batch 4) run at ~600–6
 ## Architecture
 
 ```text
-Corpus (.txt / wizard) ──► CharacterGPTTokenizer
-                              │
-                              ▼
-                     WindowedDataset (train)
-                     + 10% seeded val holdout
-                              │
-                              ▼
-              GPTModel (PyCUDA forward + NumPy backward)
-                              │
-         ModelParameters: host NumPy + device gpuarray mirror
-                              │
-                    AdamWGPU ── sync_device() once / step
-                              │
-         checkpoints under output/checkpoints/<run>/
+                    GPTModel (live path)
+
+                          │
+                          ▼
+                    GPU forward
+                          │
+                          ▼
+                      GPU loss
+                          │
+                          ▼
+               GPU manual backward
+                          │
+                          ▼
+                     GPU AdamW
+                          │
+                          ▼
+              checkpoints under output/checkpoints/<run>/
+
+
+NumPy backward path = reference implementation / testing fallback
 ```
 
 **Design notes**
 
-- Weights stay GPU-resident between steps (`upload_to_device` / `sync_device`) — V2 architecture (see changelog 2026-07-12).
-- Attention head split and activation caches for backward still touch host where needed; weight re-upload every linear call was removed.
-- Character vocab (often ~110 for TinyStories ASCII) keeps embedding/LM-head matrices small enough for Kepler.
+- Weights stay GPU-resident between steps (`upload_to_device` / `sync_device`).
+- `ScratchPool` reuses temporary GPU buffers (pool lifetime until `clear()` — see Observability).
+- Character vocab (~110 for TinyStories ASCII) keeps embedding/LM-head matrices small on Kepler.
 
 ---
 
@@ -105,35 +261,16 @@ Corpus (.txt / wizard) ──► CharacterGPTTokenizer
 ```text
 llm gpu 8/
 ├── README.md                 ← this file
-├── VERSION / version.py      ← project version (0.1.0)
-├── train.py                  ← main training entry
-├── auto_train.py             ← train + smoke generate
-├── generate.py               ← sample from a checkpoint
-├── interactive.py            ← interactive generation shell
-├── cli_common.py             ← shared argparse / tracers / checkpoint listing
-├── paths.py                  ← output/ + quarter helpers
-├── logging_config.py
-├── training_log_plotter.py
-├── loss_landscape_plotter.py
-├── bench_step.py / bench_profile.py / bench_mlp_fusion.py
-├── model/
-│   ├── gpt.py                ← GPT forward/backward/generate
-│   ├── layers.py             ← linear / LN / attention / MLP helpers
-│   ├── weights.py            ← host + device parameter store
-│   ├── config.py / trace.py
-│   └── cuda/                 ← env, kernels, ops
-├── training/
-│   ├── checkpoint.py         ← save/load, promote_best, metrics
-│   ├── dataset.py / loss.py / optimizer.py / gpu_optimizer.py
-│   ├── eval.py               ← val loss / PPL
-│   ├── probe.py              ← checkpoint + generate probes
-│   └── quality.py            ← quality scores + compare_quarters
-├── tokenizer/
-├── setup/                    ← wizard, presets, CUDA activate notes
-├── data/                     ← input corpora (gitignored *.txt)
-├── output/                   ← logs, checkpoints, configs, tokenizer (gitignored)
-├── collab/                   ← Colab / T4 helpers (optional)
-└── superfinal/               ← example smaller checkpoint bundle in-tree
+├── VERSION / version.py      ← 0.1.1-dev
+├── train.py / auto_train.py / generate.py / interactive.py
+├── cli_common.py / paths.py / logging_config.py
+├── tools/tracing/            ← Stage 3.1 observability
+│   ├── runtime_metrics.py    ← SyncMeter + MemoryTimeline recorders
+│   └── memory_timeline.py    ← JSONL summary / --plot CLI
+├── tests/parity/             ← Stage 3.1 NumPy↔CUDA verification
+├── model/                    ← GPT + CUDA kernels/ops
+├── training/                 ← checkpoint, loss, AdamWGPU, quality, …
+├── tokenizer/ / setup/ / data/ / output/
 ```
 
 Runtime artifact convention is documented in [`output/README.md`](output/README.md). Setup details: [`setup/README.md`](setup/README.md).
@@ -215,6 +352,8 @@ python generate.py --checkpoint output\checkpoints\BiggerTest256256 `
 | `--set-best quarter_50` | Promote a quarter to `best/` |
 | `--quality-trial` / `--no-quality-trial` | Force / suppress post-train quality trial |
 | `--plot` | Render training / landscape plots after train |
+| `--runtime-metrics` | Stage 3.1: log `grad_norm` / `param_norm` / `sync_*` / `scratch_peak_mb` (off by default) |
+| `--memory-timeline` | Stage 3.1: ScratchPool alloc/reuse JSONL + implies `--runtime-metrics` |
 
 Resume example toward a long target (e.g. remaining steps to 120k):
 
@@ -222,6 +361,40 @@ Resume example toward a long target (e.g. remaining steps to 120k):
 python train.py --resume --checkpoint output\checkpoints\BiggerTest256256 `
   --steps 19000 --learning-rate 0.00001 --batch-size 4 --no-prompt
 ```
+
+---
+
+## Observability (Stage 3.1)
+
+**Off by default** — BiggerTest throughput must not change when flags are absent (no extra CUDA syncs, no JSONL I/O).
+
+```powershell
+python train.py --config ... --checkpoint output\checkpoints\run1 `
+  --steps 20 --no-prompt --runtime-metrics
+
+python train.py ... --memory-timeline
+# writes output/logs/memory_timeline_<run>.jsonl
+
+python -m tools.tracing.memory_timeline --input output\logs\memory_timeline_run.jsonl
+python -m tools.tracing.memory_timeline --input ... --plot
+# optional PNG: output/logs/memory_timeline.png
+```
+
+Extended `[train]` keys when metrics are on: `grad_norm`, `param_norm`, `sync_count`, `sync_ms`, `scratch_peak_mb`.
+
+**Limitation:** the Memory Timeline shows **ScratchPool lifetime** (buffers live until `clear()`), not per-activation free/reuse of a future arena allocator.
+
+---
+
+## Verification / parity
+
+NumPy is the reference; CUDA is the device under test.
+
+```powershell
+python -m tests.parity.run_parity
+```
+
+Progression: linear → LayerNorm → GELU → attention → one full train step. Tolerances: `rtol=1e-4`, `atol=1e-5`; NaN/Inf fail first. Tiny shapes keep display-shared VRAM safe.
 
 ---
 
@@ -306,10 +479,12 @@ python training_log_plotter.py --save                 # PNG, no GUI
 
 python loss_landscape_plotter.py
 
-python bench_step.py
+python bench_step.py          # GPU step microbench + forward→backward contract smoke
 python bench_profile.py
 python bench_mlp_fusion.py
 ```
+
+`bench_step.py` uses the batched GPU path (`forward_batch` / `backward_batch_gpu` / `AdamWGPU`) and asserts `forward()` keeps `B`/`T` on the cache for `backward()`.
 
 Logs default under `output/logs/` (`training.log` aggregate + per-run files).
 
@@ -334,8 +509,8 @@ Long-running Kepler train used as the project’s stress reference:
 | Data | TinyStories character corpus (~558k train / ~62k val sentences), vocab ~110 |
 | Batch / LR (late fine-tune) | 4 / `1e-05` |
 | Long-run target | **120,000** steps (first logged 2026-07-15) |
-| Recent finish | **101,000** steps (~84% of 120k), train loss ~0.97, val loss ~0.96 |
-| Quality @ 101k | aggregate **~0.884** (spell 0.93 / punct 0.75 / gram 1.0 / sem 0.85) |
+| Stage 3.1 control | step **111100**, train loss **0.9305**, ppl **2.54**, **~586 tok/s** — see [`stage31_baseline.json`](output/baselines/stage31_baseline.json) |
+| Quality @ 101k (quarter) | aggregate **~0.884** (spell 0.93 / punct 0.75 / gram 1.0 / sem 0.85); val loss ~0.96 |
 
 Generation at this stage: reliable TinyStories openers; mid-sample coherence still soft — expected for char-level ~3M-param Kepler training.
 
@@ -343,7 +518,30 @@ Generation at this stage: reliable TinyStories openers; mid-sample coherence sti
 
 ## Changelog
 
-All commits on `main` from init through current HEAD. Dates are author dates (UTC+local as recorded).
+### [0.1.1-dev] — 2026-07-22 — Stage 3.2–3.8 serial roadmap
+
+- **3.2 KV cache** (generate-only): prefill + incremental decode; `tools/bench_generate.py`; BiggerTest **~3.9×** generate speedup @ 256 tokens; [`stage32_kv_generate.json`](output/baselines/stage32_kv_generate.json)
+- **3.3 BPE experiments:** [`tokenizer/bpe.py`](tokenizer/bpe.py) + [`tools/bpe_protocol.py`](tools/bpe_protocol.py); char remains BiggerTest default
+- **3.4 Activation accounting:** attention_cache largest bucket (~48 MB of ~99 MB cache @ BiggerTest shapes)
+- **3.5 FP16 activation storage** + FP32 compute cast (`model/cuda/fp16_storage.py`)
+- **3.6 LifetimeAllocator** for qkv_split temps (`model/cuda/allocator.py`)
+- **3.7 Software kernel timeline** (`kernel_timeline` in runtime_metrics)
+- **3.8 Evolution report:** [`output/reports/evolution.html`](output/reports/evolution.html)
+
+### [0.1.1-dev] — 2026-07-22 — Stage 3.1 Observability + Verification (exit)
+
+Measurement and correctness foundation (does **not** optimize execution):
+
+- `tools/tracing/runtime_metrics.py` — SyncMeter + MemoryTimeline (disabled by default)
+- ScratchPool alloc/reuse/clear instrumentation; `--memory-timeline` JSONL
+- Richer `[train]` fields: `grad_norm`, `param_norm`, `sync_count`, `sync_ms`, `scratch_peak_mb`
+- `tools/tracing/memory_timeline.py` summary CLI + optional `--plot`
+- `tests/parity/` unittest harness (linear → LN → GELU → attention → full step + forward cache contract)
+- **Cache contract:** `forward()` squeezes logits only; cache keeps `B`/`T`/`batched` for GPU backward
+- **`bench_step.py`** repaired for batched GPU path + forward→backward smoke
+- **Baseline freeze:** [`output/baselines/stage31_baseline.json`](output/baselines/stage31_baseline.json) (BiggerTest telemetry @ 111100; GT 730 not transfer-bound)
+- README: five pillars, exists vs Not yet, demotions (weight-sync / ScratchPool redesign)
+- Corrected GPU backward architecture docs (live path is GPU manual backward + AdamWGPU)
 
 ### [0.1.0] — 2026-07-21
 
@@ -419,9 +617,9 @@ Treated as `0.0.x`–`0.9.9` relative to `version.py` policy. Building blocks be
 
 ## Versioning
 
-- Canonical version string: [`VERSION`](VERSION) (currently `0.1.0`), exposed as `version.py` → `__version__`.
+- Canonical version string: [`VERSION`](VERSION) (currently `0.1.1-dev`), exposed as `version.py` → `__version__`.
 - Printed at startup by `train.py` / `auto_train.py`; stamped into checkpoint `config.json` / `state.json` / `metrics.json`.
-- **Policy:** all work before `a2b1a6f` is pre-0.1.0 (`0.0.x`–`0.9.9` conceptually). Bump `VERSION` when cutting a release and append a section under [Changelog](#changelog).
+- **Policy:** all work before `a2b1a6f` is pre-0.1.0. Stage 3.1 ships as `0.1.1-dev` until a tagged release.
 
 ---
 
@@ -432,6 +630,7 @@ Treated as `0.0.x`–`0.9.9` relative to `version.py` policy. Building blocks be
 | [`setup/README.md`](setup/README.md) | Model/dataset/init/hyperparam wizard deep dive |
 | [`setup/cuda_activate.md`](setup/cuda_activate.md) | GT 730 CUDA / PyCUDA activation journey |
 | [`output/README.md`](output/README.md) | Runtime artifact directories |
+| [`.cursor/plans/obs_verify_foundation_da50b350.plan.md`](.cursor/plans/obs_verify_foundation_da50b350.plan.md) | Stage 3.1 Observability + Verification |
 | [`.cursor/plans/quarterly_checkpoint_resume_f982639b.plan.md`](.cursor/plans/quarterly_checkpoint_resume_f982639b.plan.md) | v0.1.0 quarterly design |
 | [`.cursor/plans/pycuda_gpt_training_8d816e55.plan.md`](.cursor/plans/pycuda_gpt_training_8d816e55.plan.md) | Original stack plan |
 | [`.cursor/plans/port_gpu5_cuda_core_ce814de3.plan.md`](.cursor/plans/port_gpu5_cuda_core_ce814de3.plan.md) | GPU-5 CUDA core port notes |

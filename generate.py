@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
     parser.add_argument("--top-k", type=int, default=None, help="Only sample from top K characters (e.g. 15)")
     parser.add_argument("--top-p", type=float, default=None, help="Nucleus sampling threshold (e.g. 0.9)")
+    parser.add_argument(
+        "--no-kv-cache",
+        action="store_true",
+        help="Disable Stage 3.2 KV cache (full recompute each token)",
+    )
     cli_common.add_trace_args(parser)
     return parser.parse_args()
 
@@ -64,6 +69,7 @@ def generate(args: argparse.Namespace) -> str:
         tracer=tracer,
         tokenizer=tokenizer if tracer.any_enabled else None,
         rng=rng,
+        use_kv_cache=not args.no_kv_cache,
     )
 
     text = tokenizer.decode(generated_ids)

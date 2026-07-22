@@ -79,23 +79,45 @@ class ScratchPool:
     (e.g. d_probs vs d_raw). Do **not** pool tensors that outlive the
     call and are stored in grad dicts or forward caches unless each has
     a distinct stable name.
+
+    When ``memory_timeline`` is enabled (opt-in), records alloc/reuse/clear
+    events for pool-lifetime visualization — not per-tensor free timing.
     """
 
     def __init__(self):
         self._buffers = {}
 
     def get(self, shape, dtype=np.float32, zero=False, name=None):
+        from tools.tracing.runtime_metrics import memory_timeline
+
         key = (tuple(int(s) for s in shape), np.dtype(dtype).str, name)
         buf = self._buffers.get(key)
-        if buf is None or buf.shape != tuple(shape):
+        shape_t = tuple(int(s) for s in shape)
+        if buf is None or buf.shape != shape_t:
             buf = gpuarray.empty(shape, dtype=dtype)
             self._buffers[key] = buf
+            if memory_timeline.enabled:
+                free_b, total_b = cuda.mem_get_info()
+                memory_timeline.record_alloc(
+                    name, shape_t, int(buf.nbytes), key,
+                    driver_free=int(free_b), driver_total=int(total_b),
+                )
+        else:
+            if memory_timeline.enabled:
+                memory_timeline.record_reuse(name, shape_t, int(buf.nbytes))
         if zero:
             cuda.memset_d8(buf.gpudata, 0, buf.nbytes)
         return buf
 
     def clear(self):
+        from tools.tracing.runtime_metrics import memory_timeline
+
         self._buffers.clear()
+        if memory_timeline.enabled:
+            memory_timeline.record_clear()
+
+    def resident_bytes(self) -> int:
+        return int(sum(int(b.nbytes) for b in self._buffers.values()))
 
 
 scratch_pool = ScratchPool()
@@ -122,23 +144,57 @@ def next_pow2(n: int, cap: int = MAX_THREADS_PER_BLOCK) -> int:
 
 def to_device(arr: np.ndarray) -> gpuarray.GPUArray:
     """Upload a NumPy float32 array to the device."""
-    return gpuarray.to_gpu(np.ascontiguousarray(arr, dtype=np.float32))
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    host = np.ascontiguousarray(arr, dtype=np.float32)
+    if not runtime_metrics.enabled:
+        return gpuarray.to_gpu(host)
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_device"):
+        out = gpuarray.to_gpu(host)
+        cuda.Context.synchronize()
+    return out
 
 
 def to_host(arr: gpuarray.GPUArray) -> np.ndarray:
     """Download a device array to NumPy."""
-    return arr.get()
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    if not runtime_metrics.enabled:
+        return arr.get()
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_host"):
+        out = arr.get()
+        cuda.Context.synchronize()
+    return out
 
 
 def to_device_int64(arr: np.ndarray) -> gpuarray.GPUArray:
     """Upload an int64 NumPy array to the device (offsets tables etc.)."""
-    return gpuarray.to_gpu(np.ascontiguousarray(arr, dtype=np.int64))
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    host = np.ascontiguousarray(arr, dtype=np.int64)
+    if not runtime_metrics.enabled:
+        return gpuarray.to_gpu(host)
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_device"):
+        out = gpuarray.to_gpu(host)
+        cuda.Context.synchronize()
+    return out
 
 
 def to_device_ptrs(gpudata_list) -> gpuarray.GPUArray:
     """Upload a list of device pointers (from gpuarray.gpudata) as uint64."""
+    from tools.tracing.runtime_metrics import runtime_metrics
+
     ptrs = np.array([int(p) for p in gpudata_list], dtype=np.uint64)
-    return gpuarray.to_gpu(ptrs)
+    if not runtime_metrics.enabled:
+        return gpuarray.to_gpu(ptrs)
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_device"):
+        out = gpuarray.to_gpu(ptrs)
+        cuda.Context.synchronize()
+    return out
 
 
 def add_arrays(a: gpuarray.GPUArray, b: gpuarray.GPUArray) -> gpuarray.GPUArray:
@@ -211,6 +267,8 @@ def matmul_bias(
     tracer=None, name: str = "gemm_bias",
 ) -> gpuarray.GPUArray:
     """C = A @ B + bias (contiguous A, B only)."""
+    from tools.tracing.runtime_metrics import kernel_timeline
+
     assert A.flags.c_contiguous and B.flags.c_contiguous
     M, K = int(A.shape[0]), int(A.shape[1])
     assert B.shape[0] == K and int(bias.size) == int(B.shape[1])
@@ -224,11 +282,46 @@ def matmul_bias(
     )
     if tracer is not None and getattr(tracer, "trace_vectorization", False):
         tracer.log_vectorization(name, (M, K), (K, N), (M, N), grid_dim, block_dim)
-    _gemm_bias_kernel(
-        A, B, bias, C, np.int32(M), np.int32(N), np.int32(K),
-        block=block_dim, grid=grid_dim,
-    )
+    with kernel_timeline.measure(name, category="gemm"):
+        _gemm_bias_kernel(
+            A, B, bias, C, np.int32(M), np.int32(N), np.int32(K),
+            block=block_dim, grid=grid_dim,
+        )
     return C
+
+
+def causal_self_attention(
+    q: gpuarray.GPUArray,
+    k: gpuarray.GPUArray,
+    v: gpuarray.GPUArray,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    scale: float,
+) -> tuple:
+    """Causal MHA on interleaved Q/K/V [B*T, C]. Returns (attn_concat, probs)."""
+    from tools.tracing.runtime_metrics import kernel_timeline
+
+    B, T, H, hd = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    C = H * hd
+    # Cache-owned buffers stay on gpuarray.empty (not freelist) so FP16 storage
+    # / backward can replace them safely. LifetimeAllocator is for true temps.
+    out = gpuarray.empty((B * T, C), dtype=np.float32)
+    probs = gpuarray.empty((B * H * T * T,), dtype=np.float32)
+
+    num_warps = (hd + 31) // 32
+    shared_bytes = (2 * T + hd + num_warps) * np.dtype(np.float32).itemsize
+    grid = (T, H, B)
+    block = (int(hd), 1, 1)
+
+    with kernel_timeline.measure("causal_mha", category="attention"):
+        _causal_mha_kernel(
+            q, k, v, out, probs,
+            np.int32(B), np.int32(T), np.int32(H), np.int32(hd), np.float32(scale),
+            block=block, grid=grid, shared=shared_bytes,
+        )
+    return out, probs
 
 
 def linear_qkv_split(
@@ -248,9 +341,10 @@ def linear_qkv_split(
     assert N % 3 == 0, f"gemm_bias_qkv_split expects N = 3*C_head, got {N}"
     C_head = N // 3
 
-    Q = gpuarray.empty((M, C_head), dtype=np.float32)
-    K_out = gpuarray.empty((M, C_head), dtype=np.float32)
-    V = gpuarray.empty((M, C_head), dtype=np.float32)
+    from model.cuda.allocator import lifetime_allocator
+    Q = lifetime_allocator.empty((M, C_head), dtype=np.float32, lifetime="qkv_split")
+    K_out = lifetime_allocator.empty((M, C_head), dtype=np.float32, lifetime="qkv_split")
+    V = lifetime_allocator.empty((M, C_head), dtype=np.float32, lifetime="qkv_split")
 
     block_dim = (TILE_SIZE, TILE_SIZE, 1)
     grid_dim = (
@@ -426,35 +520,6 @@ def split_qkv(qkv: gpuarray.GPUArray, hidden_dim: int):
     return q, k, v
 
 
-def causal_self_attention(
-    q: gpuarray.GPUArray,
-    k: gpuarray.GPUArray,
-    v: gpuarray.GPUArray,
-    batch_size: int,
-    seq_len: int,
-    num_heads: int,
-    head_dim: int,
-    scale: float,
-) -> tuple:
-    """Causal MHA on interleaved Q/K/V [B*T, C]. Returns (attn_concat, probs)."""
-    B, T, H, hd = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
-    C = H * hd
-    out = gpuarray.empty((B * T, C), dtype=np.float32)
-    probs = gpuarray.empty((B * H * T * T,), dtype=np.float32)
-
-    num_warps = (hd + 31) // 32
-    shared_bytes = (2 * T + hd + num_warps) * np.dtype(np.float32).itemsize
-    grid = (T, H, B)
-    block = (int(hd), 1, 1)
-
-    _causal_mha_kernel(
-        q, k, v, out, probs,
-        np.int32(B), np.int32(T), np.int32(H), np.int32(hd), np.float32(scale),
-        block=block, grid=grid, shared=shared_bytes,
-    )
-    return out, probs
-
-
 # Phase 2C fused forward is correct but ~2x slower than causal_mha on sm_35 at T=256.
 # Default uses corrected causal_mha; set True to force the GPU5 fused kernel.
 _USE_FUSED_ATTENTION_FORWARD = False
@@ -555,6 +620,10 @@ def fused_causal_attention_from_qkv(
         v, v_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
         block=block, grid=grid,
     )
+    from model.cuda.allocator import lifetime_allocator
+    lifetime_allocator.release(q)
+    lifetime_allocator.release(k)
+    lifetime_allocator.release(v)
     return attn_concat, probs, q_h, k_h, v_h
 
 
@@ -964,4 +1033,23 @@ def embed_backward(
 
 def sync_to_host(device_arr: gpuarray.GPUArray, host_arr: np.ndarray) -> None:
     """Copy device array into existing host buffer in-place (no reallocation)."""
-    host_arr[:] = device_arr.get().reshape(host_arr.shape)
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    if not runtime_metrics.enabled:
+        host_arr[:] = device_arr.get().reshape(host_arr.shape)
+        return
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_host"):
+        host_arr[:] = device_arr.get().reshape(host_arr.shape)
+        cuda.Context.synchronize()
+
+
+def param_global_norm(device_tensors) -> float:
+    """L2 norm over an iterable of device weight/bias arrays (log_every use)."""
+    total_sq = 0.0
+    for arr in device_tensors:
+        if arr is None:
+            continue
+        # Reuse grad_norm kernel path via a one-key dict
+        total_sq += float(grad_global_norm_sq({"_": arr}))
+    return float(np.sqrt(total_sq))

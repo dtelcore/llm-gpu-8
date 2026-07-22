@@ -30,6 +30,21 @@ def add_trace_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--trace-every", type=int, default=None, help="Emit traces every N steps (default: 10%% of total training steps; ignored for generate/interactive where it defaults to every step)")
 
 
+def add_runtime_observability_args(parser: argparse.ArgumentParser) -> None:
+    """Stage 3.1: opt-in runtime metrics and ScratchPool memory timeline (off by default)."""
+    group = parser.add_argument_group("runtime observability (Stage 3.1; off by default)")
+    group.add_argument(
+        "--runtime-metrics", action="store_true",
+        help="Log grad_norm/param_norm/sync_count/sync_ms/scratch_peak_mb on [train] lines; "
+             "meter host↔device transfers (no memory JSONL)",
+    )
+    group.add_argument(
+        "--memory-timeline", action="store_true",
+        help="Record ScratchPool alloc/reuse/clear to output/logs/memory_timeline_<run>.jsonl "
+             "(implies --runtime-metrics)",
+    )
+
+
 def add_config_arg(parser: argparse.ArgumentParser, default: Optional[str] = None) -> None:
     default_path = str(default or DEFAULT_CONFIG_PATH)
     parser.add_argument("--config", type=str, default=default_path, help="Path to training_config.json")
