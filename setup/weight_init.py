@@ -58,9 +58,11 @@ class WeightInitializer:
             return scale
         
         elif layer_type == 'output_proj':
-            # Output projections: 1/sqrt(fan_in) per transformer literature
+            # Output projections: 1/sqrt(fan_in), GPT-2 residual depth scaling
             scale = 1.0 / np.sqrt(fan_in)
-            logger.debug(f"Output projection init scale: {scale:.6f} (fan_in={fan_in})")
+            if total_layers > 0:
+                scale /= np.sqrt(2.0 * total_layers)
+            logger.debug(f"Output projection init scale: {scale:.6f} (fan_in={fan_in}, L={total_layers})")
             return scale
         
         # Feed-forward network layers
@@ -71,10 +73,11 @@ class WeightInitializer:
             return scale
         
         elif layer_type == 'mlp_contract':
-            # Contracting layer (4C -> C): std = 1/sqrt(fan_in)
-            # This is critical for gradient flow
+            # Contracting layer (4C -> C): depth-scaled residual init
             scale = 1.0 / np.sqrt(fan_in)
-            logger.debug(f"MLP contract init scale: {scale:.6f} (fan_in={fan_in})")
+            if total_layers > 0:
+                scale /= np.sqrt(2.0 * total_layers)
+            logger.debug(f"MLP contract init scale: {scale:.6f} (fan_in={fan_in}, L={total_layers})")
             return scale
         
         # Language model head (final projection to vocabulary)
@@ -197,7 +200,7 @@ def get_init_scales_for_config(config: Dict) -> Dict[str, float]:
     
     # Output projection (attention) [C, C]
     scales['attention_output_proj'] = WeightInitializer.layer_init_scale(
-        'output_proj', C, C
+        'output_proj', C, C, total_layers=L
     )
     
     # MLP expand [C, 4C]
@@ -207,7 +210,7 @@ def get_init_scales_for_config(config: Dict) -> Dict[str, float]:
     
     # MLP contract [4C, C]
     scales['mlp_contract'] = WeightInitializer.layer_init_scale(
-        'mlp_contract', 4*C, C
+        'mlp_contract', 4*C, C, total_layers=L
     )
     
     # Output projection (lm_head) [C, vocab_size]

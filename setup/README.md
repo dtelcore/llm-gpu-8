@@ -1,6 +1,6 @@
 # Setup Directory: Complete Training Configuration System
 
-Current state: setup still drives model, dataset, and weight-init configuration, but the recommended validation path now includes the shared probe checks after each fresh checkpoint save.
+Current state: setup still drives model, dataset, and weight-init configuration. For **GT 730 TinyStories training** with the 2026 recipe (preset `tiny_stories`), use `train.py --menu` → scaling preset **2** — see **[`../guide.md`](../guide.md)**.
 
 Complete infrastructure for model configuration, dataset selection, weight initialization, and training hyperparameter setup for the Kepler GT 730 GPU training system.
 
@@ -83,6 +83,27 @@ from setup import quickstart_training_setup
 config = quickstart_training_setup(interactive=False)
 ```
 
+### Option 4: Scaling presets (`training_presets.py`) — training wizard
+
+Used by `train.py --menu` / `auto_train.py --menu`. Bundles **model + hyperparameters + dataset** in one choice:
+
+| Key | Model | Training highlights | Dataset |
+|-----|--------|---------------------|---------|
+| **`toy`** | C=16, L=1, T=8 | LR 0.01, batch 64 | built-in `minimal` |
+| **`tiny_stories`** | C=256, 8 heads, L=4, T=128, rmsnorm, RoPE, tied | LR **3e-4**, warmup **1000**, batch **4**, accum **4**, cosine `min_lr_ratio=0.1`, **`window_stride=64`**, dropout **0** | `data/*.txt` |
+
+Programmatic:
+
+```python
+from setup.training_presets import apply_scale_preset
+
+model_config, hyperparams, dataset_name = apply_scale_preset("tiny_stories", vocab_size=110)
+```
+
+**Dropout:** GPU training does **not** apply dropout even if `dropout_prob > 0` on legacy presets (`small`, `medium`) — `train.py` logs a warning. Keep **0** for honest configs.
+
+**Weight init:** `output_proj` and `mlp_contract` use an extra **1/√(2L)** scale factor (GPT-2-style residual depth init) when `num_layers` is set.
+
 ---
 
 ## 📁 File Structure
@@ -109,6 +130,7 @@ setup/
 | Preset | Vocab | Embedding | Heads | Layers | Max Seq | Params | VRAM |
 |--------|-------|-----------|-------|--------|---------|--------|------|
 | **Tiny** | Auto | 16 | 2 | 1 | 8 | ~20K | ~80KB |
+| **Tiny Stories** | Auto | 256 | 8 | 4 | 128 | ~3M | (see `estimate_vram_footprint`) |
 | **Small** | Auto | 64 | 4 | 2 | 16 | ~200K | ~800KB |
 | **Medium** | Auto | 128 | 8 | 3 | 32 | ~1M | ~4MB |
 

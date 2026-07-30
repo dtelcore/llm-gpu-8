@@ -5,6 +5,7 @@ AdamW optimizer that updates GPU-resident weight mirrors directly.
 Host NumPy copies are synced only when saving checkpoints.
 """
 
+import math
 from typing import Dict, Iterable, Optional
 
 import numpy as np
@@ -27,6 +28,8 @@ class AdamWGPU:
         epsilon: float = 1e-8,
         warmup_steps: int = 0,
         gradient_clip: float = 1.0,
+        total_steps: int = 0,
+        min_lr_ratio: float = 0.1,
     ) -> None:
         self.params = params
         self.base_lr = learning_rate
@@ -36,6 +39,8 @@ class AdamWGPU:
         self.epsilon = epsilon
         self.warmup_steps = max(0, warmup_steps)
         self.gradient_clip = gradient_clip
+        self.total_steps = max(0, int(total_steps))
+        self.min_lr_ratio = float(min_lr_ratio)
         self.t = 0
 
         # Exclude tied lm_head view — it aliases token_embedding storage.
@@ -73,7 +78,12 @@ class AdamWGPU:
     def current_lr(self) -> float:
         if self.warmup_steps > 0 and self.t < self.warmup_steps:
             return self.base_lr * (self.t + 1) / self.warmup_steps
-        return self.base_lr
+        if self.total_steps <= self.warmup_steps:
+            return self.base_lr
+        min_lr = self.base_lr * self.min_lr_ratio
+        denom = max(1, self.total_steps - self.warmup_steps)
+        progress = min(1.0, max(0.0, (self.t - self.warmup_steps) / denom))
+        return min_lr + 0.5 * (self.base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
     def clip_grads_(self, grads: Dict[str, gpuarray.GPUArray]) -> float:
         total_sq = cuda_ops.grad_global_norm_sq(grads)

@@ -112,7 +112,7 @@ Not yet
 └── CUDA Graph capture (software timeline exists)
 ```
 
-**Modern block (shipped with this train of work):** `norm_type=rmsnorm`, `pos_encoding=rope`, optional `--grad-checkpoint` (selective attn/MLP recompute; ~72 MB less activation cache at BiggerTest shapes — see [`output/baselines/modern_activation_recompute.json`](output/baselines/modern_activation_recompute.json)). Legacy checkpoints without these keys stay LayerNorm + learned positions.
+**Modern block (shipped with this train of work):** `norm_type=rmsnorm`, `pos_encoding=rope`, optional `--grad-checkpoint` (**VRAM** lever: selective attn/MLP recompute; ~72 MB less activation cache at BiggerTest shapes — not a tok/s speedup; see [`output/baselines/modern_activation_recompute.json`](output/baselines/modern_activation_recompute.json)). Legacy checkpoints without these keys stay LayerNorm + learned positions. RoPE path uses **QKV-split fusion** again (no full `[B·T, 3C]` buffer).
 **Scientific control (BiggerTest telemetry, not a contended microbench):**
 
 [`output/baselines/stage31_baseline.json`](output/baselines/stage31_baseline.json)
@@ -202,7 +202,7 @@ Future:   training/allocator.py   model/cuda/graph.py   tokenizer/bpe.py
 | Checkpoints | Latest + `quarter_*` + optional `best/` |
 | Quality | Heuristic generation scores + quarter trial |
 | Observability | `--runtime-metrics`, `--memory-timeline`, kernel timeline (off by default) |
-| Verification | `python -m tests.parity.run_parity` |
+| Verification | `.\venv\Scripts\python.exe -m tests.parity.run_parity` |
 | Generation | KV cache on by default (`--no-kv-cache` to disable) |
 | Reports | `python tools/reports/evolution_report.py` → `output/reports/evolution.html` |
 
@@ -261,6 +261,7 @@ NumPy backward path = reference implementation / testing fallback
 ```text
 llm gpu 8/
 ├── README.md                 ← this file
+├── guide.md                  ← GT 730 TinyStories fast start
 ├── VERSION / version.py      ← 0.1.1-dev
 ├── train.py / auto_train.py / generate.py / interactive.py
 ├── cli_common.py / paths.py / logging_config.py
@@ -296,19 +297,29 @@ See [`setup/cuda_activate.md`](setup/cuda_activate.md) if kernels fail to compil
 
 ## Quick start
 
+**GT 730 TinyStories (recommended):** see **[`guide.md`](guide.md)** for copy-paste steps. Short version:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+python train.py --menu
+# Scaling preset 2 (Tiny Stories); put .txt corpora in data/ first
+```
+
 **Interactive train (wizard):**
 
 ```powershell
 python train.py --menu
 ```
 
-**Non-interactive short run:**
+**Non-interactive short run** (only after you have a saved config from the wizard, or when resuming):
 
 ```powershell
 python train.py --config output\configs\training_config.json `
   --checkpoint output\checkpoints\run1 `
-  --steps 500 --learning-rate 0.0001 --no-prompt
+  --steps 500 --no-prompt
 ```
+
+Do **not** use legacy examples like `--learning-rate 0.0001` for new TinyStories runs — use preset **2** or the recipe in [Configuration & presets](#configuration--presets).
 
 **Train then smoke-generate:**
 
@@ -344,14 +355,19 @@ python generate.py --checkpoint output\checkpoints\BiggerTest256256 `
 | `--menu` | Interactive model/dataset/hyperparam wizard (presets: toy / TinyStories / custom) |
 | `--resume` | Continue from `--checkpoint` (run root, `best/`, or `quarter_*`) |
 | `--steps N` | Total absolute step target (overrides epochs) |
-| `--learning-rate` | Override AdamW LR |
+| `--learning-rate` | Override AdamW base LR (preset **2** default **3e-4**) |
+| `--warmup-steps` | Linear LR warmup length (preset **1000**) |
+| `--min-lr-ratio` | Cosine floor as fraction of base LR after warmup (default **0.1**) |
 | `--batch-size` / `--embedding-dim` / `--num-heads` / `--num-layers` / `--max-len` | Model & batch overrides |
-| `--grad-accum N` | Micro-batches per optimizer step (gradient accumulation) |
+| `--grad-accum N` | Micro-batches per optimizer step (gradient accumulation; preset **4**) |
+| `--window-stride` | Token stride between sliding windows (preset **64**; `1` = dense / legacy) |
+| `--val-every N` | Lightweight val loss every N steps, no quarterly checkpoint I/O (**0** = off; try **500**) |
 | `--run-budget N` | Absolute step budget for quarterly 25/50/75/100% markers |
 | `--tie-embeddings` / `--no-tie-embeddings` | Share or split token_embedding ↔ lm_head |
 | `--norm-type layernorm\|rmsnorm` | Normalization (new presets default rmsnorm) |
 | `--pos-encoding learned\|rope` | Positions (new presets default rope) |
-| `--grad-checkpoint` / `--no-grad-checkpoint` | Recompute attn/MLP activations in backward |
+| `--grad-checkpoint` / `--no-grad-checkpoint` | Save VRAM by recomputing attn/MLP in backward (**not** a speed lever) |
+| `--dropout` | Override `dropout_prob` — values **> 0** log a warning (dropout not implemented) |
 | `--log-every` / `--checkpoint-every` | Progress & disk cadence |
 | `--no-prompt` | Never ask on stdin; use CLI/config defaults |
 | `--compare-quarters` | Skip train; run quality trial on a run dir |
@@ -361,12 +377,14 @@ python generate.py --checkpoint output\checkpoints\BiggerTest256256 `
 | `--runtime-metrics` | Stage 3.1: log `grad_norm` / `param_norm` / `sync_*` / `scratch_peak_mb` (off by default) |
 | `--memory-timeline` | Stage 3.1: ScratchPool alloc/reuse JSONL + implies `--runtime-metrics` |
 
-Resume example toward a long target (e.g. remaining steps to 120k):
+Resume example toward a long target (architecture/LR schedule come from checkpoint + CLI overrides):
 
 ```powershell
 python train.py --resume --checkpoint output\checkpoints\BiggerTest256256 `
-  --steps 19000 --learning-rate 0.00001 --batch-size 4 --no-prompt
+  --steps 120000 --no-prompt
 ```
+
+For **new** runs on the 2026 recipe, prefer `train.py --menu` → preset **2** or [`guide.md`](guide.md) instead of copying BiggerTest fine-tune LR (`1e-5`).
 
 ---
 
@@ -397,7 +415,7 @@ Extended `[train]` keys when metrics are on: `grad_norm`, `param_norm`, `sync_co
 NumPy is the reference; CUDA is the device under test.
 
 ```powershell
-python -m tests.parity.run_parity
+.\venv\Scripts\python.exe -m tests.parity.run_parity
 ```
 
 Progression: linear → LayerNorm → GELU → attention → one full train step. Tolerances: `rtol=1e-4`, `atol=1e-5`; NaN/Inf fail first. Tiny shapes keep display-shared VRAM safe.
@@ -504,6 +522,7 @@ Logs default under `output/logs/` (`training.log` aggregate + per-run files).
 - Default config path: `output/configs/training_config.json` (`paths.DEFAULT_CONFIG_PATH`)
 - Wizard / presets: `setup/training_setup.py`, `setup/training_presets.py`, `setup/model_config.py`
 - **Do not commit** configs that embed full corpora — `setup/training_config.json` and `output/configs/training_config.json` are gitignored
+- **GT 730 TinyStories recipe (2026, preset `tiny_stories`):** `C=256`, `L=4`, 8 heads, `T=128`, rmsnorm + RoPE + tied embeddings, `dropout_prob=0`. Training: `LR=3e-4`, warmup **1000**, cosine to `min_lr_ratio=0.1` (`--min-lr-ratio`), `batch=4`, grad accum **4**, `window_stride=64` (`--window-stride`). Strided windows mean **fewer windows per epoch** than dense stride-1. Dropout is **not implemented** on GPU — keep **0** (nonzero only warns). For BiggerTest-style context, A/B with `--max-len 256`. Use `--val-every 500` for cheap mid-run val. Turn **off** `--grad-checkpoint` for tok/s baselines; turn **off** `--runtime-metrics` unless measuring. Step-by-step: [`guide.md`](guide.md).
 
 ---
 
@@ -514,9 +533,9 @@ Long-running Kepler train used as the project’s stress reference:
 | Setting | Value |
 |---------|--------|
 | Name | `output/checkpoints/BiggerTest256256` |
-| Model | embed 256, 8 heads, 4 layers, max_len 256, dropout 0.1 |
+| Model | embed 256, 8 heads, 4 layers, max_len **256**, dropout **0.1 in config (never applied — no dropout kernels)** |
 | Data | TinyStories character corpus (~558k train / ~62k val sentences), vocab ~110 |
-| Batch / LR (late fine-tune) | 4 / `1e-05` |
+| Batch / LR (late fine-tune) | 4 / **`1e-5`** (historical; new preset uses **3e-4** + cosine — see [`guide.md`](guide.md)) |
 | Long-run target | **120,000** steps (first logged 2026-07-15) |
 | Stage 3.1 control | step **111100**, train loss **0.9305**, ppl **2.54**, **~586 tok/s** — see [`stage31_baseline.json`](output/baselines/stage31_baseline.json) |
 | Quality @ 101k (quarter) | aggregate **~0.884** (spell 0.93 / punct 0.75 / gram 1.0 / sem 0.85); val loss ~0.96 |
@@ -526,6 +545,14 @@ Generation at this stage: reliable TinyStories openers; mid-sample coherence sti
 ---
 
 ## Changelog
+
+### [0.1.1-dev] — 2026-07-30 — Train recipe + throughput hygiene
+
+- **`tiny_stories` preset:** C=256, L=4, T=128, ~3M params; LR **3e-4**, warmup **1000**, batch **4**, grad accum **4**, cosine LR (`min_lr_ratio=0.1`), **`window_stride=64`**, dropout **0** (warn if >0)
+- **CLI:** `--min-lr-ratio`, `--window-stride`, `--val-every` (lightweight val without quarterly I/O)
+- **Optimizer:** cosine schedule after warmup in `AdamWGPU`; residual out-proj init **1/√(2L)**
+- **Throughput:** train GPU path skips host logits sync when only device CE is needed; RoPE attention restores QKV-split fusion
+- **Docs:** [`guide.md`](guide.md) GT 730 quick start; README / `py_calls.md` aligned with recipe
 
 ### [0.1.1-dev] — 2026-07-22 — Stage 3.2–3.8 serial roadmap
 
@@ -636,9 +663,11 @@ Treated as `0.0.x`–`0.9.9` relative to `version.py` policy. Building blocks be
 
 | Doc | Topic |
 |-----|--------|
+| [`guide.md`](guide.md) | **GT 730 fast start** — TinyStories preset 2, verify, pitfalls |
 | [`setup/README.md`](setup/README.md) | Model/dataset/init/hyperparam wizard deep dive |
 | [`setup/cuda_activate.md`](setup/cuda_activate.md) | GT 730 CUDA / PyCUDA activation journey |
 | [`output/README.md`](output/README.md) | Runtime artifact directories |
+| [`.cursor/plans/train_recipe_speed_33e6e93c.plan.md`](.cursor/plans/train_recipe_speed_33e6e93c.plan.md) | Train recipe + throughput plan (completed) |
 | [`.cursor/plans/obs_verify_foundation_da50b350.plan.md`](.cursor/plans/obs_verify_foundation_da50b350.plan.md) | Stage 3.1 Observability + Verification |
 | [`.cursor/plans/quarterly_checkpoint_resume_f982639b.plan.md`](.cursor/plans/quarterly_checkpoint_resume_f982639b.plan.md) | v0.1.0 quarterly design |
 | [`.cursor/plans/pycuda_gpt_training_8d816e55.plan.md`](.cursor/plans/pycuda_gpt_training_8d816e55.plan.md) | Original stack plan |

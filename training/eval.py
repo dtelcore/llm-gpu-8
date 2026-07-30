@@ -90,7 +90,7 @@ def evaluate_val_loss(
             break
         xs = np.stack([x for x, _ in batch])
         ys = np.stack([y for _, y in batch])
-        logits, cache = model.forward_batch(xs)
+        logits, cache = model.forward_batch(xs, need_host_logits=False)
         if cache.get("gpu"):
             loss, _ = softmax_cross_entropy_batch_gpu(cache["logits_d"], ys)
         else:

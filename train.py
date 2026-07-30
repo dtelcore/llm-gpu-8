@@ -20,7 +20,8 @@ Usage:
 
 If --learning-rate/--steps/--epochs/model-hyperparameters (--embedding-dim,
 --num-heads, --num-layers, --max-len, --dropout, --batch-size, --weight-decay,
---warmup-steps, --gradient-clip) aren't all given on the command line, you'll be
+--warmup-steps, --gradient-clip, --min-lr-ratio, --window-stride, --val-every,
+--grad-accum) aren't all given on the command line, you'll be
 prompted for whichever ones are missing (pass --no-prompt to disable and
 silently fall back to config/CLI defaults).
 """
@@ -455,8 +456,6 @@ def train(args: argparse.Namespace) -> str:
     # 90/10 val holdout (stable across resume when val_corpus.json is present).
     train_corpus, val_corpus = ensure_train_val_split(config, seed=args.seed)
 
-    model = GPTModel(gpt_config, params)
-
     cli_common.prompt_training_length_and_lr(args, hyperparams)
     if args.learning_rate is not None:
         hyperparams["learning_rate"] = args.learning_rate
@@ -465,32 +464,39 @@ def train(args: argparse.Namespace) -> str:
     grad_accum = max(1, int(hyperparams.get("gradient_accumulation_steps", 1)))
     hyperparams["gradient_accumulation_steps"] = grad_accum
 
-    optimizer = AdamWGPU(
-        params,
-        learning_rate=hyperparams["learning_rate"],
-        weight_decay=hyperparams.get("weight_decay", 0.01),
-        beta1=hyperparams.get("beta1", 0.9),
-        beta2=hyperparams.get("beta2", 0.999),
-        epsilon=hyperparams.get("epsilon", 1e-8),
-        warmup_steps=hyperparams.get("warmup_steps", 0),
-        gradient_clip=hyperparams.get("gradient_clip", 1.0),
-    )
-    if resumed:
-        optimizer.t = start_step
-        warn = (
-            "Adam moments (m/v) were NOT restored from disk — buffers start at zero. "
-            "Step counter t=%s was restored so the LR schedule continues, but early "
-            "post-resume loss/grad spikes can look like a failure when they are not. "
-            "This is intentional (weights-only checkpoints to conserve memory)."
-        ) % start_step
-        print(f"WARNING: {warn}")
-        logger.warning(warn)
+    if getattr(args, "min_lr_ratio", None) is not None:
+        hyperparams["min_lr_ratio"] = float(args.min_lr_ratio)
+    elif "min_lr_ratio" not in hyperparams:
+        hyperparams["min_lr_ratio"] = 0.1
 
-    dataset = WindowedDataset(train_corpus, tokenizer, gpt_config.max_len, hyperparams["batch_size"])
+    window_stride = (
+        int(args.window_stride)
+        if getattr(args, "window_stride", None) is not None
+        else int(hyperparams.get("window_stride", 1))
+    )
+    hyperparams["window_stride"] = window_stride
+
+    model = GPTModel(gpt_config, params)
+
+    if gpt_config.dropout_prob > 0:
+        dropout_warn = (
+            f"dropout_prob={gpt_config.dropout_prob} but dropout is not implemented "
+            "in GPU kernels — the setting has no effect."
+        )
+        print(f"WARNING: {dropout_warn}")
+        logger.warning(dropout_warn)
+
+    dataset = WindowedDataset(
+        train_corpus, tokenizer, gpt_config.max_len, hyperparams["batch_size"],
+        window_stride=window_stride,
+    )
     val_dataset = None
     if val_corpus:
         try:
-            val_dataset = WindowedDataset(val_corpus, tokenizer, gpt_config.max_len, hyperparams["batch_size"])
+            val_dataset = WindowedDataset(
+                val_corpus, tokenizer, gpt_config.max_len, hyperparams["batch_size"],
+                window_stride=window_stride,
+            )
         except ValueError as exc:
             logger.warning("Val dataset too small for windows; skipping val eval: %s", exc)
             val_dataset = None
@@ -507,6 +513,31 @@ def train(args: argparse.Namespace) -> str:
     else:
         epochs = args.epochs if args.epochs is not None else hyperparams["num_epochs"]
         total_steps = start_step + epochs * steps_per_epoch
+
+    optimizer = AdamWGPU(
+        params,
+        learning_rate=hyperparams["learning_rate"],
+        weight_decay=hyperparams.get("weight_decay", 0.01),
+        beta1=hyperparams.get("beta1", 0.9),
+        beta2=hyperparams.get("beta2", 0.999),
+        epsilon=hyperparams.get("epsilon", 1e-8),
+        warmup_steps=hyperparams.get("warmup_steps", 0),
+        gradient_clip=hyperparams.get("gradient_clip", 1.0),
+        total_steps=total_steps,
+        min_lr_ratio=float(hyperparams.get("min_lr_ratio", 0.1)),
+    )
+    if resumed:
+        optimizer.t = start_step
+        warn = (
+            "Adam moments (m/v) were NOT restored from disk — buffers start at zero. "
+            "Step counter t=%s was restored so the LR schedule continues, but early "
+            "post-resume loss/grad spikes can look like a failure when they are not. "
+            "This is intentional (weights-only checkpoints to conserve memory)."
+        ) % start_step
+        print(f"WARNING: {warn}")
+        logger.warning(warn)
+
+    val_every = max(0, int(getattr(args, "val_every", 0) or 0))
 
     # Absolute budget for quarterly 25/50/75/100% markers. Prefer CLI, then
     # persisted state, else this session's total_steps. Never shrink a prior budget.
@@ -575,6 +606,7 @@ def train(args: argparse.Namespace) -> str:
     print("=" * 70)
     print(f"TRAINING v{__version__}: {gpt_config.name} | vocab={gpt_config.vocab_size} | "
           f"params={params.param_count():,} | windows={dataset.num_windows()} | "
+          f"window_stride={window_stride} | "
           f"batches/epoch={steps_per_epoch} | total_steps={total_steps} | "
           f"grad_accum={grad_accum} | tie_embeddings={gpt_config.tie_embeddings} | "
           f"checkpoint_every={checkpoint_every} steps | trace_every={tracer.trace_every} steps | "
@@ -624,11 +656,15 @@ def train(args: argparse.Namespace) -> str:
         ys = np.stack([y for _, y in batch])
         tracer.dump_tokens(xs[0], tokenizer, label=f"step {global_step} input")
 
-        logits, cache = model.forward_batch(xs, tracer=tracer)
+        need_host = bool(tracer.trace_logits or tracer.trace_tokens)
+        logits, cache = model.forward_batch(xs, tracer=tracer, need_host_logits=need_host)
         if cache.get("gpu"):
             loss, dlogits_d = softmax_cross_entropy_batch_gpu(cache["logits_d"], ys)
             if tracer.trace_logits or tracer.trace_tokens:
-                logits = cuda_ops.to_host(cache["logits_d"]).reshape(xs.shape[0], -1, model.config.vocab_size)
+                if not need_host:
+                    logits = cuda_ops.to_host(cache["logits_d"]).reshape(
+                        xs.shape[0], -1, model.config.vocab_size,
+                    )
                 trace_predictions(logits[0], ys[0], xs[0], tokenizer, tracer, label=f"step {global_step} last-position")
             batch_grads = model.backward_batch_gpu(cache, dlogits_d.reshape(-1, model.config.vocab_size))
         else:
@@ -722,6 +758,20 @@ def train(args: argparse.Namespace) -> str:
             window_loss_sum = 0.0
             window_steps = 0
             window_start_time = now
+
+        if (
+            val_every > 0
+            and global_step % val_every == 0
+            and global_step not in quarterly_steps
+            and val_dataset is not None
+        ):
+            val_loss, val_ppl = evaluate_val_loss(model, val_dataset, seed=args.seed)
+            if val_loss is not None:
+                print(f"[Val] step={global_step:,} loss={val_loss:.4f} ppl={val_ppl:.4f}")
+                logger.info(
+                    f"[train] step={global_step}/{total_steps} val_loss={val_loss:.4f} "
+                    f"val_ppl={val_ppl:.4f}"
+                )
 
         if is_quarter:
             fraction = milestone_fracs[global_step]

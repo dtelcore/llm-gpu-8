@@ -32,18 +32,20 @@ SCALE_PRESETS: Dict[str, Dict] = {
     },
     'tiny_stories': {
         'name': 'Tiny Stories (real run)',
-        'tagline': 'TinyStories-capable ~1M params',
+        'tagline': 'TinyStories-capable ~3M params (C=256, L=4, T=128)',
         'model_key': 'tiny_stories',
         'dataset': 'tiny_stories',
         'hyperparameters': {
             'name': 'Tiny Stories Run',
-            'learning_rate': 1e-5,
+            'learning_rate': 3e-4,
             'weight_decay': 0.01,
-            'batch_size': 32,
+            'batch_size': 4,
             'num_epochs': 1,
-            'warmup_steps': 100,
+            'warmup_steps': 1000,
             'gradient_clip': 1.0,
             'gradient_accumulation_steps': 4,
+            'window_stride': 64,
+            'min_lr_ratio': 0.1,
             'optimizer': 'adamw',
             'beta1': 0.9,
             'beta2': 0.999,
@@ -97,7 +99,11 @@ def print_scale_preset_menu(vocab_size: int = 110) -> None:
     print(f"  2. Tiny Stories — {SCALE_PRESETS['tiny_stories']['tagline']}")
     print(f"       embed={ts_m['embedding_dim']}  heads={ts_m['num_heads']}  "
           f"layers={ts_m['num_layers']}  seq={ts_m['max_len']}  "
-          f"batch={ts_hp['batch_size']}  ~{ts_n:,} params")
+          f"batch={ts_hp['batch_size']}  accum={ts_hp['gradient_accumulation_steps']}  "
+          f"~{ts_n:,} params")
+    print(f"       LR={ts_hp['learning_rate']}  warmup={ts_hp['warmup_steps']}  "
+          f"cosine min_lr_ratio={ts_hp['min_lr_ratio']}  window_stride={ts_hp['window_stride']}")
+    print(f"       rmsnorm+rope+tied  dropout=0 (unimplemented if >0)")
     print(f"       Dataset: {SCALE_PRESETS['tiny_stories']['dataset']} (data/*.txt)")
     print()
     print("  3. Custom (pick model + hyperparameters separately)")

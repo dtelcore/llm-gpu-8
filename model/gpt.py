@@ -222,6 +222,7 @@ class GPTModel:
 
     def forward_batch(
         self, token_ids_batch: np.ndarray, tracer: TraceContext = None,
+        need_host_logits: bool = True,
     ) -> Tuple[np.ndarray, Dict]:
         """token_ids_batch: [B, T] int. Returns (logits [B, T, V], cache)."""
         cfg = self.config
@@ -317,8 +318,11 @@ class GPTModel:
                 h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
             )
             cache["logits_d"] = logits_d
-            logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
-            cache["logits"] = logits
+            if need_host_logits:
+                logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
+                cache["logits"] = logits
+            else:
+                logits = np.empty((B, T, cfg.vocab_size), dtype=np.float32)
             from model.cuda.fp16_storage import compress_cache_fp16, fp16_storage_enabled
             if fp16_storage_enabled() and not self._grad_checkpoint:
                 compress_cache_fp16(cache)

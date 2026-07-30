@@ -48,13 +48,16 @@ class ModelParameters:
         if not use_rope:
             self.weights["position_embedding"] = self._init("position_embedding", (max_len, C), max_len, C)
 
-        for layer in range(self.config.num_layers):
+        L = self.config.num_layers
+        for layer in range(L):
             prefix = f"layer_{layer}"
 
             self.weights[f"{prefix}.qkv_proj"] = self._init("qkv_proj", (C, 3 * C), C, 3 * C)
             self.biases[f"{prefix}.qkv_bias"] = WeightInitializer.bias_init((3 * C,))
 
-            self.weights[f"{prefix}.attn_out_proj"] = self._init("attention_output_proj", (C, C), C, C)
+            self.weights[f"{prefix}.attn_out_proj"] = self._init(
+                "attention_output_proj", (C, C), C, C, total_layers=L,
+            )
             self.biases[f"{prefix}.attn_out_bias"] = WeightInitializer.bias_init((C,))
 
             gamma1, beta1 = WeightInitializer.layernorm_init((C,))
@@ -70,7 +73,9 @@ class ModelParameters:
             self.weights[f"{prefix}.mlp_expand"] = self._init("mlp_expand", (C, 4 * C), C, 4 * C)
             self.biases[f"{prefix}.mlp_expand_bias"] = WeightInitializer.bias_init((4 * C,))
 
-            self.weights[f"{prefix}.mlp_contract"] = self._init("mlp_contract", (4 * C, C), 4 * C, C)
+            self.weights[f"{prefix}.mlp_contract"] = self._init(
+                "mlp_contract", (4 * C, C), 4 * C, C, total_layers=L,
+            )
             self.biases[f"{prefix}.mlp_contract_bias"] = WeightInitializer.bias_init((C,))
 
         final_gamma, final_beta = WeightInitializer.layernorm_init((C,))
@@ -99,11 +104,20 @@ class ModelParameters:
         "lm_head": "lm_head",
     }
 
-    def _init(self, layer_type: str, shape: Tuple[int, int], fan_in: int, fan_out: int) -> np.ndarray:
+    def _init(
+        self,
+        layer_type: str,
+        shape: Tuple[int, int],
+        fan_in: int,
+        fan_out: int,
+        total_layers: int = 0,
+    ) -> np.ndarray:
         scale = self.scales.get(layer_type)
         if scale is None:
             canonical = self._CANONICAL_TYPE.get(layer_type, layer_type)
-            scale = WeightInitializer.layer_init_scale(canonical, fan_in, fan_out)
+            scale = WeightInitializer.layer_init_scale(
+                canonical, fan_in, fan_out, total_layers=total_layers or self.config.num_layers,
+            )
         return (self._rng.standard_normal(shape) * scale).astype(np.float32)
 
     @property

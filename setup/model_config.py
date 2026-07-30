@@ -42,15 +42,15 @@ PRESETS = {
         'name': 'Tiny Stories Run',
         'vocab_size': None,
         'max_len': 128,
-        'embedding_dim': 128,
+        'embedding_dim': 256,
         'num_heads': 8,
-        'num_layers': 6,
-        'dropout_prob': 0.1,
+        'num_layers': 4,
+        'dropout_prob': 0.0,
         'tie_embeddings': True,
         'norm_type': 'rmsnorm',
         'pos_encoding': 'rope',
         'init_scale': 0.02,
-        'description': 'TinyStories-capable real run. ~1-5M params. batch=32, seq=128.',
+        'description': 'TinyStories-capable real run (BiggerTest-aligned). ~3M params. batch=4, seq=128.',
     },
     'tiny': {
         'name': 'Tiny (Testing)',
@@ -275,7 +275,7 @@ class ModelConfigBuilder:
         
         print("\n[Quick Start] Choose a preset or customize:")
         print("  1. Toy Run (smoke test, ~7k params)")
-        print("  2. Tiny Stories (real run, ~1M params)")
+        print("  2. Tiny Stories (real run, ~3M params, C=256/L=4/T=128)")
         print("  3. Small (development)")
         print("  4. Medium (production)")
         print("  5. Custom (full customization)")

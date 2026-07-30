@@ -60,7 +60,20 @@ def add_training_length_args(parser: argparse.ArgumentParser) -> None:
         "--checkpoint-every", type=int, default=None,
         help="Save a checkpoint every N steps (default: min(1000, batches/epoch); override to tune disk I/O vs crash safety)",
     )
-    group.add_argument("--no-prompt", action="store_true", help="Never prompt for learning_rate/steps/epochs; silently use config/CLI defaults")
+    group.add_argument(
+        "--no-prompt", action="store_true", help="Never prompt for learning_rate/steps/epochs; silently use config/CLI defaults")
+    group.add_argument(
+        "--min-lr-ratio", type=float, default=None,
+        help="Cosine LR floor as a fraction of base learning rate after warmup (default: 0.1)",
+    )
+    group.add_argument(
+        "--window-stride", type=int, default=None,
+        help="Token stride between training windows (default: hyperparameters window_stride or 1)",
+    )
+    group.add_argument(
+        "--val-every", type=int, default=0,
+        help="Lightweight val loss every N steps without quarterly checkpoint I/O (0=off; try 500 for sweeps)",
+    )
 
 
 def prompt_training_length_and_lr(args: argparse.Namespace, hyperparams: Dict) -> None:

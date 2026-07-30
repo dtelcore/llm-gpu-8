@@ -12,10 +12,18 @@ import numpy as np
 
 
 class WindowedDataset:
-    def __init__(self, corpus: List[str], tokenizer, max_len: int, batch_size: int) -> None:
+    def __init__(
+        self,
+        corpus: List[str],
+        tokenizer,
+        max_len: int,
+        batch_size: int,
+        window_stride: int = 1,
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.batch_size = batch_size
+        self.window_stride = max(1, int(window_stride))
 
         joined_text = " ".join(corpus)
         self.tokens = np.array(tokenizer.encode(joined_text), dtype=np.int64)
@@ -27,8 +35,15 @@ class WindowedDataset:
                 f"{max_len + 1} for a single window (max_len={max_len})."
             )
 
-    def num_windows(self) -> int:
+    def num_dense_windows(self) -> int:
+        """Sliding starts with stride=1 (upper bound on unique windows)."""
         return self.total_tokens - self.max_len
+
+    def num_windows(self) -> int:
+        dense = self.num_dense_windows()
+        if dense <= 0:
+            return 0
+        return int(np.arange(0, dense, self.window_stride).size)
 
     def num_batches(self) -> int:
         return max(1, self.num_windows() // self.batch_size)
@@ -36,7 +51,7 @@ class WindowedDataset:
     def iter_batches(self, shuffle: bool = True, rng: np.random.Generator = None) -> Iterator[List[Tuple[np.ndarray, np.ndarray]]]:
         """Yields lists of (x, y) sequence pairs, one list per mini-batch."""
         rng = rng or np.random.default_rng()
-        starts = np.arange(self.num_windows())
+        starts = np.arange(0, self.num_dense_windows(), self.window_stride)
         if shuffle:
             rng.shuffle(starts)
 

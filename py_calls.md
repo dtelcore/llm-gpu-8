@@ -1,6 +1,6 @@
 # py_calls.md — runnable entry points
 
-Activate the project venv first (PyCUDA / sm_35):
+**TinyStories on GT 730:** start with [`guide.md`](guide.md). Activate the project venv first (PyCUDA / sm_35):
 
 ```powershell
 .\venv\Scripts\Activate.ps1
@@ -47,6 +47,9 @@ Shared flag groups live in [`cli_common.py`](cli_common.py) and are referenced b
 | `--steps` | int | `None` | Total steps across all epochs |
 | `--log-every` | int | `100` | Progress line cadence |
 | `--checkpoint-every` | int | `None` | Save every N steps |
+| `--min-lr-ratio` | float | `None` | Cosine LR floor vs base after warmup (default **0.1** in train wiring) |
+| `--window-stride` | int | `None` | Stride between sliding windows (preset **64**; else hyperparams or **1**) |
+| `--val-every` | int | `0` | Val loss every N steps without quarterly I/O (**0**=off) |
 | `--no-prompt` | flag | off | No interactive prompts |
 
 ### Model hyperparameters `(shared: model)`
@@ -68,7 +71,7 @@ Shared flag groups live in [`cli_common.py`](cli_common.py) and are referenced b
 | `--run-budget` | int | `None` (absolute quarterly budget) |
 | `--norm-type` | `layernorm`\|`rmsnorm` | `None` (presets → rmsnorm) |
 | `--pos-encoding` | `learned`\|`rope` | `None` (presets → rope) |
-| `--grad-checkpoint` | flag | off |
+| `--grad-checkpoint` | flag | off | VRAM: recompute attn/MLP in backward (**not** tok/s) |
 | `--no-grad-checkpoint` | flag | off |
 
 ### Generate probes `(shared: probe)`
@@ -116,8 +119,11 @@ python train.py [flags]
 **Examples**
 
 ```powershell
-python train.py --menu --no-prompt
-python train.py --resume --checkpoint output\checkpoints\BiggerTest256256 --steps 19000 --no-prompt --learning-rate 0.00001 --batch-size 4
+# Recommended new TinyStories run (wizard preset 2) — see guide.md
+python train.py --menu
+
+python train.py --resume --checkpoint output\checkpoints\BiggerTest256256 --steps 5000 --no-prompt
+python train.py --resume --checkpoint output\checkpoints\ts_run --val-every 500 --steps 2000 --no-prompt
 python train.py --resume --checkpoint output\checkpoints\BiggerTest256256 --runtime-metrics --memory-timeline --no-prompt --steps 200
 python train.py --generate --models-dir output\checkpoints
 python train.py --compare-quarters --checkpoint output\checkpoints\BiggerTest256256
@@ -399,7 +405,7 @@ Writes `output/releases/<tag>/{runtime,quality,generation,memory}.json`, `parity
 ### `tests/parity/run_parity.py`
 
 ```text
-python -m tests.parity.run_parity
+.\venv\Scripts\python.exe -m tests.parity.run_parity
 ```
 
 No flags. Discovers `tests/parity/test_*.py`. Release gate: **10/10**.
@@ -456,6 +462,7 @@ These are imported by the entry points above; they have no project-facing argpar
 | `tools/stage3_milestones.py` | Stages 3.4–3.7 batch |
 | `tools/reports/evolution_report.py` | HTML evolution report |
 | `tools/releases/make_snapshot.py` | `v0.1.1` release snapshot |
-| `python -m tests.parity.run_parity` | Correctness gate |
+| `python -m tests.parity.run_parity` | Correctness gate (prefer `.\venv\Scripts\python.exe -m tests.parity.run_parity`) |
+| [`guide.md`](guide.md) | GT 730 TinyStories fast start |
 | `setup/training_setup.py` | Setup wizard |
 | `setup/2_test_workspace.py` | CUDA workspace check |

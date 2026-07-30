@@ -592,10 +592,30 @@ def fused_causal_attention_from_qkv(
     M, D = T, HD
     use_rope = rope_base is not None
 
-    # Prefer heads-layout path when RoPE is on (apply before attention).
+    q, k, v = linear_qkv_split(ln1_out_d, w_qkv, bias_qkv, tracer=tracer, name=name)
+
     if _USE_FUSED_ATTENTION_FORWARD or use_rope:
-        qkv = matmul_bias(ln1_out_d, w_qkv, bias_qkv, tracer=tracer, name=name)
-        q_h, k_h, v_h = split_heads_from_qkv(qkv, B, T, NH, HD)
+        q_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+        k_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+        v_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+        n = B * T * NH * HD
+        grid, block = _launch_1d(n)
+        _interleaved_to_heads_kernel(
+            q, q_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+            block=block, grid=grid,
+        )
+        _interleaved_to_heads_kernel(
+            k, k_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+            block=block, grid=grid,
+        )
+        _interleaved_to_heads_kernel(
+            v, v_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+            block=block, grid=grid,
+        )
+        from model.cuda.allocator import lifetime_allocator
+        lifetime_allocator.release(q)
+        lifetime_allocator.release(k)
+        lifetime_allocator.release(v)
         if use_rope:
             rope_apply_inplace(
                 q_h, batch_heads=H, seq_len=T, head_dim=HD,
@@ -616,12 +636,9 @@ def fused_causal_attention_from_qkv(
             np.int32(H), np.int32(M), np.int32(D), np.float32(scale),
             block=(threads, 1, 1), grid=(H, M, 1), shared=shared_bytes,
         )
-        attn_concat = merge_heads(out_h, B, T, NH, HD)  # fresh — cached for backward
+        attn_concat = merge_heads(out_h, B, T, NH, HD)
         return attn_concat, probs.reshape(H * M * M), q_h, k_h, v_h
 
-    # Default: fused gemm+split (no combined [B*T,3*C] buffer) + corrected
-    # causal_mha + head-layout cache for backward.
-    q, k, v = linear_qkv_split(ln1_out_d, w_qkv, bias_qkv, tracer=tracer, name=name)
     attn_concat, probs = causal_self_attention(q, k, v, B, T, NH, HD, scale)
     q_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
     k_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
