@@ -38,7 +38,8 @@ class AdamWGPU:
         self.gradient_clip = gradient_clip
         self.t = 0
 
-        all_keys = list(params.weights.keys()) + list(params.biases.keys())
+        # Exclude tied lm_head view — it aliases token_embedding storage.
+        all_keys = list(params.trainable_param_names())
         self.m: Dict[str, gpuarray.GPUArray] = {}
         self.v: Dict[str, gpuarray.GPUArray] = {}
         for key in all_keys:
@@ -118,9 +119,21 @@ class AdamWGPU:
 
     def sync_host_weights(self, names: Optional[Iterable[str]] = None) -> None:
         """Pull GPU mirrors back to host NumPy dicts (checkpoint save only)."""
-        keys = names if names is not None else list(self.params.weights.keys()) + list(self.params.biases.keys())
+        if names is not None:
+            keys = list(names)
+        else:
+            keys = list(self.params.trainable_param_names())
         for key in keys:
+            if self.params.tie_embeddings and key == "lm_head":
+                continue
             if key in self.params.device_weights:
-                cuda_ops.sync_to_host(self.params.device_weights[key], self.params.weights[key])
+                host = self.params.weights[key]
+                if not host.flags.c_contiguous:
+                    host = np.ascontiguousarray(host)
+                    self.params.weights[key] = host
+                cuda_ops.sync_to_host(self.params.device_weights[key], host)
             elif key in self.params.device_biases:
                 cuda_ops.sync_to_host(self.params.device_biases[key], self.params.biases[key])
+        if self.params.tie_embeddings:
+            self.params.weights["lm_head"] = self.params.weights["token_embedding"].T
+            self.params.device_weights["lm_head"] = self.params.device_weights["token_embedding"].T

@@ -108,6 +108,42 @@ def add_model_hyperparam_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--weight-decay", type=float, default=None, help="Override config weight_decay")
     group.add_argument("--warmup-steps", type=int, default=None, help="Override config warmup_steps")
     group.add_argument("--gradient-clip", type=float, default=None, help="Override config gradient_clip norm")
+    group.add_argument(
+        "--grad-accum", "--gradient-accumulation-steps",
+        dest="gradient_accumulation_steps",
+        type=int, default=None,
+        help="Micro-batches per optimizer step (gradient accumulation). Default: config or 1",
+    )
+    group.add_argument(
+        "--tie-embeddings", action="store_true", default=None,
+        help="Tie token_embedding with lm_head (saves V*C params). Overrides config.",
+    )
+    group.add_argument(
+        "--no-tie-embeddings", action="store_true", default=False,
+        help="Keep separate lm_head weights (legacy). Overrides config.",
+    )
+    group.add_argument(
+        "--run-budget", type=int, default=None,
+        help="Absolute step budget for quarterly 25/50/75/100%% milestones. "
+             "Persisted in state.json so chunked --steps resumes do not rewrite quarter_100. "
+             "Default: this session's total_steps (or prior state.run_budget_steps on resume).",
+    )
+    group.add_argument(
+        "--norm-type", type=str, choices=("layernorm", "rmsnorm"), default=None,
+        help="Normalization: layernorm (legacy) or rmsnorm (scale-only)",
+    )
+    group.add_argument(
+        "--pos-encoding", type=str, choices=("learned", "rope"), default=None,
+        help="Position encoding: learned absolute table or RoPE",
+    )
+    group.add_argument(
+        "--grad-checkpoint", action="store_true", default=None,
+        help="Recompute attention/MLP activations in backward to save VRAM",
+    )
+    group.add_argument(
+        "--no-grad-checkpoint", action="store_true", default=False,
+        help="Disable gradient checkpointing (override config)",
+    )
 
 
 def prompt_model_hyperparams(args: argparse.Namespace, model_config: Dict, hyperparams: Dict) -> None:
@@ -139,10 +175,40 @@ def prompt_model_hyperparams(args: argparse.Namespace, model_config: Dict, hyper
     _ask("max_len", "Max sequence length (context window)", model_config, "max_len", int, model_config.get("max_len", 16))
     _ask("dropout", "Dropout probability", model_config, "dropout_prob", float, model_config.get("dropout_prob", 0.0))
 
+    if getattr(args, "no_tie_embeddings", False):
+        model_config["tie_embeddings"] = False
+    elif getattr(args, "tie_embeddings", None):
+        model_config["tie_embeddings"] = True
+    elif "tie_embeddings" not in model_config:
+        model_config["tie_embeddings"] = True  # new runs default tied
+
+    if getattr(args, "norm_type", None) is not None:
+        model_config["norm_type"] = args.norm_type
+    elif "norm_type" not in model_config:
+        model_config["norm_type"] = "rmsnorm"
+
+    if getattr(args, "pos_encoding", None) is not None:
+        model_config["pos_encoding"] = args.pos_encoding
+    elif "pos_encoding" not in model_config:
+        model_config["pos_encoding"] = "rope"
+
+    if getattr(args, "no_grad_checkpoint", False):
+        model_config["gradient_checkpointing"] = False
+    elif getattr(args, "grad_checkpoint", None):
+        model_config["gradient_checkpointing"] = True
+    elif "gradient_checkpointing" not in model_config:
+        model_config["gradient_checkpointing"] = False
+
     _ask("batch_size", "Batch size", hyperparams, "batch_size", int, hyperparams.get("batch_size", 2))
     _ask("weight_decay", "Weight decay", hyperparams, "weight_decay", float, hyperparams.get("weight_decay", 0.01))
     _ask("warmup_steps", "Warmup steps", hyperparams, "warmup_steps", int, hyperparams.get("warmup_steps", 0))
     _ask("gradient_clip", "Gradient clip norm", hyperparams, "gradient_clip", float, hyperparams.get("gradient_clip", 1.0))
+    _ask(
+        "gradient_accumulation_steps",
+        "Gradient accumulation steps (micro-batches per optimizer step)",
+        hyperparams, "gradient_accumulation_steps", int,
+        hyperparams.get("gradient_accumulation_steps", 1),
+    )
 
 
 def add_checkpoint_arg(parser: argparse.ArgumentParser, default: Optional[str] = None) -> None:

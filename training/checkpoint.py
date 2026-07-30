@@ -36,6 +36,7 @@ def save_checkpoint(
     step: int,
     epoch: int,
     metrics: Optional[Dict] = None,
+    state_extra: Optional[Dict] = None,
 ) -> Path:
     ensure_output_dirs()
     out_dir = _resolve_out_dir(checkpoint_dir)
@@ -70,6 +71,8 @@ def save_checkpoint(
         json.dump(config_to_save, f, indent=2, ensure_ascii=False)
 
     state = {"step": step, "epoch": epoch, "version": __version__}
+    if state_extra:
+        state.update(state_extra)
     with open(out_dir / "state.json", "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 

@@ -195,6 +195,32 @@ def _restore_traces(tracer: TraceContext, snapshot: Dict) -> None:
     tracer.active_step = snapshot["active_step"]
 
 
+def _scale_grads_(grads: Dict, scale: float) -> None:
+    """In-place multiply every grad tensor by scale (GPU or NumPy)."""
+    if scale == 1.0:
+        return
+    for g in grads.values():
+        if hasattr(g, "gpudata"):
+            cuda_ops.scal_mul(g, scale)
+        else:
+            g *= np.float32(scale)
+
+
+def _accumulate_grads_(acc: Optional[Dict], grads: Dict) -> Dict:
+    """Add grads into acc (or adopt grads as the accumulator on the first micro-batch)."""
+    if acc is None:
+        return grads
+    for key, g in grads.items():
+        if key not in acc:
+            acc[key] = g
+            continue
+        if hasattr(acc[key], "gpudata"):
+            cuda_ops.add_inplace(acc[key], g)
+        else:
+            acc[key] += g
+    return acc
+
+
 def generate_test_menu(args: argparse.Namespace) -> None:
     """Interactive checkpoint picker + generation REPL, without touching training at all."""
     import interactive as interactive_cli
@@ -257,6 +283,7 @@ def _handle_quarterly_milestone(
     avg_recent_loss: Optional[float],
     val_dataset: Optional[WindowedDataset],
     do_generate_probe: bool = True,
+    state_extra: Optional[Dict] = None,
 ) -> None:
     """Save latest + quarter_XX, val eval, probe, full-trace generate, quality score."""
     from paths import quarter_name_for_fraction
@@ -286,8 +313,14 @@ def _handle_quarterly_milestone(
         "val_ppl": val_ppl,
     }
 
-    save_checkpoint(str(run_dir), params, tokenizer, config, step=global_step, epoch=epoch, metrics=metrics)
-    save_checkpoint(str(quarter_path), params, tokenizer, config, step=global_step, epoch=epoch, metrics=metrics)
+    save_checkpoint(
+        str(run_dir), params, tokenizer, config,
+        step=global_step, epoch=epoch, metrics=metrics, state_extra=state_extra,
+    )
+    save_checkpoint(
+        str(quarter_path), params, tokenizer, config,
+        step=global_step, epoch=epoch, metrics=metrics, state_extra=state_extra,
+    )
 
     run_probe(str(quarter_path))
 
@@ -353,6 +386,7 @@ def train(args: argparse.Namespace) -> str:
     # also works when called from auto_train.py's smaller argument set.
     resumed = False
     start_step = 0
+    state: Dict = {}
     tokenizer = gpt_config = params = None
     run_dir = run_root_for_checkpoint(args.checkpoint)
 
@@ -411,6 +445,12 @@ def train(args: argparse.Namespace) -> str:
         cli_common.prompt_model_hyperparams(args, config["model"], hyperparams)
         tokenizer, gpt_config = build_tokenizer_and_config(config)
         params = ModelParameters(gpt_config, init_scales=config.get("weight_initialization", {}), seed=args.seed)
+    else:
+        # Resume: allow CLI overrides for grad-accum / tie only when explicitly set.
+        if getattr(args, "gradient_accumulation_steps", None) is not None:
+            hyperparams["gradient_accumulation_steps"] = int(args.gradient_accumulation_steps)
+        if getattr(args, "batch_size", None) is not None:
+            hyperparams["batch_size"] = int(args.batch_size)
 
     # 90/10 val holdout (stable across resume when val_corpus.json is present).
     train_corpus, val_corpus = ensure_train_val_split(config, seed=args.seed)
@@ -420,6 +460,10 @@ def train(args: argparse.Namespace) -> str:
     cli_common.prompt_training_length_and_lr(args, hyperparams)
     if args.learning_rate is not None:
         hyperparams["learning_rate"] = args.learning_rate
+    if getattr(args, "gradient_accumulation_steps", None) is not None:
+        hyperparams["gradient_accumulation_steps"] = int(args.gradient_accumulation_steps)
+    grad_accum = max(1, int(hyperparams.get("gradient_accumulation_steps", 1)))
+    hyperparams["gradient_accumulation_steps"] = grad_accum
 
     optimizer = AdamWGPU(
         params,
@@ -433,6 +477,14 @@ def train(args: argparse.Namespace) -> str:
     )
     if resumed:
         optimizer.t = start_step
+        warn = (
+            "Adam moments (m/v) were NOT restored from disk — buffers start at zero. "
+            "Step counter t=%s was restored so the LR schedule continues, but early "
+            "post-resume loss/grad spikes can look like a failure when they are not. "
+            "This is intentional (weights-only checkpoints to conserve memory)."
+        ) % start_step
+        print(f"WARNING: {warn}")
+        logger.warning(warn)
 
     dataset = WindowedDataset(train_corpus, tokenizer, gpt_config.max_len, hyperparams["batch_size"])
     val_dataset = None
@@ -455,6 +507,23 @@ def train(args: argparse.Namespace) -> str:
     else:
         epochs = args.epochs if args.epochs is not None else hyperparams["num_epochs"]
         total_steps = start_step + epochs * steps_per_epoch
+
+    # Absolute budget for quarterly 25/50/75/100% markers. Prefer CLI, then
+    # persisted state, else this session's total_steps. Never shrink a prior budget.
+    prior_budget = int(state.get("run_budget_steps") or 0) if resumed else 0
+    if getattr(args, "run_budget", None) is not None:
+        run_budget_steps = max(1, int(args.run_budget))
+    elif prior_budget > 0:
+        run_budget_steps = prior_budget
+    else:
+        run_budget_steps = total_steps
+    if prior_budget > 0 and run_budget_steps < prior_budget:
+        logger.warning(
+            "run_budget_steps=%s is below prior budget %s; keeping prior so quarter_* stay stable",
+            run_budget_steps, prior_budget,
+        )
+        run_budget_steps = prior_budget
+    state_extra = {"run_budget_steps": run_budget_steps}
 
     # Default to every 1000 steps (capped by epoch length). Never fall back to
     # steps_per_epoch alone — on TinyStories that is ~26M and silently loses hours of work.
@@ -481,13 +550,21 @@ def train(args: argparse.Namespace) -> str:
         memory_timeline.enable(log_path=str(timeline_path))
         print(f"Memory timeline enabled -> {timeline_path}")
 
-    milestone_fracs = milestone_fraction_map(total_steps)
+    milestone_fracs = milestone_fraction_map(run_budget_steps)
     quarterly_steps = set(milestone_fracs.keys())
     quarterly_done: set[int] = {s for s in quarterly_steps if s <= start_step}
     do_generate_probe = not getattr(args, "no_generate_probe", False)
     if quarterly_steps:
         pending = sorted(quarterly_steps - quarterly_done)
-        print(f"Quarterly milestones at steps: {', '.join(f'{s:,}' for s in sorted(quarterly_steps))}")
+        print(
+            f"Quarterly milestones (budget={run_budget_steps:,} steps): "
+            f"{', '.join(f'{s:,}' for s in sorted(quarterly_steps))}"
+        )
+        if run_budget_steps != total_steps:
+            print(
+                f"  (session total_steps={total_steps:,}; quarters bound to absolute "
+                f"--run-budget / state.run_budget_steps, not this chunk alone)"
+            )
         if quarterly_done:
             print(f"  (skipping already-passed milestones: {', '.join(f'{s:,}' for s in sorted(quarterly_done))})")
         if pending:
@@ -499,11 +576,13 @@ def train(args: argparse.Namespace) -> str:
     print(f"TRAINING v{__version__}: {gpt_config.name} | vocab={gpt_config.vocab_size} | "
           f"params={params.param_count():,} | windows={dataset.num_windows()} | "
           f"batches/epoch={steps_per_epoch} | total_steps={total_steps} | "
+          f"grad_accum={grad_accum} | tie_embeddings={gpt_config.tie_embeddings} | "
           f"checkpoint_every={checkpoint_every} steps | trace_every={tracer.trace_every} steps | "
           f"val_sentences={len(val_corpus)}")
     print("=" * 70)
     logger.info(
         f"Training started: {gpt_config} total_steps={total_steps} start_step={start_step} "
+        f"run_budget_steps={run_budget_steps} grad_accum={grad_accum} "
         f"version={__version__} run_dir={run_dir}"
     )
 
@@ -514,12 +593,22 @@ def train(args: argparse.Namespace) -> str:
     train_start_time = window_start_time
     avg_recent_loss: Optional[float] = None
 
+    accum_grads: Optional[Dict] = None
+    accum_loss_sum = 0.0
+    accum_count = 0
+
     for batch, epoch in _iter_batches_forever(dataset, rng):
         if global_step >= total_steps:
             break
 
         next_step = global_step + 1
-        is_quarter = next_step in quarterly_steps and next_step not in quarterly_done
+        # Only treat as quarter on the optimizer step that lands on the milestone.
+        will_step = (accum_count + 1) >= grad_accum or (global_step + 1) >= total_steps
+        is_quarter = (
+            will_step
+            and next_step in quarterly_steps
+            and next_step not in quarterly_done
+        )
         trace_snapshot = None
         if is_quarter:
             # Force full traces on the training forward for this milestone step.
@@ -546,19 +635,34 @@ def train(args: argparse.Namespace) -> str:
             loss, dlogits = softmax_cross_entropy_batch(logits, ys)
             trace_predictions(logits[0], ys[0], xs[0], tokenizer, tracer, label=f"step {global_step} last-position")
             batch_grads = model.backward_batch(cache, dlogits)
-        batch_loss = loss
+        batch_loss = float(loss)
 
-        global_norm = optimizer.clip_grads_(batch_grads)
-        optimizer.step(batch_grads)
+        accum_grads = _accumulate_grads_(accum_grads, batch_grads)
+        accum_loss_sum += batch_loss
+        accum_count += 1
+
+        if not will_step:
+            continue
+
+        # Mean over micro-batches so effective batch ≈ batch_size * accum_count.
+        _scale_grads_(accum_grads, 1.0 / float(accum_count))
+        mean_loss = accum_loss_sum / float(accum_count)
+
+        global_norm = optimizer.clip_grads_(accum_grads)
+        optimizer.step(accum_grads)
 
         step_time_ms = (time.time() - step_start_time) * 1000.0
 
         global_step += 1
-        window_loss_sum += batch_loss
+        window_loss_sum += mean_loss
         window_steps += 1
 
+        accum_grads = None
+        accum_loss_sum = 0.0
+        accum_count = 0
+
         if tracer.active_step:
-            logger.debug(f"step={global_step} loss={batch_loss:.4f} grad_norm={global_norm:.4f} lr={optimizer.current_lr():.6g}")
+            logger.debug(f"step={global_step} loss={mean_loss:.4f} grad_norm={global_norm:.4f} lr={optimizer.current_lr():.6g}")
 
         if global_step % log_every == 0 or global_step == total_steps:
             now = time.time()
@@ -566,7 +670,9 @@ def train(args: argparse.Namespace) -> str:
             elapsed = now - train_start_time
             avg_recent_loss = window_loss_sum / max(1, window_steps)
             avg_step_ms = (window_elapsed / max(1, window_steps)) * 1000.0
-            tokens_per_sec = (window_steps * hyperparams["batch_size"] * gpt_config.max_len) / max(window_elapsed, 1e-6)
+            tokens_per_sec = (
+                window_steps * hyperparams["batch_size"] * grad_accum * gpt_config.max_len
+            ) / max(window_elapsed, 1e-6)
 
             remaining_steps = max(0, total_steps - global_step)
             eta_seconds = (avg_step_ms / 1000.0) * remaining_steps
@@ -578,6 +684,12 @@ def train(args: argparse.Namespace) -> str:
             metrics_extra = ""
             if want_metrics:
                 tensors = list(params.device_weights.values()) + list(params.device_biases.values())
+                # Exclude tied lm_head view from param_norm (aliases token_embedding).
+                if params.tie_embeddings:
+                    tensors = [
+                        t for k, t in list(params.device_weights.items()) + list(params.device_biases.items())
+                        if k != "lm_head"
+                    ]
                 param_norm = cuda_ops.param_global_norm(tensors)
                 sync_snap = runtime_metrics.snapshot()
                 scratch_peak = memory_timeline.scratch_peak_mb() if want_timeline else (
@@ -602,7 +714,7 @@ def train(args: argparse.Namespace) -> str:
                 f"ppl={perplexity_from_loss(avg_recent_loss):.4f} "
                 f"step_ms={avg_step_ms:.1f} tok_s={tokens_per_sec:.0f} lr={optimizer.current_lr():.6g} "
                 f"device_used_mb={used_mb:.0f} vram_free_mb={free_mb:.0f} "
-                f"elapsed_s={elapsed:.2f} eta_s={eta_seconds:.2f}"
+                f"elapsed_s={elapsed:.2f} eta_s={eta_seconds:.2f} grad_accum={grad_accum}"
                 + metrics_extra
             )
             if want_metrics:
@@ -622,12 +734,13 @@ def train(args: argparse.Namespace) -> str:
                 optimizer=optimizer,
                 run_dir=run_dir,
                 global_step=global_step,
-                total_steps=total_steps,
+                total_steps=run_budget_steps,
                 epoch=epoch,
                 fraction=fraction,
-                avg_recent_loss=avg_recent_loss if avg_recent_loss is not None else float(batch_loss),
+                avg_recent_loss=avg_recent_loss if avg_recent_loss is not None else float(mean_loss),
                 val_dataset=val_dataset,
                 do_generate_probe=do_generate_probe,
+                state_extra=state_extra,
             )
             quarterly_done.add(global_step)
             if trace_snapshot is not None:
@@ -637,12 +750,12 @@ def train(args: argparse.Namespace) -> str:
             metrics = {
                 "step": global_step,
                 "epoch": epoch,
-                "loss": avg_recent_loss if avg_recent_loss is not None else float(batch_loss),
-                "ppl": perplexity_from_loss(avg_recent_loss if avg_recent_loss is not None else float(batch_loss)),
+                "loss": avg_recent_loss if avg_recent_loss is not None else float(mean_loss),
+                "ppl": perplexity_from_loss(avg_recent_loss if avg_recent_loss is not None else float(mean_loss)),
             }
             ckpt_dir = save_checkpoint(
                 str(run_dir), params, tokenizer, config,
-                step=global_step, epoch=epoch, metrics=metrics,
+                step=global_step, epoch=epoch, metrics=metrics, state_extra=state_extra,
             )
             run_probe(str(ckpt_dir))
 

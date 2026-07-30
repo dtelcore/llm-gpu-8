@@ -32,6 +32,9 @@ PRESETS = {
         'num_heads': 2,
         'num_layers': 1,
         'dropout_prob': 0.0,
+        'tie_embeddings': True,
+        'norm_type': 'rmsnorm',
+        'pos_encoding': 'rope',
         'init_scale': 0.02,
         'description': 'Toy smoke test. ~7k params. batch=64, seq=8.',
     },
@@ -43,6 +46,9 @@ PRESETS = {
         'num_heads': 8,
         'num_layers': 6,
         'dropout_prob': 0.1,
+        'tie_embeddings': True,
+        'norm_type': 'rmsnorm',
+        'pos_encoding': 'rope',
         'init_scale': 0.02,
         'description': 'TinyStories-capable real run. ~1-5M params. batch=32, seq=128.',
     },
@@ -54,6 +60,9 @@ PRESETS = {
         'num_heads': 2,
         'num_layers': 1,
         'dropout_prob': 0.0,
+        'tie_embeddings': True,
+        'norm_type': 'rmsnorm',
+        'pos_encoding': 'rope',
         'init_scale': 0.02,
         'description': 'Alias for toy. ~7k parameters.',
     },
@@ -65,6 +74,9 @@ PRESETS = {
         'num_heads': 4,
         'num_layers': 2,
         'dropout_prob': 0.1,
+        'tie_embeddings': True,
+        'norm_type': 'rmsnorm',
+        'pos_encoding': 'rope',
         'init_scale': 0.02,
         'description': 'Small model for development. ~200KB parameters. Batch=2, SeqLen=16.',
     },
@@ -76,6 +88,9 @@ PRESETS = {
         'num_heads': 8,
         'num_layers': 3,
         'dropout_prob': 0.1,
+        'tie_embeddings': True,
+        'norm_type': 'rmsnorm',
+        'pos_encoding': 'rope',
         'init_scale': 0.02,
         'description': 'Medium model for production training. ~1MB parameters. Batch=2, SeqLen=32.',
     },
@@ -149,19 +164,26 @@ def estimate_vram_footprint(config_dict: Dict) -> Dict[str, float]:
     total_params += token_embed
     breakdown['token_embedding'] = token_embed
     
-    # 2. Position embeddings [max_len, C]
-    pos_embed = max_len * C
-    total_params += pos_embed
-    breakdown['position_embedding'] = pos_embed
+    # 2. Position embeddings [max_len, C] (skipped for RoPE)
+    use_rope = str(config_dict.get('pos_encoding', 'learned')).lower() == 'rope'
+    if use_rope:
+        breakdown['position_embedding'] = 0
+    else:
+        pos_embed = max_len * C
+        total_params += pos_embed
+        breakdown['position_embedding'] = pos_embed
     
     # 3. Per transformer block:
-    # - LayerNorm: 2 × (gamma [C] + beta [C]) = 4C per block
+    # - Norm: LayerNorm 4C (2γ+2β) or RMSNorm 2C (2γ) per block
     # - Attention: QKV proj [C, 3C] + output proj [C, C] = 4C² params
     # - MLP: expand [C, 4C] + contract [4C, C] = 8C² params
     # - Biases: 3C (QKV) + C (output) + 4C (expand) + C (contract) = 9C
     
+    use_rmsnorm = str(config_dict.get('norm_type', 'layernorm')).lower() == 'rmsnorm'
+    norm_params = (2 * C) if use_rmsnorm else (4 * C)
+    
     per_block_params = (
-        4 * C +  # Layer norms (2 gammas + 2 betas)
+        norm_params +
         C * (3*C) +  # QKV projection
         C * C +  # Output projection
         C * (4*C) +  # MLP expand
@@ -173,15 +195,23 @@ def estimate_vram_footprint(config_dict: Dict) -> Dict[str, float]:
     total_params += transformer_params
     breakdown['transformer_blocks'] = transformer_params
     
-    # 4. Final layer norm [C] + [C]
-    final_ln = 2 * C
+    # 4. Final layer norm: 2C (LN) or C (RMSNorm)
+    final_ln = C if use_rmsnorm else (2 * C)
     total_params += final_ln
     breakdown['final_layernorm'] = final_ln
     
-    # 5. Output projection [C, vocab_size]
-    output_proj = C * vocab_size
-    total_params += output_proj
-    breakdown['output_projection'] = output_proj
+    # 5. Output projection [C, vocab_size] (skipped when embeddings are tied)
+    tie_embeddings = bool(config_dict.get('tie_embeddings', False))
+    if tie_embeddings:
+        breakdown['output_projection'] = 0
+        breakdown['tied_embeddings'] = True
+    else:
+        output_proj = C * vocab_size
+        total_params += output_proj
+        breakdown['output_projection'] = output_proj
+        breakdown['tied_embeddings'] = False
+    breakdown['norm_type'] = 'rmsnorm' if use_rmsnorm else 'layernorm'
+    breakdown['pos_encoding'] = 'rope' if use_rope else 'learned'
     
     # Convert to bytes (float32 = 4 bytes per param)
     total_bytes = total_params * 4

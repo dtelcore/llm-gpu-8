@@ -61,6 +61,45 @@ def _layernorm_backward(dout: np.ndarray, xhat: np.ndarray, invstd: np.ndarray, 
     return dx, dgamma, dbeta
 
 
+def _rmsnorm_cache(x: np.ndarray, gamma: np.ndarray, eps: float = EPS):
+    """Host RMSNorm: inv_rms = 1/sqrt(mean(x^2)+eps); xhat = x * inv_rms; y = xhat * gamma."""
+    mean_sq = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+    inv_rms = (1.0 / np.sqrt(mean_sq + eps)).astype(np.float32)
+    xhat = (x * inv_rms).astype(np.float32)
+    y = (xhat * gamma).astype(np.float32)
+    return y, xhat, inv_rms.astype(np.float32)
+
+
+def _rmsnorm_backward(dout: np.ndarray, xhat: np.ndarray, inv_rms: np.ndarray, gamma: np.ndarray):
+    """Host RMSNorm VJP. Returns (dx, dgamma); no dbeta."""
+    dxhat = dout * gamma
+    mean_dxhat_xhat = np.mean(dxhat * xhat, axis=-1, keepdims=True)
+    dx = inv_rms * (dxhat - xhat * mean_dxhat_xhat)
+    dgamma = np.sum(dout * xhat, axis=0)
+    return dx.astype(np.float32), dgamma.astype(np.float32)
+
+
+def _rope_np(x: np.ndarray, base: float = 10000.0, pos_offset: int = 0, backward: bool = False) -> np.ndarray:
+    """RoPE on [..., T, HD] or [BH, T, HD]. HD even. Returns a copy."""
+    out = np.array(x, dtype=np.float32, copy=True)
+    *lead, T, HD = out.shape
+    assert HD % 2 == 0
+    pairs = HD // 2
+    sign = -1.0 if backward else 1.0
+    freqs = base ** (-2.0 * np.arange(pairs, dtype=np.float64) / HD)
+    pos = (np.arange(T, dtype=np.float64) + pos_offset)[:, None]  # [T, 1]
+    angles = sign * pos * freqs[None, :]  # [T, pairs]
+    c = np.cos(angles).astype(np.float32)
+    s = np.sin(angles).astype(np.float32)
+    flat = out.reshape(-1, T, HD)
+    for b in range(flat.shape[0]):
+        x0 = flat[b, :, 0::2].copy()
+        x1 = flat[b, :, 1::2].copy()
+        flat[b, :, 0::2] = x0 * c - x1 * s
+        flat[b, :, 1::2] = x0 * s + x1 * c
+    return out
+
+
 def _qkv_to_heads(qkv: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int):
     """qkv [B*T, 3C] -> q_h,k_h,v_h each [B, H, T, hd]."""
     c = num_heads * head_dim
@@ -138,6 +177,45 @@ class GPTModel:
         self.config = config
         self.params = params
 
+    @property
+    def _use_rmsnorm(self) -> bool:
+        return bool(getattr(self.config, "use_rmsnorm", False))
+
+    @property
+    def _use_rope(self) -> bool:
+        return bool(getattr(self.config, "use_rope", False))
+
+    @property
+    def _grad_checkpoint(self) -> bool:
+        return bool(getattr(self.config, "gradient_checkpointing", False))
+
+    def _norm_with_cache_gpu(self, h_d, gamma_d, beta_d=None):
+        if self._use_rmsnorm:
+            return cuda_ops.rmsnorm_with_cache(h_d, gamma_d)
+        return cuda_ops.layernorm_with_cache(h_d, gamma_d, beta_d)
+
+    def _residual_norm_with_cache_gpu(self, h_d, residual_d, gamma_d, beta_d=None):
+        if self._use_rmsnorm:
+            return cuda_ops.residual_rmsnorm_with_cache(h_d, residual_d, gamma_d)
+        return cuda_ops.residual_layernorm_with_cache(h_d, residual_d, gamma_d, beta_d)
+
+    def _norm_backward_gpu(self, dout, xhat, inv, gamma_d):
+        if self._use_rmsnorm:
+            dx, dg = cuda_ops.rmsnorm_backward(dout, xhat, inv, gamma_d)
+            return dx, dg, None
+        return cuda_ops.layernorm_backward(dout, xhat, inv, gamma_d)
+
+    def _norm_cache_host(self, x, gamma, beta=None):
+        if self._use_rmsnorm:
+            return _rmsnorm_cache(x, gamma)
+        return _layernorm_cache(x, gamma, beta)
+
+    def _norm_backward_host(self, dout, xhat, inv, gamma):
+        if self._use_rmsnorm:
+            dx, dg = _rmsnorm_backward(dout, xhat, inv, gamma)
+            return dx, dg, None
+        return _layernorm_backward(dout, xhat, inv, gamma)
+
     # ------------------------------------------------------------------
     # Forward (batched)
     # ------------------------------------------------------------------
@@ -161,13 +239,21 @@ class GPTModel:
 
         cache: Dict = {
             "ids": token_ids_batch, "B": B, "T": T, "batched": True, "gpu": _GPU_TRAINING,
+            "use_rmsnorm": self._use_rmsnorm,
+            "use_rope": self._use_rope,
+            "grad_checkpoint": self._grad_checkpoint,
         }
 
         if _GPU_TRAINING:
-            h_d = cuda_ops.embedding_lookup(
-                token_ids_batch.astype(np.int32),
-                dw["token_embedding"], dw["position_embedding"], T,
-            )
+            if self._use_rope:
+                h_d = cuda_ops.embedding_lookup_tokens(
+                    token_ids_batch.astype(np.int32), dw["token_embedding"], T,
+                )
+            else:
+                h_d = cuda_ops.embedding_lookup(
+                    token_ids_batch.astype(np.int32),
+                    dw["token_embedding"], dw["position_embedding"], T,
+                )
             cache["layers"] = []
             pending_ln1 = None
 
@@ -176,8 +262,9 @@ class GPTModel:
                 layer_cache: Dict = {"B": B, "T": T, "gpu": True}
 
                 if pending_ln1 is None:
-                    ln1_out_d, ln1_xhat_d, ln1_invstd_d = cuda_ops.layernorm_with_cache(
-                        h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"],
+                    beta1 = None if self._use_rmsnorm else db[f"{prefix}.ln1_beta"]
+                    ln1_out_d, ln1_xhat_d, ln1_invstd_d = self._norm_with_cache_gpu(
+                        h_d, dw[f"{prefix}.ln1_gamma"], beta1,
                     )
                 else:
                     ln1_out_d, ln1_xhat_d, ln1_invstd_d = pending_ln1
@@ -191,8 +278,9 @@ class GPTModel:
                 )
                 layer_cache["attn"] = attn_cache
 
-                h_d, ln2_out_d, ln2_xhat_d, ln2_invstd_d = cuda_ops.residual_layernorm_with_cache(
-                    h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"],
+                beta2 = None if self._use_rmsnorm else db[f"{prefix}.ln2_beta"]
+                h_d, ln2_out_d, ln2_xhat_d, ln2_invstd_d = self._residual_norm_with_cache_gpu(
+                    h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], beta2,
                 )
                 layer_cache["ln2_out_d"] = ln2_out_d
                 layer_cache["ln2_xhat_d"] = ln2_xhat_d
@@ -205,14 +293,15 @@ class GPTModel:
 
                 if layer + 1 < cfg.num_layers:
                     next_prefix = f"layer_{layer + 1}"
-                    h_d, ln1_n, xhat_n, inv_n = cuda_ops.residual_layernorm_with_cache(
-                        h_d, mlp_out_d,
-                        dw[f"{next_prefix}.ln1_gamma"], db[f"{next_prefix}.ln1_beta"],
+                    nbeta = None if self._use_rmsnorm else db[f"{next_prefix}.ln1_beta"]
+                    h_d, ln1_n, xhat_n, inv_n = self._residual_norm_with_cache_gpu(
+                        h_d, mlp_out_d, dw[f"{next_prefix}.ln1_gamma"], nbeta,
                     )
                     pending_ln1 = (ln1_n, xhat_n, inv_n)
                 else:
-                    h_d, h_final_d, final_xhat_d, final_invstd_d = cuda_ops.residual_layernorm_with_cache(
-                        h_d, mlp_out_d, dw["final_ln_gamma"], db["final_ln_beta"],
+                    fbeta = None if self._use_rmsnorm else db["final_ln_beta"]
+                    h_d, h_final_d, final_xhat_d, final_invstd_d = self._residual_norm_with_cache_gpu(
+                        h_d, mlp_out_d, dw["final_ln_gamma"], fbeta,
                     )
 
                 if tracer is not None and tracer.trace_neurons and tracer.active_step:
@@ -231,13 +320,16 @@ class GPTModel:
             logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
             cache["logits"] = logits
             from model.cuda.fp16_storage import compress_cache_fp16, fp16_storage_enabled
-            if fp16_storage_enabled():
+            if fp16_storage_enabled() and not self._grad_checkpoint:
                 compress_cache_fp16(cache)
             return logits, cache
 
         tok_emb = w["token_embedding"][token_ids_batch]  # [B, T, C]
-        pos_emb = w["position_embedding"][:T]  # [T, C]
-        x0 = (tok_emb + pos_emb).astype(np.float32).reshape(B * T, cfg.embedding_dim)
+        if self._use_rope:
+            x0 = tok_emb.astype(np.float32).reshape(B * T, cfg.embedding_dim)
+        else:
+            pos_emb = w["position_embedding"][:T]  # [T, C]
+            x0 = (tok_emb + pos_emb).astype(np.float32).reshape(B * T, cfg.embedding_dim)
 
         cache["x0"] = x0
         cache["layers"] = []
@@ -248,12 +340,18 @@ class GPTModel:
             layer_cache: Dict = {"B": B, "T": T}
 
             ln1_in = cuda_ops.to_host(h_d)
-            ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"] = _layernorm_cache(
-                ln1_in, w[f"{prefix}.ln1_gamma"], b[f"{prefix}.ln1_beta"],
+            beta1 = None if self._use_rmsnorm else b[f"{prefix}.ln1_beta"]
+            ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"] = self._norm_cache_host(
+                ln1_in, w[f"{prefix}.ln1_gamma"], beta1,
             )
             layer_cache["ln1_in"] = ln1_in
 
-            ln1_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"])
+            if self._use_rmsnorm:
+                ln1_out_d = cuda_ops.rmsnorm_with_cache(
+                    h_d, dw[f"{prefix}.ln1_gamma"],
+                )[0]
+            else:
+                ln1_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"])
             attn_out_d, attn_cache = self._attention_forward_batch(
                 ln1_out_d, ln1_out, prefix, B, T, H, hd, scale, tracer=tracer,
             )
@@ -261,12 +359,16 @@ class GPTModel:
             h_d = layers.add_residual(h_d, attn_out_d)
 
             ln2_in = cuda_ops.to_host(h_d)
-            ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"] = _layernorm_cache(
-                ln2_in, w[f"{prefix}.ln2_gamma"], b[f"{prefix}.ln2_beta"],
+            beta2 = None if self._use_rmsnorm else b[f"{prefix}.ln2_beta"]
+            ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"] = self._norm_cache_host(
+                ln2_in, w[f"{prefix}.ln2_gamma"], beta2,
             )
             layer_cache["ln2_in"] = ln2_in
 
-            ln2_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"])
+            if self._use_rmsnorm:
+                ln2_out_d = cuda_ops.rmsnorm_with_cache(h_d, dw[f"{prefix}.ln2_gamma"])[0]
+            else:
+                ln2_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"])
             mlp_out_d, mlp_cache = self._mlp_forward_batch(ln2_out_d, ln2_out, prefix, tracer=tracer)
             layer_cache["mlp"] = mlp_cache
             h_d = layers.add_residual(h_d, mlp_out_d)
@@ -277,11 +379,15 @@ class GPTModel:
             cache["layers"].append(layer_cache)
 
         cache["h_pre_final_ln"] = cuda_ops.to_host(h_d)
-        cache["h_final"], cache["final_xhat"], cache["final_invstd"] = _layernorm_cache(
-            cache["h_pre_final_ln"], w["final_ln_gamma"], b["final_ln_beta"],
+        fbeta = None if self._use_rmsnorm else b["final_ln_beta"]
+        cache["h_final"], cache["final_xhat"], cache["final_invstd"] = self._norm_cache_host(
+            cache["h_pre_final_ln"], w["final_ln_gamma"], fbeta,
         )
 
-        h_final_d = layers.layernorm(h_d, dw["final_ln_gamma"], db["final_ln_beta"])
+        if self._use_rmsnorm:
+            h_final_d = cuda_ops.rmsnorm_with_cache(h_d, dw["final_ln_gamma"])[0]
+        else:
+            h_final_d = layers.layernorm(h_d, dw["final_ln_gamma"], db["final_ln_beta"])
         logits_d = layers.linear(h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head")
         logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
         cache["logits"] = logits
@@ -301,23 +407,35 @@ class GPTModel:
     def _attention_forward_batch(
         self, ln1_out_d, ln1_out_host: np.ndarray, prefix: str,
         B: int, T: int, H: int, hd: int, scale: float, tracer: TraceContext = None,
+        pos_offset: int = 0,
     ):
         dw, db = self.params.device_weights, self.params.device_biases
+        rope_base = float(self.config.rope_base) if self._use_rope else None
 
         if _USE_GPU_ATTENTION:
             attn_concat_d, probs_d, q_h, k_h, v_h = cuda_ops.fused_causal_attention_from_qkv(
                 ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
                 B, T, H, hd, scale, tracer=tracer, name=f"{prefix}.qkv",
+                rope_base=rope_base, pos_offset=pos_offset,
             )
             attn_out_d = layers.linear(
                 attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
                 tracer=tracer, name=f"{prefix}.attn_out",
             )
             attn_cache = {
-                "ln1_out_d": ln1_out_d, "q_d": q_h, "k_d": k_h, "v_d": v_h,
-                "probs_d": probs_d, "attn_concat_d": attn_concat_d,
+                "ln1_out_d": ln1_out_d,
+                "k_d": k_h, "v_d": v_h,  # always keep for KV generate / rope decode
                 "scale": scale, "B": B, "T": T, "gpu": True, "heads_layout": True,
+                "use_rope": self._use_rope, "rope_base": rope_base, "pos_offset": pos_offset,
             }
+            if self._grad_checkpoint:
+                # Drop Q / probs / concat (largest); recompute in backward. Keep K/V for generate.
+                attn_cache["checkpoint"] = True
+            else:
+                attn_cache.update({
+                    "q_d": q_h,
+                    "probs_d": probs_d, "attn_concat_d": attn_concat_d,
+                })
         else:
             qkv_d = layers.linear(
                 ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
@@ -327,6 +445,11 @@ class GPTModel:
             attn_concat, probs_h, q_h, k_h, v_h = _batched_attention_host(
                 qkv, B, T, H, hd, scale,
             )
+            if self._use_rope:
+                q_h = _rope_np(q_h.reshape(B * H, T, hd), base=float(self.config.rope_base), pos_offset=pos_offset)
+                k_h = _rope_np(k_h.reshape(B * H, T, hd), base=float(self.config.rope_base), pos_offset=pos_offset)
+                q_h = q_h.reshape(B, H, T, hd)
+                k_h = k_h.reshape(B, H, T, hd)
             attn_concat_d = cuda_ops.to_device(attn_concat)
             attn_out_d = layers.linear(
                 attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
@@ -360,9 +483,12 @@ class GPTModel:
             tracer.dump_neurons(f"{prefix}.mlp_out", cuda_ops.to_host(mlp_out_d))
 
         if _GPU_TRAINING and ln2_out_host is None:
-            mlp_cache = {
-                "ln2_out_d": ln2_out_d, "hidden_d": hidden_d, "act_d": act_d, "gpu": True,
-            }
+            mlp_cache = {"ln2_out_d": ln2_out_d, "gpu": True}
+            if self._grad_checkpoint:
+                mlp_cache["checkpoint"] = True
+            else:
+                mlp_cache["hidden_d"] = hidden_d
+                mlp_cache["act_d"] = act_d
         else:
             mlp_cache = {
                 "ln2_out": ln2_out_host,
@@ -389,7 +515,6 @@ class GPTModel:
 
     def backward_batch_gpu(self, cache: Dict, dlogits_d) -> Dict:
         """Full backward on GPU. dlogits_d: [B*T, V] device array."""
-        import pycuda.gpuarray as gpuarray
         from model.cuda.fp16_storage import expand_cache_fp32
 
         expand_cache_fp32(cache)
@@ -406,14 +531,14 @@ class GPTModel:
         d_h, d_lm_head, d_lm_bias = cuda_ops.linear_backward(
             dlogits_d, cache["h_final_d"], dw["lm_head"],
         )
-        grads["lm_head"] = d_lm_head
         grads["lm_head_bias"] = d_lm_bias
 
-        d_h, d_final_gamma, d_final_beta = cuda_ops.layernorm_backward(
+        d_h, d_final_gamma, d_final_beta = self._norm_backward_gpu(
             d_h, cache["final_xhat_d"], cache["final_invstd_d"], dw["final_ln_gamma"],
         )
         grads["final_ln_gamma"] = d_final_gamma
-        grads["final_ln_beta"] = d_final_beta
+        if d_final_beta is not None:
+            grads["final_ln_beta"] = d_final_beta
 
         for layer in reversed(range(cfg.num_layers)):
             prefix = f"layer_{layer}"
@@ -425,12 +550,13 @@ class GPTModel:
             d_ln2_out, mlp_grads = self._mlp_backward_gpu(d_mlp_out, layer_cache["mlp"], prefix, dw)
             grads.update(mlp_grads)
 
-            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = cuda_ops.layernorm_backward(
+            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = self._norm_backward_gpu(
                 d_ln2_out, layer_cache["ln2_xhat_d"], layer_cache["ln2_invstd_d"],
                 dw[f"{prefix}.ln2_gamma"],
             )
             grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
-            grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+            if d_ln2_beta is not None:
+                grads[f"{prefix}.ln2_beta"] = d_ln2_beta
 
             d_h = cuda_ops.add_into(d_resid1, d_h_from_ln2)
 
@@ -442,26 +568,42 @@ class GPTModel:
             )
             grads.update(attn_grads)
 
-            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = cuda_ops.layernorm_backward(
+            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = self._norm_backward_gpu(
                 d_ln1_out, layer_cache["ln1_xhat_d"], layer_cache["ln1_invstd_d"],
                 dw[f"{prefix}.ln1_gamma"],
             )
             grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
-            grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+            if d_ln1_beta is not None:
+                grads[f"{prefix}.ln1_beta"] = d_ln1_beta
 
             d_h = cuda_ops.add_into(d_resid0, d_h_from_ln1)
 
         d_tok, d_pos = cuda_ops.embed_backward(
             cache["ids"].astype(np.int32), d_h, cfg.vocab_size, C,
+            with_position=not self._use_rope,
         )
-        grads["token_embedding"] = d_tok
-        grads["position_embedding"] = d_pos
+        if self.params.tie_embeddings:
+            d_tok_from_head = cuda_ops.transpose_2d(d_lm_head, name="tied_lm_head_dT")
+            cuda_ops.add_inplace(d_tok, d_tok_from_head)
+            grads["token_embedding"] = d_tok
+        else:
+            grads["lm_head"] = d_lm_head
+            grads["token_embedding"] = d_tok
+        if d_pos is not None:
+            grads["position_embedding"] = d_pos
         return grads
 
     def _mlp_backward_gpu(self, d_mlp_out, mlp_cache: Dict, prefix: str, dw: Dict):
-        act_d = mlp_cache["act_d"]
-        hidden_d = mlp_cache["hidden_d"]
+        db = self.params.device_biases
         ln2_out_d = mlp_cache["ln2_out_d"]
+        if mlp_cache.get("checkpoint") or "act_d" not in mlp_cache:
+            hidden_d, act_d = cuda_ops.matmul_bias_gelu(
+                ln2_out_d, dw[f"{prefix}.mlp_expand"], db[f"{prefix}.mlp_expand_bias"],
+                name=f"{prefix}.mlp_expand_recompute",
+            )
+        else:
+            act_d = mlp_cache["act_d"]
+            hidden_d = mlp_cache["hidden_d"]
 
         d_act, d_contract, d_contract_b = cuda_ops.linear_backward(
             d_mlp_out, act_d, dw[f"{prefix}.mlp_contract"],
@@ -484,9 +626,22 @@ class GPTModel:
         C = H * hd
         scale = attn_cache["scale"]
         ln1_out_d = attn_cache["ln1_out_d"]
-        q_d, k_d, v_d = attn_cache["q_d"], attn_cache["k_d"], attn_cache["v_d"]
-        probs_d = attn_cache["probs_d"]
-        attn_concat_d = attn_cache["attn_concat_d"]
+        db = self.params.device_biases
+
+        if attn_cache.get("checkpoint") or "probs_d" not in attn_cache:
+            rope_base = attn_cache.get("rope_base")
+            pos_offset = int(attn_cache.get("pos_offset", 0))
+            attn_concat_d, probs_d, q_d, k_d, v_d = cuda_ops.fused_causal_attention_from_qkv(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                B, T, H, hd, scale, name=f"{prefix}.qkv_recompute",
+                rope_base=rope_base, pos_offset=pos_offset,
+            )
+            heads_layout = True
+        else:
+            q_d, k_d, v_d = attn_cache["q_d"], attn_cache["k_d"], attn_cache["v_d"]
+            probs_d = attn_cache["probs_d"]
+            attn_concat_d = attn_cache["attn_concat_d"]
+            heads_layout = bool(attn_cache.get("heads_layout"))
 
         d_attn_out_flat = d_attn_out.reshape(B * T, C)
         d_attn_concat, d_out_proj, d_out_bias = cuda_ops.linear_backward(
@@ -496,9 +651,20 @@ class GPTModel:
         d_q, d_k, d_v = cuda_ops.attention_backward_heads(
             d_attn_concat, q_d, k_d, v_d, probs_d,
             B, T, H, hd, scale,
-            heads_layout=bool(attn_cache.get("heads_layout")),
+            heads_layout=heads_layout,
         )
-        if attn_cache.get("heads_layout"):
+        if attn_cache.get("use_rope") and heads_layout:
+            rope_base = float(attn_cache.get("rope_base") or self.config.rope_base)
+            pos_offset = int(attn_cache.get("pos_offset", 0))
+            cuda_ops.rope_apply_inplace(
+                d_q, batch_heads=B * H, seq_len=T, head_dim=hd,
+                base=rope_base, pos_offset=pos_offset, backward=True,
+            )
+            cuda_ops.rope_apply_inplace(
+                d_k, batch_heads=B * H, seq_len=T, head_dim=hd,
+                base=rope_base, pos_offset=pos_offset, backward=True,
+            )
+        if heads_layout:
             d_qkv = cuda_ops.pack_qkv_from_heads(d_q, d_k, d_v, B, T, H, hd)
         else:
             d_qkv = cuda_ops.pack_qkv(d_q, d_k, d_v)
@@ -530,14 +696,16 @@ class GPTModel:
         d_lm_head = h_final.T @ dlogits_flat
         d_lm_head_bias = np.sum(dlogits_flat, axis=0)
         d_h_final = dlogits_flat @ w["lm_head"].T
-        grads["lm_head"] = d_lm_head
         grads["lm_head_bias"] = d_lm_head_bias
+        if not self.params.tie_embeddings:
+            grads["lm_head"] = d_lm_head
 
-        d_h, d_final_gamma, d_final_beta = _layernorm_backward(
+        d_h, d_final_gamma, d_final_beta = self._norm_backward_host(
             d_h_final, cache["final_xhat"], cache["final_invstd"], w["final_ln_gamma"],
         )
         grads["final_ln_gamma"] = d_final_gamma
-        grads["final_ln_beta"] = d_final_beta
+        if d_final_beta is not None:
+            grads["final_ln_beta"] = d_final_beta
 
         for layer in reversed(range(cfg.num_layers)):
             prefix = f"layer_{layer}"
@@ -549,11 +717,12 @@ class GPTModel:
             d_ln2_out, d_mlp_grads = self._mlp_backward(d_mlp_out, layer_cache["mlp"], prefix, w)
             grads.update(d_mlp_grads)
 
-            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = _layernorm_backward(
+            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = self._norm_backward_host(
                 d_ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"], w[f"{prefix}.ln2_gamma"],
             )
             grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
-            grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+            if d_ln2_beta is not None:
+                grads[f"{prefix}.ln2_beta"] = d_ln2_beta
 
             d_h = d_resid1 + d_h_from_ln2
 
@@ -565,23 +734,27 @@ class GPTModel:
             )
             grads.update(d_attn_grads)
 
-            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = _layernorm_backward(
+            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = self._norm_backward_host(
                 d_ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"], w[f"{prefix}.ln1_gamma"],
             )
             grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
-            grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+            if d_ln1_beta is not None:
+                grads[f"{prefix}.ln1_beta"] = d_ln1_beta
 
             d_h = d_resid0 + d_h_from_ln1
 
         d_h = d_h.reshape(B, T, C)
         d_token_embedding = np.zeros_like(w["token_embedding"])
-        d_position_embedding = np.zeros_like(w["position_embedding"])
         for b in range(B):
             np.add.at(d_token_embedding, cache["ids"][b], d_h[b])
-            d_position_embedding[:T] += d_h[b]
-
+        if self.params.tie_embeddings:
+            d_token_embedding = d_token_embedding + d_lm_head.T
         grads["token_embedding"] = d_token_embedding
-        grads["position_embedding"] = d_position_embedding
+        if not self._use_rope and "position_embedding" in w:
+            d_position_embedding = np.zeros_like(w["position_embedding"])
+            for b in range(B):
+                d_position_embedding[:T] += d_h[b]
+            grads["position_embedding"] = d_position_embedding
         return grads
 
     def _attention_backward_batch(self, d_attn_out: np.ndarray, attn_cache: Dict, prefix: str, w: Dict):
@@ -645,14 +818,16 @@ class GPTModel:
         d_lm_head = h_final.T @ dlogits
         d_lm_head_bias = np.sum(dlogits, axis=0)
         d_h_final = dlogits @ w["lm_head"].T
-        grads["lm_head"] = d_lm_head
         grads["lm_head_bias"] = d_lm_head_bias
+        if not self.params.tie_embeddings:
+            grads["lm_head"] = d_lm_head
 
-        d_h, d_final_gamma, d_final_beta = _layernorm_backward(
+        d_h, d_final_gamma, d_final_beta = self._norm_backward_host(
             d_h_final, cache["final_xhat"], cache["final_invstd"], w["final_ln_gamma"],
         )
         grads["final_ln_gamma"] = d_final_gamma
-        grads["final_ln_beta"] = d_final_beta
+        if d_final_beta is not None:
+            grads["final_ln_beta"] = d_final_beta
 
         for layer in reversed(range(cfg.num_layers)):
             prefix = f"layer_{layer}"
@@ -664,11 +839,12 @@ class GPTModel:
             d_ln2_out, d_mlp_grads = self._mlp_backward(d_mlp_out, layer_cache["mlp"], prefix, w)
             grads.update(d_mlp_grads)
 
-            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = _layernorm_backward(
+            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = self._norm_backward_host(
                 d_ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"], w[f"{prefix}.ln2_gamma"],
             )
             grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
-            grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+            if d_ln2_beta is not None:
+                grads[f"{prefix}.ln2_beta"] = d_ln2_beta
 
             d_h = d_resid1 + d_h_from_ln2
 
@@ -678,22 +854,26 @@ class GPTModel:
             d_ln1_out, d_attn_grads = self._attention_backward(d_attn_out, layer_cache["attn"], prefix, w)
             grads.update(d_attn_grads)
 
-            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = _layernorm_backward(
+            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = self._norm_backward_host(
                 d_ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"], w[f"{prefix}.ln1_gamma"],
             )
             grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
-            grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+            if d_ln1_beta is not None:
+                grads[f"{prefix}.ln1_beta"] = d_ln1_beta
 
             d_h = d_resid0 + d_h_from_ln1
 
         T = len(cache["ids"])
         d_token_embedding = np.zeros_like(w["token_embedding"])
         np.add.at(d_token_embedding, cache["ids"], d_h)
-        d_position_embedding = np.zeros_like(w["position_embedding"])
-        d_position_embedding[:T] += d_h
 
+        if self.params.tie_embeddings:
+            d_token_embedding = d_token_embedding + d_lm_head.T
         grads["token_embedding"] = d_token_embedding
-        grads["position_embedding"] = d_position_embedding
+        if not self._use_rope and "position_embedding" in w:
+            d_position_embedding = np.zeros_like(w["position_embedding"])
+            d_position_embedding[:T] += d_h
+            grads["position_embedding"] = d_position_embedding
         return grads
 
     def _mlp_backward(self, d_mlp_out: np.ndarray, mlp_cache: Dict, prefix: str, w: Dict):
@@ -878,8 +1058,11 @@ class GPTModel:
             raise ValueError("KV decode position exceeds max_len; caller should re-prefill")
 
         tok_emb = cuda_ops.to_host(dw["token_embedding"])
-        pos_emb = cuda_ops.to_host(dw["position_embedding"])
-        h = (tok_emb[int(token_id)] + pos_emb[pos]).astype(np.float32).reshape(1, cfg.embedding_dim)
+        if self._use_rope:
+            h = tok_emb[int(token_id)].astype(np.float32).reshape(1, cfg.embedding_dim)
+        else:
+            pos_emb = cuda_ops.to_host(dw["position_embedding"])
+            h = (tok_emb[int(token_id)] + pos_emb[pos]).astype(np.float32).reshape(1, cfg.embedding_dim)
         h_d = cuda_ops.to_device(h)
 
         new_layers = []
@@ -890,8 +1073,9 @@ class GPTModel:
             past = kv_state["layers"][layer]
 
             if pending_ln1 is None:
-                ln1_out_d, _, _ = cuda_ops.layernorm_with_cache(
-                    h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"],
+                beta1 = None if self._use_rmsnorm else db[f"{prefix}.ln1_beta"]
+                ln1_out_d, _, _ = self._norm_with_cache_gpu(
+                    h_d, dw[f"{prefix}.ln1_gamma"], beta1,
                 )
             else:
                 ln1_out_d = pending_ln1
@@ -905,6 +1089,11 @@ class GPTModel:
             k_new = _interleaved_to_heads_host(cuda_ops.to_host(k_i), 1, 1, H, hd)
             v_new = _interleaved_to_heads_host(cuda_ops.to_host(v_i), 1, 1, H, hd)
 
+            if self._use_rope:
+                # Rotate new token at absolute position `pos`; past K already rotated.
+                q_h = _rope_np(q_h.reshape(H, 1, hd), base=float(cfg.rope_base), pos_offset=pos).reshape(1, H, 1, hd)
+                k_new = _rope_np(k_new.reshape(H, 1, hd), base=float(cfg.rope_base), pos_offset=pos).reshape(1, H, 1, hd)
+
             k_all = np.concatenate([past["k"], k_new], axis=1)
             v_all = np.concatenate([past["v"], v_new], axis=1)
             attn_heads = _causal_attention_decode_host(q_h, k_all, v_all, scale)
@@ -914,21 +1103,23 @@ class GPTModel:
                 tracer=tracer, name=f"{prefix}.attn_out",
             )
 
-            h_d, ln2_out_d, _, _ = cuda_ops.residual_layernorm_with_cache(
-                h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"],
+            beta2 = None if self._use_rmsnorm else db[f"{prefix}.ln2_beta"]
+            h_d, ln2_out_d, _, _ = self._residual_norm_with_cache_gpu(
+                h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], beta2,
             )
             mlp_out_d, _ = self._mlp_forward_batch(ln2_out_d, None, prefix, tracer=tracer)
 
             if layer + 1 < cfg.num_layers:
                 next_prefix = f"layer_{layer + 1}"
-                h_d, ln1_n, _, _ = cuda_ops.residual_layernorm_with_cache(
-                    h_d, mlp_out_d,
-                    dw[f"{next_prefix}.ln1_gamma"], db[f"{next_prefix}.ln1_beta"],
+                nbeta = None if self._use_rmsnorm else db[f"{next_prefix}.ln1_beta"]
+                h_d, ln1_n, _, _ = self._residual_norm_with_cache_gpu(
+                    h_d, mlp_out_d, dw[f"{next_prefix}.ln1_gamma"], nbeta,
                 )
                 pending_ln1 = ln1_n
             else:
-                h_d, h_final_d, _, _ = cuda_ops.residual_layernorm_with_cache(
-                    h_d, mlp_out_d, dw["final_ln_gamma"], db["final_ln_beta"],
+                fbeta = None if self._use_rmsnorm else db["final_ln_beta"]
+                h_d, h_final_d, _, _ = self._residual_norm_with_cache_gpu(
+                    h_d, mlp_out_d, dw["final_ln_gamma"], fbeta,
                 )
 
             if tracer is not None and tracer.trace_neurons and tracer.active_step:

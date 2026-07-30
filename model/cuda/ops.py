@@ -38,9 +38,15 @@ _cross_entropy_kernel = _mod.get_function("cross_entropy_fp32")
 _gelu_backward_kernel = _mod.get_function("gelu_backward_fp32")
 _layernorm_cache_kernel = _mod.get_function("layernorm_cache_fp32")
 _layernorm_backward_kernel = _mod.get_function("layernorm_backward_fp32")
+_rmsnorm_kernel = _mod.get_function("rmsnorm_fp32")
+_rmsnorm_cache_kernel = _mod.get_function("rmsnorm_cache_fp32")
+_residual_rmsnorm_cache_kernel = _mod.get_function("residual_rmsnorm_cache_fp32")
+_rmsnorm_backward_kernel = _mod.get_function("rmsnorm_backward_fp32")
 _embed_backward_kernel = _mod.get_function("embed_backward_fp32")
 _pos_embed_backward_kernel = _mod.get_function("pos_embed_backward_fp32")
 _embed_forward_kernel = _mod.get_function("embed_forward_fp32")
+_embed_tokens_kernel = _mod.get_function("embed_tokens_fp32")
+_rope_apply_kernel = _mod.get_function("rope_apply_fp32")
 _scal_mul_kernel = _mod.get_function("scal_mul_fp32")
 _adamw_update_kernel = _mod.get_function("adamw_update_fp32")
 _softmax_backward_kernel = _mod.get_function("softmax_backward_fp32")
@@ -569,22 +575,36 @@ def fused_causal_attention_from_qkv(
     scale: float,
     tracer=None,
     name: str = "qkv",
+    rope_base: float = None,
+    pos_offset: int = 0,
 ) -> tuple:
     """QKV projection (fused with the split) + causal attention.
 
     ``ln1_out_d`` is [B*T, K]; ``w_qkv``/``bias_qkv`` project to N = 3*C.
     Returns (attn_concat [B*T, C], probs flat, q_h, k_h, v_h) with heads
     in [B*NH, T, HD] for the backward path (avoids re-split).
+
+    When ``rope_base`` is set, applies RoPE to Q/K (heads layout) before attention.
     """
     B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
     C = NH * HD
     H = B * NH
     M, D = T, HD
+    use_rope = rope_base is not None
 
-    if _USE_FUSED_ATTENTION_FORWARD:
-        # Phase 2C path needs the combined [B*T, 3*C] buffer for split_heads_from_qkv.
+    # Prefer heads-layout path when RoPE is on (apply before attention).
+    if _USE_FUSED_ATTENTION_FORWARD or use_rope:
         qkv = matmul_bias(ln1_out_d, w_qkv, bias_qkv, tracer=tracer, name=name)
         q_h, k_h, v_h = split_heads_from_qkv(qkv, B, T, NH, HD)
+        if use_rope:
+            rope_apply_inplace(
+                q_h, batch_heads=H, seq_len=T, head_dim=HD,
+                base=float(rope_base), pos_offset=int(pos_offset),
+            )
+            rope_apply_inplace(
+                k_h, batch_heads=H, seq_len=T, head_dim=HD,
+                base=float(rope_base), pos_offset=int(pos_offset),
+            )
         probs = gpuarray.empty((H, M, M), dtype=np.float32)
         out_h = gpuarray.empty((H, M, D), dtype=np.float32)
         row_max = scratch_pool.get((H, M), name="fused_row_max")
@@ -842,6 +862,25 @@ def layernorm_with_cache(
     return y, xhat, invstd_row
 
 
+def rmsnorm_with_cache(
+    x: gpuarray.GPUArray, gamma: gpuarray.GPUArray, eps: float = 1e-5,
+) -> tuple:
+    """RMSNorm on device; returns (y, xhat, invrms_row). Scale-only (no beta)."""
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    y = gpuarray.empty_like(x)
+    xhat = gpuarray.empty_like(x)
+    invrms_row = gpuarray.empty((total_rows,), dtype=np.float32)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _rmsnorm_cache_kernel(
+        x, y, xhat, invrms_row, gamma,
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return y, xhat, invrms_row
+
+
 def residual_layernorm_with_cache(
     x: gpuarray.GPUArray,
     residual: gpuarray.GPUArray,
@@ -868,6 +907,30 @@ def residual_layernorm_with_cache(
         block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
     )
     return x_out, y, xhat, invstd_row
+
+
+def residual_rmsnorm_with_cache(
+    x: gpuarray.GPUArray,
+    residual: gpuarray.GPUArray,
+    gamma: gpuarray.GPUArray,
+    eps: float = 1e-5,
+) -> tuple:
+    """Fused x_out = x + residual; y = RMSNorm(x_out). Returns (x_out, y, xhat, invrms)."""
+    assert x.shape == residual.shape
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    x_out = gpuarray.empty_like(x)
+    y = gpuarray.empty_like(x)
+    xhat = gpuarray.empty_like(x)
+    invrms_row = gpuarray.empty((total_rows,), dtype=np.float32)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _residual_rmsnorm_cache_kernel(
+        x, residual, x_out, y, xhat, invrms_row, gamma,
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return x_out, y, xhat, invrms_row
 
 
 def _zeros_gpu(shape, dtype=np.float32) -> gpuarray.GPUArray:
@@ -897,6 +960,27 @@ def layernorm_backward(
         block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
     )
     return dx, dgamma, dbeta
+
+
+def rmsnorm_backward(
+    dout: gpuarray.GPUArray,
+    xhat: gpuarray.GPUArray,
+    invrms_row: gpuarray.GPUArray,
+    gamma: gpuarray.GPUArray,
+) -> tuple:
+    """RMSNorm backward. Returns (dx, dgamma) on device (no dbeta)."""
+    hidden_dim = int(xhat.shape[-1])
+    total_rows = int(np.prod(xhat.shape[:-1])) if xhat.ndim > 1 else 1
+    dx = gpuarray.empty_like(xhat)
+    dgamma = _zeros_gpu((hidden_dim,))
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _rmsnorm_backward_kernel(
+        dout, xhat, invrms_row, gamma, dx, dgamma,
+        np.int32(hidden_dim), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return dx, dgamma
 
 
 def gelu_backward(x: gpuarray.GPUArray, d_out: gpuarray.GPUArray) -> gpuarray.GPUArray:
@@ -1010,20 +1094,65 @@ def embedding_lookup(ids: np.ndarray, emb: gpuarray.GPUArray, pos_emb: gpuarray.
     return out
 
 
+def embedding_lookup_tokens(ids: np.ndarray, emb: gpuarray.GPUArray, T: int) -> gpuarray.GPUArray:
+    """Token embeddings only [B*T, C] (RoPE path)."""
+    ids = np.asarray(ids, dtype=np.int32)
+    B = int(ids.shape[0])
+    C = int(emb.shape[1])
+    out = gpuarray.empty((B * T, C), dtype=np.float32)
+    ids_d = gpuarray.to_gpu(np.ascontiguousarray(ids.reshape(-1), dtype=np.int32))
+    n = B * T * C
+    threads = 256
+    blocks = int(np.ceil(n / threads))
+    _embed_tokens_kernel(
+        emb, ids_d, out, np.int32(B), np.int32(T), np.int32(C),
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+    return out
+
+
+def rope_apply_inplace(
+    x: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    seq_len: int,
+    head_dim: int,
+    base: float = 10000.0,
+    pos_offset: int = 0,
+    backward: bool = False,
+) -> gpuarray.GPUArray:
+    """In-place RoPE on heads tensor [BH, T, HD]. HD must be even."""
+    assert x.ndim == 3 and int(x.shape[2]) == head_dim
+    assert head_dim % 2 == 0, "RoPE requires even head_dim"
+    BH, T, HD = int(batch_heads), int(seq_len), int(head_dim)
+    pairs = BH * T * (HD // 2)
+    grid, block = _launch_1d(pairs)
+    sign = -1.0 if backward else 1.0
+    _rope_apply_kernel(
+        x, np.int32(BH), np.int32(T), np.int32(HD),
+        np.float32(base), np.int32(pos_offset), np.float32(sign),
+        block=block, grid=grid,
+    )
+    return x
+
+
 def embed_backward(
     ids: np.ndarray, d_h: gpuarray.GPUArray, vocab_size: int, embed_dim: int,
+    *, with_position: bool = True,
 ) -> tuple:
-    """Returns (d_token_embedding, d_position_embedding) on device."""
+    """Returns (d_token_embedding, d_position_embedding|None) on device."""
     B, T = ids.shape
     C = embed_dim
     d_tok = _zeros_gpu((vocab_size, C))
-    d_pos = _zeros_gpu((T, C))
     ids_d = gpuarray.to_gpu(np.ascontiguousarray(ids, dtype=np.int32))
     threads = min(next_pow2(C), MAX_THREADS_PER_BLOCK)
     _embed_backward_kernel(
         d_tok, ids_d, d_h, np.int32(B), np.int32(T), np.int32(C),
         block=(threads, 1, 1), grid=(B, T, 1),
     )
+    if not with_position:
+        return d_tok, None
+    d_pos = _zeros_gpu((T, C))
     _pos_embed_backward_kernel(
         d_pos, d_h, np.int32(B), np.int32(T), np.int32(C),
         block=(threads, 1, 1), grid=(T, 1, 1),

@@ -62,6 +62,14 @@ Shared flag groups live in [`cli_common.py`](cli_common.py) and are referenced b
 | `--weight-decay` | float | `None` |
 | `--warmup-steps` | int | `None` |
 | `--gradient-clip` | float | `None` |
+| `--grad-accum` / `--gradient-accumulation-steps` | int | `None` (config or 1) |
+| `--tie-embeddings` | flag | off (presets default tied) |
+| `--no-tie-embeddings` | flag | off |
+| `--run-budget` | int | `None` (absolute quarterly budget) |
+| `--norm-type` | `layernorm`\|`rmsnorm` | `None` (presets → rmsnorm) |
+| `--pos-encoding` | `learned`\|`rope` | `None` (presets → rope) |
+| `--grad-checkpoint` | flag | off |
+| `--no-grad-checkpoint` | flag | off |
 
 ### Generate probes `(shared: probe)`
 

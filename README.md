@@ -108,11 +108,11 @@ Exists (Stage 3.2–3.8 additions)
 └── Evolution HTML report (tools/reports/evolution_report.py)
 
 Not yet
-├── deeper activation checkpointing / recompute
 ├── native FP16 compute kernels (storage path exists)
 └── CUDA Graph capture (software timeline exists)
 ```
 
+**Modern block (shipped with this train of work):** `norm_type=rmsnorm`, `pos_encoding=rope`, optional `--grad-checkpoint` (selective attn/MLP recompute; ~72 MB less activation cache at BiggerTest shapes — see [`output/baselines/modern_activation_recompute.json`](output/baselines/modern_activation_recompute.json)). Legacy checkpoints without these keys stay LayerNorm + learned positions.
 **Scientific control (BiggerTest telemetry, not a contended microbench):**
 
 [`output/baselines/stage31_baseline.json`](output/baselines/stage31_baseline.json)
@@ -346,6 +346,12 @@ python generate.py --checkpoint output\checkpoints\BiggerTest256256 `
 | `--steps N` | Total absolute step target (overrides epochs) |
 | `--learning-rate` | Override AdamW LR |
 | `--batch-size` / `--embedding-dim` / `--num-heads` / `--num-layers` / `--max-len` | Model & batch overrides |
+| `--grad-accum N` | Micro-batches per optimizer step (gradient accumulation) |
+| `--run-budget N` | Absolute step budget for quarterly 25/50/75/100% markers |
+| `--tie-embeddings` / `--no-tie-embeddings` | Share or split token_embedding ↔ lm_head |
+| `--norm-type layernorm\|rmsnorm` | Normalization (new presets default rmsnorm) |
+| `--pos-encoding learned\|rope` | Positions (new presets default rope) |
+| `--grad-checkpoint` / `--no-grad-checkpoint` | Recompute attn/MLP activations in backward |
 | `--log-every` / `--checkpoint-every` | Progress & disk cadence |
 | `--no-prompt` | Never ask on stdin; use CLI/config defaults |
 | `--compare-quarters` | Skip train; run quality trial on a run dir |
@@ -448,7 +454,10 @@ Scores (0–1): **spelling**, **punctuation**, **grammar**, **semantics** → we
 python train.py --set-best quarter_100 --checkpoint output\checkpoints\BiggerTest256256
 ```
 
-**Note:** Chunked resumes that end each chunk at a new `total_steps` will treat the chunk end as 100% and overwrite `quarter_100`. For distinct 25/50/75/100 dirs at absolute steps, prefer one long `--steps` target (e.g. 120000) from the desired start.
+**Note:** Quarterly 25/50/75/100% markers use an absolute **`run_budget_steps`**
+(persisted in `state.json`, overridable with `--run-budget`). Chunked `--steps`
+resumes no longer treat each chunk end as `quarter_100`. On first run without
+`--run-budget`, the session `total_steps` becomes the budget.
 
 ---
 

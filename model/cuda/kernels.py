@@ -429,6 +429,143 @@ __global__ void layernorm_backward_fp32(
     }
 }
 
+// ---------------------------------------------------------------------------
+// RMSNorm (scale-only): inv_rms = rsqrt(mean(x^2)+eps); y = xhat * gamma; xhat = x * inv_rms
+// ---------------------------------------------------------------------------
+
+__global__ void rmsnorm_fp32(const float* x, float* out, const float* gamma,
+                              int hidden_dim, float eps, int total_rows) {
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    if (row >= total_rows) return;
+    int tid = threadIdx.x;
+    int offset = row * hidden_dim;
+
+    float local_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float v = x[offset + i];
+        local_sq += v * v;
+    }
+    sdata[tid] = local_sq;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(sdata[0] / hidden_dim + eps);
+    __syncthreads();
+
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        out[offset + i] = x[offset + i] * inv_rms * gamma[i];
+    }
+}
+
+__global__ void rmsnorm_cache_fp32(
+    const float* x, float* y, float* xhat, float* invrms_row,
+    const float* gamma,
+    int hidden_dim, float eps, int total_rows
+) {
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    if (row >= total_rows) return;
+    int tid = threadIdx.x;
+    int offset = row * hidden_dim;
+
+    float local_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float v = x[offset + i];
+        local_sq += v * v;
+    }
+    sdata[tid] = local_sq;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(sdata[0] / hidden_dim + eps);
+    if (tid == 0) invrms_row[row] = inv_rms;
+    __syncthreads();
+
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float xh = x[offset + i] * inv_rms;
+        xhat[offset + i] = xh;
+        y[offset + i] = xh * gamma[i];
+    }
+}
+
+__global__ void residual_rmsnorm_cache_fp32(
+    const float* x, const float* residual,
+    float* x_out, float* y, float* xhat, float* invrms_row,
+    const float* gamma,
+    int hidden_dim, float eps, int total_rows
+) {
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    if (row >= total_rows) return;
+    int tid = threadIdx.x;
+    int offset = row * hidden_dim;
+
+    float local_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float v = x[offset + i] + residual[offset + i];
+        x_out[offset + i] = v;
+        local_sq += v * v;
+    }
+    sdata[tid] = local_sq;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(sdata[0] / hidden_dim + eps);
+    if (tid == 0) invrms_row[row] = inv_rms;
+    __syncthreads();
+
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float xh = x_out[offset + i] * inv_rms;
+        xhat[offset + i] = xh;
+        y[offset + i] = xh * gamma[i];
+    }
+}
+
+// RMSNorm backward: dx = inv_rms * (dout*gamma - xhat * mean(dout*gamma*xhat)); dgamma via atomicAdd.
+__global__ void rmsnorm_backward_fp32(
+    const float* dout, const float* xhat, const float* invrms_row, const float* gamma,
+    float* dx, float* dgamma,
+    int hidden_dim, int total_rows
+) {
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    if (row >= total_rows) return;
+    int tid = threadIdx.x;
+    int offset = row * hidden_dim;
+    float inv_rms = invrms_row[row];
+    float N = (float)hidden_dim;
+
+    float sum_dxhat_xhat = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float d = dout[offset + i];
+        float xh = xhat[offset + i];
+        float dxh = d * gamma[i];
+        sum_dxhat_xhat += dxh * xh;
+        atomicAdd(&dgamma[i], d * xh);
+    }
+    sdata[tid] = sum_dxhat_xhat;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float mean_dxhat_xhat = sdata[0] / N;
+    __syncthreads();
+
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float xh = xhat[offset + i];
+        float dxh = dout[offset + i] * gamma[i];
+        dx[offset + i] = inv_rms * (dxh - xh * mean_dxhat_xhat);
+    }
+}
+
 // GeLU (tanh approximation), elementwise
 __global__ void gelu_fp32(const float* x, float* out, int n_elements) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -887,6 +1024,46 @@ __global__ void embed_forward_fp32(
     int t = bt % T;
     int id = ids[b * T + t];
     out[idx] = tok_emb[id * C + c] + pos_emb[t * C + c];
+}
+
+// Token embedding only (RoPE path — no absolute position table add).
+__global__ void embed_tokens_fp32(
+    const float* tok_emb, const int* ids, float* out, int B, int T, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = B * T * C;
+    if (idx >= n) return;
+    int c = idx % C;
+    int bt = idx / C;
+    int b = bt / T;
+    int t = bt % T;
+    int id = ids[b * T + t];
+    out[idx] = tok_emb[id * C + c];
+}
+
+// RoPE in-place on heads layout [BH, T, HD]. Rotates pairs (2i, 2i+1).
+// pos_offset added to token index t (for KV decode). sign=+1 forward, -1 backward.
+__global__ void rope_apply_fp32(
+    float* x, int BH, int T, int HD, float base, int pos_offset, float sign
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int pairs = HD / 2;
+    int n = BH * T * pairs;
+    if (idx >= n) return;
+    int pair = idx % pairs;
+    int bt = idx / pairs;
+    int t = bt % T;
+    int bh = bt / T;
+    int pos = t + pos_offset;
+    float freq = powf(base, -2.0f * pair / (float)HD);
+    float angle = sign * ((float)pos) * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    int base_i = ((bh * T + t) * HD) + (2 * pair);
+    float x0 = x[base_i];
+    float x1 = x[base_i + 1];
+    x[base_i] = x0 * c - x1 * s;
+    x[base_i + 1] = x0 * s + x1 * c;
 }
 
 // ============================================================================
