@@ -1,0 +1,41 @@
+{
+  "tag": "v0.1.1",
+  "captured_at": "2026-07-22T21:38:58.165309+00:00",
+  "version_file": "0.1.1-dev",
+  "statement": "Known-good runtime state for stabilization / regression comparison.",
+  "training": {
+    "source": "stage31_baseline.json",
+    "tokens_per_sec": 586,
+    "step_ms": 1747.9,
+    "device_used_mb": 844,
+    "scratch_peak_mb": 28.1,
+    "train_loss": 0.9305,
+    "checkpoint_step": 111100
+  },
+  "hardware": {
+    "gpu": "GT 730 GK208",
+    "compute_capability": "3.5",
+    "display_shared": true
+  },
+  "model": {
+    "vocab_size": 110,
+    "params": 3281518,
+    "embedding_dim": 256,
+    "layers": 4,
+    "heads": 8,
+    "context": 256,
+    "batch_size": 4,
+    "learning_rate": 1e-05
+  },
+  "gates": {
+    "parity_required": "10/10",
+    "compare_against": [
+      "stage31_baseline.json",
+      "stage32_kv_generate.json",
+      "stage34_activation_account.json",
+      "stage35_fp16_storage.json",
+      "stage36_allocator.json",
+      "stage37_timeline.json"
+    ]
+  }
+}

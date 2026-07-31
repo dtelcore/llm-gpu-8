@@ -1,0 +1,20 @@
+{
+  "tag": "v0.1.1",
+  "captured_at": "2026-07-22T21:38:58.165309+00:00",
+  "parity": {
+    "ok": true,
+    "returncode": 0,
+    "summary": "Ran 10 tests in 0.440s",
+    "path": "C:\\dev\\llm gpu 8\\output\\releases\\v0.1.1\\parity.txt"
+  },
+  "files": [
+    "runtime.json",
+    "quality.json",
+    "generation.json",
+    "memory.json",
+    "parity.txt",
+    "evolution.html",
+    "MANIFEST.json"
+  ],
+  "statement": "This is the known-good runtime state."
+}

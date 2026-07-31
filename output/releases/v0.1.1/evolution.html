@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>llm-gpu-8 Stage 3 evolution</title>
+<style>
+body { font-family: Georgia, 'Times New Roman', serif; margin: 2rem; background: #f7f4ef; color: #1c1a16; }
+h1 { font-size: 1.8rem; }
+table { border-collapse: collapse; width: 100%; margin-top: 1rem; background: #fff; }
+th, td { border: 1px solid #cfc8bc; padding: 0.5rem 0.7rem; text-align: left; font-size: 0.95rem; }
+th { background: #ebe4d8; }
+.note { margin-top: 1.5rem; max-width: 48rem; line-height: 1.45; }
+code { background: #efe9df; padding: 0.1rem 0.3rem; }
+</style>
+</head>
+<body>
+<h1>llm-gpu-8 evolution report</h1>
+<p>Generated 2026-07-22T21:35:02.246881+00:00</p>
+<p class="note">Comparison root: <code>stage31_baseline.json</code>. Each later stage should answer:
+did runtime efficiency, model efficiency, or developer confidence improve — and can the baseline prove it?</p>
+<table>
+<thead><tr><th>Stage</th><th>Metric A</th><th>Metric B</th><th>Metric C</th><th>Metric D</th></tr></thead>
+<tbody>
+<tr><td>3.1 train</td><td>586</td><td>1747.9</td><td>844</td><td>0.9305</td></tr><tr><td>3.2 generate KV</td><td>36.64</td><td>6.987</td><td>2.0</td><td>speedup 3.924</td></tr><tr><td>3.3 BPE chars/tok</td><td>1.5649350649350648</td><td>23.91966666666667</td><td>61</td><td>4.4032182693481445</td></tr><tr><td>3.4 activations</td><td>attention_cache</td><td>98.9024</td><td>775.544</td><td>12.518</td></tr><tr><td>3.5 FP16 storage</td><td>0.7031</td><td>1.062825322151184e-05</td><td>True</td><td>5.143181324005127</td></tr><tr><td>3.6 allocator</td><td>34</td><td>4</td><td>262144</td><td>True</td></tr><tr><td>3.7 timeline</td><td>7</td><td>0.19260000000009825</td><td>[&#x27;causal_mha&#x27;, &#x27;layer_1.mlp_contract&#x27;, &#x27;lm_head&#x27;]</td><td>output\baselines\stage37_timeline.json</td></tr>
+</tbody>
+</table>
+<p class="note">Artifacts live under <code>output/baselines/</code>. Open this file locally in a browser.</p>
+</body>
+</html>

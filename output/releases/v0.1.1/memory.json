@@ -1,0 +1,51 @@
+{
+  "tag": "v0.1.1",
+  "activation_accounting": {
+    "source": "stage34_activation_account.json",
+    "activation_cache_mb": 98.9024,
+    "buckets_mb": {
+      "other_activations": 1.8672,
+      "ln_cache": 17.0352,
+      "attention_cache": 48.0,
+      "mlp_cache": 32.0
+    },
+    "largest_activation_bucket": "attention_cache",
+    "parameter_mb": 12.518,
+    "device_used_mb_after_forward": 775.544
+  },
+  "fp16_storage": {
+    "source": "stage35_fp16_storage.json",
+    "estimated_savings_mb": 0.7031,
+    "parity_ok": true,
+    "lm_head_grad_maxdiff": 1.062825322151184e-05
+  },
+  "allocator": {
+    "source": "stage36_allocator.json",
+    "stats": {
+      "alloc_count": 4,
+      "reuse_count": 34,
+      "release_count": 38,
+      "peak_live_bytes": 262144,
+      "freelist_buffers": 4,
+      "live_buffers": 0
+    },
+    "reuse_observed": true
+  },
+  "timeline": {
+    "source": "stage37_timeline_meta.json",
+    "summary": {
+      "event_count": 7,
+      "total_ms": 0.19260000000009825,
+      "by_name_ms": {
+        "causal_mha": 0.06249999999985434,
+        "layer_1.mlp_contract": 0.027600000000127523,
+        "lm_head": 0.027199999999893976,
+        "layer_0.mlp_contract": 0.026000000000081513,
+        "layer_1.attn_out": 0.02469999999998862,
+        "layer_0.attn_out": 0.024600000000152278
+      }
+    },
+    "timeline_path": "output\\baselines\\stage37_timeline.json"
+  },
+  "stage31_scratch_peak_mb": 28.1
+}

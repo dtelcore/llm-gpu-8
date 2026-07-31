@@ -1,0 +1,10 @@
+{
+  "tag": "v0.1.1",
+  "source": "stage31_baseline.json + stage33_bpe_protocol.json",
+  "train_loss": 0.9305,
+  "train_ppl": 2.5359,
+  "val_loss_prior_101k": 0.96,
+  "quality_score_prior_101k": 0.884,
+  "bpe_experiment_note": "Char remains BiggerTest default. BPE is experiment-only.",
+  "bpe_chars_per_token": 1.5649350649350648
+}

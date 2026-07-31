@@ -1,0 +1,21 @@
+2026-07-22 23:38:58 | INFO     | llm_gpu | Logging initialized | Level: INFO | File: C:\dev\llm gpu 8\output\logs\training_20260722_233858.log
+2026-07-22 23:38:58 | INFO     | llm_gpu | PyCUDA kernels compiled for sm_35 (Kepler GT 730)
+2026-07-22 23:38:58 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+2026-07-22 23:38:58 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+2026-07-22 23:38:59 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+test_causal_attention_forward (tests.parity.test_attention.TestAttentionParity) ... ok
+test_forward_cache_keeps_batch_dims (tests.parity.test_forward_contract.TestForwardBackwardContract) ... ok
+test_gelu_forward_backward (tests.parity.test_gelu.TestGeluParity) ... ok
+test_kv_grows (tests.parity.test_kv_cache.TestKVCacheGenerate) ... ok
+test_kv_matches_nokv_greedy (tests.parity.test_kv_cache.TestKVCacheGenerate)
+Argmax decode: KV vs full recompute should agree on token ids. ... ok
+test_kv_self_deterministic (tests.parity.test_kv_cache.TestKVCacheGenerate) ... ok
+test_layernorm_forward_backward (tests.parity.test_layernorm.TestLayerNormParity) ... ok
+test_linear_backward (tests.parity.test_linear.TestLinearParity) ... ok
+test_matmul_bias_forward (tests.parity.test_linear.TestLinearParity) ... ok
+test_forward_backward_grads (tests.parity.test_step.TestStepParity) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.440s
+
+OK

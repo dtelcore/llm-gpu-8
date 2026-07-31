@@ -1,0 +1,15 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_6",
+  "captured_at": "2026-07-22T21:35:01.949699+00:00",
+  "allocator_stats": {
+    "alloc_count": 4,
+    "reuse_count": 34,
+    "release_count": 38,
+    "peak_live_bytes": 262144,
+    "freelist_buffers": 4,
+    "live_buffers": 0
+  },
+  "note": "qkv_split temps use LifetimeAllocator; ScratchPool redesign still demoted.",
+  "reuse_observed": true
+}

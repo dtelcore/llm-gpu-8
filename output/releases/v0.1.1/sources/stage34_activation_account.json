@@ -1,0 +1,33 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_4",
+  "captured_at": "2026-07-22T21:35:01.797863+00:00",
+  "shapes": {
+    "B": 4,
+    "T": 256,
+    "embed": 256,
+    "layers": 4,
+    "heads": 8,
+    "vocab": 110
+  },
+  "device_used_mb_before_forward": 674.544,
+  "device_used_mb_after_forward": 775.544,
+  "parameter_mb": 12.518,
+  "adam_m_v_estimated_mb": 25.036,
+  "scratch_pool_mb": 0.0,
+  "activation_cache_mb": 98.9024,
+  "buckets_mb": {
+    "other_activations": 1.8672,
+    "ln_cache": 17.0352,
+    "attention_cache": 48.0,
+    "mlp_cache": 32.0
+  },
+  "buckets_bytes": {
+    "other_activations": 1957888,
+    "ln_cache": 17862656,
+    "attention_cache": 50331656,
+    "mlp_cache": 33554432
+  },
+  "largest_activation_bucket": "attention_cache",
+  "note": "Targets 3.5/3.6 should prioritize the largest_activation_bucket."
+}
