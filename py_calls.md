@@ -169,7 +169,7 @@ python generate.py [flags]
 | `--top-k` | int | `None` | |
 | `--top-p` | float | `None` | |
 | `--no-kv-cache` | flag | off | Full recompute each token |
-| `--cuda-graph` | flag | off | Stage 3.11: attempt CUDA Graph capture of KV decode (falls back if host sync) |
+| `--cuda-graph` | flag | off | Stage 4: capture KV kernel-chain graph; full decode stays eager GPU |
 
 ```powershell
 python generate.py --checkpoint output\checkpoints\BiggerTest256256 --prompt "once upon a" --max-new-tokens 256 --temperature 0.6 --top-k 10 --top-p 0.9

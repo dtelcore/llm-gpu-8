@@ -1,4 +1,4 @@
-"""Stage 3.2: KV cache generate path determinism and isolation smoke."""
+"""Stage 3.2 / Stage 4: KV cache generate path — device arenas + determinism."""
 import unittest
 
 import numpy as np
@@ -37,7 +37,6 @@ class TestKVCacheGenerate(unittest.TestCase):
         """Argmax decode: KV vs full recompute should agree on token ids."""
         model, tok = _model()
         prompt = tok.encode("once upon a")
-        # temperature -> near-greedy via very low temp
         kw = dict(max_new_tokens=12, temperature=1e-6, top_k=None, top_p=None)
         a = model.generate(prompt, rng=np.random.default_rng(0), use_kv_cache=True, **kw)
         b = model.generate(prompt, rng=np.random.default_rng(0), use_kv_cache=False, **kw)
@@ -49,9 +48,12 @@ class TestKVCacheGenerate(unittest.TestCase):
         _, kv = model._prefill_kv(prompt)
         n0 = _kv_state_nbytes(kv)
         t0 = kv["T"]
+        self.assertTrue(kv.get("device"))
         _, kv2 = model._decode_kv(prompt[-1], kv)
         self.assertEqual(kv2["T"], t0 + 1)
-        self.assertGreater(_kv_state_nbytes(kv2), n0)
+        # Static arenas: nbytes stays constant; T grows.
+        self.assertEqual(_kv_state_nbytes(kv2), n0)
+        self.assertEqual(kv2["layers"][0]["k_d"].shape[1], model.config.max_len)
 
     def test_kv_rope_rmsnorm_matches_nokv_greedy(self):
         """Modern stack (RoPE + RMSNorm): KV decode must match full recompute."""
@@ -63,15 +65,28 @@ class TestKVCacheGenerate(unittest.TestCase):
         self.assertEqual(a, b)
 
     def test_kv_rope_decode_shapes(self):
-        """Prefill K/V stay [H, T, hd]; decode append must not introduce a batch dim."""
+        """Prefill packs into [H, max_len, hd]; decode appends without realloc."""
         model, tok = _model(norm_type="rmsnorm", pos_encoding="rope")
         prompt = tok.encode("once")
         _, kv = model._prefill_kv(prompt)
         H, hd = model.config.num_heads, model.config.head_dim
-        self.assertEqual(kv["layers"][0]["k"].shape, (H, len(prompt), hd))
+        self.assertTrue(kv.get("device"))
+        self.assertEqual(kv["layers"][0]["k_d"].shape, (H, model.config.max_len, hd))
+        self.assertEqual(kv["T"], len(prompt))
         _, kv2 = model._decode_kv(int(prompt[-1]), kv)
-        self.assertEqual(kv2["layers"][0]["k"].shape, (H, len(prompt) + 1, hd))
-        self.assertEqual(kv2["layers"][0]["v"].ndim, 3)
+        self.assertEqual(kv2["T"], len(prompt) + 1)
+        self.assertEqual(kv2["layers"][0]["k_d"].shape, (H, model.config.max_len, hd))
+        self.assertEqual(kv2["layers"][0]["v_d"].ndim, 3)
+
+    def test_device_argmax_sample(self):
+        model, tok = _model()
+        prompt = tok.encode("once")
+        logits, _ = model._prefill_kv(prompt)
+        self.assertIsNotNone(model._last_logits_d)
+        idx = model._sample_next_id_device(model._last_logits_d, temperature=1e-6)
+        self.assertIsInstance(idx, int)
+        self.assertGreaterEqual(idx, 0)
+        self.assertLess(idx, model.config.vocab_size)
 
 
 if __name__ == "__main__":

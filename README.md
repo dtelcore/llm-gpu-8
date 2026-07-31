@@ -113,9 +113,16 @@ Exists (Stage 3.2–3.11)
 ├── Process-only VRAM (model/cuda/ops.get_memory_usage)
 └── CUDA Graph capture/fallback (model/cuda/graph.py; generate --cuda-graph)
 
-Not yet (post–Stage 3)
-├── native FP16 GEMM / AMP training (Kepler has no useful Tensor-Core path)
-└── capture-compatible GPU-resident KV decode (host attention today)
+Exists (Stage 4)
+├── Device KV arenas sized to GPTConfig.max_len (model/cuda/kv_cache.py)
+├── causal_mha_decode_fp32 + device KV append / embed
+├── Device argmax + fixed-k top-k sampling (top-p stays host)
+├── CUDA Graph kernel-chain capture (append → decode attn → argmax)
+└── Baseline: output/baselines/stage4_gpu_kv_decode.json
+
+Not yet (Stage 4 follow-ons)
+├── full transformer decode inside one CUDA Graph (GEMM/norm still default-stream)
+└── device multinomial / top-p sampling (stochastic path remains host)
 ```
 
 **Modern block (shipped with this train of work):** `norm_type=rmsnorm`, `pos_encoding=rope`, optional `--grad-checkpoint` (**VRAM** lever: selective attn/MLP recompute; ~72 MB less activation cache at BiggerTest shapes — not a tok/s speedup; see [`output/baselines/modern_activation_recompute.json`](output/baselines/modern_activation_recompute.json)). Legacy checkpoints without these keys stay LayerNorm + learned positions. RoPE path uses **QKV-split fusion** again (no full `[B·T, 3C]` buffer).
@@ -141,7 +148,7 @@ Not yet (post–Stage 3)
 
 Principle for later milestones: every change must answer (1) Did the runtime get better? (2) Did correctness hold?
 
-**Next:** post–Stage 3 work uses the stabilization discipline against the v0.1.2 snapshot.
+**Next:** Stage 4 (GPU-resident KV decode → device sampling → CUDA Graph replay) uses the stabilization discipline against the v0.1.2 snapshot.
 
 ### Stabilization release discipline
 
@@ -212,7 +219,7 @@ Future:   training/allocator.py (ScratchPool redesign still demoted)
 | Quality | Heuristic generation scores + quarter trial |
 | Observability | `--runtime-metrics`, `--memory-timeline`, kernel timeline, process-only VRAM (off by default) |
 | Verification | `.\venv\Scripts\python.exe -m tests.parity.run_parity` |
-| Generation | KV cache on by default (`--no-kv-cache`); optional `--cuda-graph` (GPU-only capture; decode may fall back) |
+| Generation | KV cache on device arenas by default (`--no-kv-cache`); `--cuda-graph` captures KV kernel-chain |
 | Reports | `python tools/reports/evolution_report.py` → `output/reports/evolution.html` |
 
 ---
@@ -559,6 +566,14 @@ Generation at this stage: reliable TinyStories openers; mid-sample coherence sti
 ---
 
 ## Changelog
+
+### [0.1.2+] — 2026-07-31 — Stage 4 GPU-resident KV decode
+
+- **S4.1 Device KV arenas:** [`model/cuda/kv_cache.py`](model/cuda/kv_cache.py) — `[B*H, max_len, hd]` packed on prefill
+- **S4.2 Decode attention:** `causal_mha_decode_fp32` — no host attention on the generate hot path
+- **S4.3 Append + embed:** device row write at `T` + `embedding_lookup_tokens`
+- **S4.4 Device sample:** argmax + fixed-k top-k; top-p/RNG remain host
+- **S4.5 Graph:** kernel-chain capture (`kv_append` → decode → argmax); [`stage4_gpu_kv_decode.json`](output/baselines/stage4_gpu_kv_decode.json)
 
 ### [0.1.2] — 2026-07-31 — Stage 3 closeout
 

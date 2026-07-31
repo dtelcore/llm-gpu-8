@@ -1470,4 +1470,152 @@ __global__ void half_to_float_kernel(const __half* __restrict__ in,
         out[i] = __half2float(in[i]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 4: GPU-resident KV decode (heads layout [BH, max_len, hd])
+// ---------------------------------------------------------------------------
+
+// Copy prefill K/V [BH, T, hd] into arena [BH, max_len, hd] slots [0 .. T).
+__global__ void kv_pack_prefill_fp32(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int BH, int T, int max_len, int hd
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = BH * T * hd;
+    if (idx >= n) return;
+    int d = idx % hd;
+    int t = (idx / hd) % T;
+    int bh = idx / (hd * T);
+    dst[(bh * max_len + t) * hd + d] = src[(bh * T + t) * hd + d];
+}
+
+// Write new row [BH, hd] into arena [BH, max_len, hd] at index t.
+__global__ void kv_append_row_fp32(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int BH, int t, int max_len, int hd
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = BH * hd;
+    if (idx >= n) return;
+    int d = idx % hd;
+    int bh = idx / hd;
+    dst[(bh * max_len + t) * hd + d] = src[bh * hd + d];
+}
+
+// Single-query causal MHA over a device KV arena.
+// Q: [BH, hd], K/V: [BH, max_len, hd], attend j < valid_len, O: [BH, hd].
+// blockDim.x == hd; grid.x == BH.
+__global__ void causal_mha_decode_fp32(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int BH, int max_len, int valid_len, int hd, float scale
+) {
+    int bh = blockIdx.x;
+    int tid = threadIdx.x;
+    if (bh >= BH || tid >= hd || valid_len <= 0) return;
+
+    extern __shared__ float smem[];
+    float* s_scores = smem;
+    float* s_probs = smem + valid_len;
+    float* q_sh = smem + 2 * valid_len;
+    float* warp_sums = smem + 2 * valid_len + hd;
+
+    int num_warps = (hd + 31) / 32;
+    const float* q_row = Q + bh * hd;
+    q_sh[tid] = q_row[tid];
+    __syncthreads();
+
+    for (int j = 0; j < valid_len; ++j) {
+        const float* k_row = K + (bh * max_len + j) * hd;
+        float partial = q_sh[tid] * k_row[tid];
+        float warp_sum = warp_reduce_sum(partial);
+        if ((tid & 31) == 0) warp_sums[tid >> 5] = warp_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float dot = 0.0f;
+            for (int w = 0; w < num_warps; ++w) dot += warp_sums[w];
+            s_scores[j] = dot * scale;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float max_val = -1e30f;
+        for (int j = 0; j < valid_len; ++j) max_val = fmaxf(max_val, s_scores[j]);
+        float sum = 0.0f;
+        for (int j = 0; j < valid_len; ++j) {
+            float e = expf(s_scores[j] - max_val);
+            s_probs[j] = e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int j = 0; j < valid_len; ++j) s_probs[j] *= inv_sum;
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (int j = 0; j < valid_len; ++j) {
+        const float* v_row = V + (bh * max_len + j) * hd;
+        acc += s_probs[j] * v_row[tid];
+    }
+    O[bh * hd + tid] = acc;
+}
+
+// Argmax over 1-D logits [n]; writes index to out_idx[0].
+__global__ void argmax_1d_fp32(const float* __restrict__ x, int n, int* __restrict__ out_idx) {
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    int tid = threadIdx.x;
+    float best_v = -1e30f;
+    int best_i = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[i];
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    s_val[tid] = best_v;
+    s_idx[tid] = best_i;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_val[tid + stride] > s_val[tid]) {
+                s_val[tid] = s_val[tid + stride];
+                s_idx[tid] = s_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_idx[0] = s_idx[0];
+}
+
+// Zero logits below the k-th largest (in-place). n <= 1024; single block.
+__global__ void topk_mask_inplace_fp32(float* __restrict__ x, int n, int k) {
+    extern __shared__ float smem[];
+    float* vals = smem;
+    int tid = threadIdx.x;
+    if (tid < n) vals[tid] = x[tid];
+    __syncthreads();
+    if (tid == 0) {
+        int kk = k < n ? k : n;
+        if (kk < 1) kk = 1;
+        // Partial select: find k-th largest via simple insertion of top-k.
+        float thresh;
+        for (int i = 0; i < kk; ++i) {
+            int best = i;
+            for (int j = i + 1; j < n; ++j) {
+                if (vals[j] > vals[best]) best = j;
+            }
+            float tmp = vals[i];
+            vals[i] = vals[best];
+            vals[best] = tmp;
+        }
+        thresh = vals[kk - 1];
+        for (int i = 0; i < n; ++i) {
+            if (x[i] < thresh) x[i] = -1e30f;
+        }
+    }
+}
 """

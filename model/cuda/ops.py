@@ -79,6 +79,11 @@ _fused_mlp_row_kernel = _mod.get_function("fused_mlp_row_fp32")
 _adamw_update_batched_kernel = _mod.get_function("adamw_update_batched_fp32")
 _float_to_half_kernel = _mod.get_function("float_to_half_kernel")
 _half_to_float_kernel = _mod.get_function("half_to_float_kernel")
+_kv_pack_prefill_kernel = _mod.get_function("kv_pack_prefill_fp32")
+_kv_append_row_kernel = _mod.get_function("kv_append_row_fp32")
+_causal_mha_decode_kernel = _mod.get_function("causal_mha_decode_fp32")
+_argmax_1d_kernel = _mod.get_function("argmax_1d_fp32")
+_topk_mask_kernel = _mod.get_function("topk_mask_inplace_fp32")
 
 logger.info("PyCUDA kernels compiled for sm_35 (Kepler GT 730)")
 
@@ -1328,6 +1333,153 @@ def sync_to_host(device_arr: gpuarray.GPUArray, host_arr: np.ndarray) -> None:
     with runtime_metrics.measure("to_host"):
         host_arr[:] = device_arr.get().reshape(host_arr.shape)
         cuda.Context.synchronize()
+
+
+def kv_pack_prefill(
+    src: gpuarray.GPUArray,
+    dst: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    seq_len: int,
+    max_len: int,
+    head_dim: int,
+    stream=None,
+) -> None:
+    """Copy [BH, T, hd] into arena [BH, max_len, hd] at slots [0 .. T)."""
+    BH, T, hd = int(batch_heads), int(seq_len), int(head_dim)
+    n = BH * T * hd
+    grid, block = _launch_1d(n)
+    kw = dict(block=block, grid=grid)
+    if stream is not None:
+        kw["stream"] = stream
+    _kv_pack_prefill_kernel(
+        src, dst, np.int32(BH), np.int32(T), np.int32(max_len), np.int32(hd),
+        **kw,
+    )
+
+
+def kv_append_row(
+    src: gpuarray.GPUArray,
+    dst: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    t: int,
+    max_len: int,
+    head_dim: int,
+    stream=None,
+) -> None:
+    """Write [BH, hd] (or [BH, 1, hd]) into arena row ``t``."""
+    BH, hd = int(batch_heads), int(head_dim)
+    n = BH * hd
+    grid, block = _launch_1d(n)
+    kw = dict(block=block, grid=grid)
+    if stream is not None:
+        kw["stream"] = stream
+    _kv_append_row_kernel(
+        src, dst, np.int32(BH), np.int32(t), np.int32(max_len), np.int32(hd),
+        **kw,
+    )
+
+
+def causal_mha_decode(
+    q: gpuarray.GPUArray,
+    k_arena: gpuarray.GPUArray,
+    v_arena: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    max_len: int,
+    valid_len: int,
+    head_dim: int,
+    scale: float,
+    out: gpuarray.GPUArray = None,
+    stream=None,
+) -> gpuarray.GPUArray:
+    """Single-query causal MHA over a device KV arena.
+
+    ``q`` is [BH, hd] or [BH, 1, hd]; arenas are [BH, max_len, hd].
+    Returns ``out`` [BH, hd].
+    """
+    from tools.tracing.runtime_metrics import kernel_timeline
+
+    BH, hd = int(batch_heads), int(head_dim)
+    T_valid = int(valid_len)
+    if out is None:
+        out = gpuarray.empty((BH, hd), dtype=np.float32)
+    num_warps = (hd + 31) // 32
+    shared_bytes = (2 * max(T_valid, 1) + hd + num_warps) * np.dtype(np.float32).itemsize
+    kw = dict(block=(int(hd), 1, 1), grid=(BH, 1, 1), shared=shared_bytes)
+    if stream is not None:
+        kw["stream"] = stream
+    with kernel_timeline.measure("causal_mha_decode", category="attention"):
+        _causal_mha_decode_kernel(
+            q, k_arena, v_arena, out,
+            np.int32(BH), np.int32(max_len), np.int32(T_valid), np.int32(hd),
+            np.float32(scale),
+            **kw,
+        )
+    return out
+
+
+def argmax_1d(logits: gpuarray.GPUArray, out_idx: gpuarray.GPUArray = None, stream=None) -> gpuarray.GPUArray:
+    """Device argmax over a 1-D logits vector. Returns int32 device scalar [1]."""
+    n = int(logits.size)
+    if out_idx is None:
+        out_idx = gpuarray.empty((1,), dtype=np.int32)
+    threads = 256 if n >= 256 else next_pow2(max(n, 1))
+    threads = min(threads, 256)
+    kw = dict(block=(threads, 1, 1), grid=(1, 1, 1))
+    if stream is not None:
+        kw["stream"] = stream
+    _argmax_1d_kernel(
+        logits, np.int32(n), out_idx,
+        **kw,
+    )
+    return out_idx
+
+
+def topk_mask_inplace(logits: gpuarray.GPUArray, k: int) -> gpuarray.GPUArray:
+    """Zero (set to -1e30) entries below the k-th largest; in-place on device."""
+    n = int(logits.size)
+    kk = max(1, min(int(k), n))
+    threads = next_pow2(n) if n <= 1024 else 1024
+    shared = n * np.dtype(np.float32).itemsize if n <= 1024 else 1024 * 4
+    if n > 1024:
+        # Fallback: host top-k mask for huge vocab (char LM is << 1024).
+        host = logits.get()
+        kth = np.partition(host, -kk)[-kk]
+        host = host.copy()
+        host[host < kth] = -1e30
+        logits.set(host)
+        return logits
+    _topk_mask_kernel(
+        logits, np.int32(n), np.int32(kk),
+        block=(threads, 1, 1), grid=(1, 1, 1), shared=shared,
+    )
+    return logits
+
+
+def sample_logits_device(
+    logits: gpuarray.GPUArray,
+    *,
+    temperature: float = 1.0,
+    top_k: int = None,
+    out_idx: gpuarray.GPUArray = None,
+) -> gpuarray.GPUArray:
+    """Deterministic device sample: optional top-k mask then argmax (graph-safe).
+
+    Temperature scales logits before argmax (near-greedy when temp → 0).
+    Stochastic top-p / multinomial stay on the host path.
+    """
+    n = int(logits.size)
+    work = scratch_pool.get((n,), name="sample_logits_work")
+    # Copy + scale
+    cuda.memcpy_dtod(work.gpudata, logits.gpudata, logits.nbytes)
+    temp = max(float(temperature), 1e-6)
+    if abs(temp - 1.0) > 1e-8:
+        scal_mul(work, 1.0 / temp)
+    if top_k is not None and int(top_k) > 0:
+        topk_mask_inplace(work, int(top_k))
+    return argmax_1d(work, out_idx=out_idx)
 
 
 def param_global_norm(device_tensors) -> float:

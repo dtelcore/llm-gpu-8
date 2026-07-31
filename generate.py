@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cuda-graph",
         action="store_true",
-        help="Stage 3.11: attempt CUDA Graph capture of KV decode (falls back if unsupported)",
+        help="Stage 4: capture KV decode kernel-chain CUDA Graph (full decode stays eager GPU)",
     )
     cli_common.add_trace_args(parser)
     return parser.parse_args()

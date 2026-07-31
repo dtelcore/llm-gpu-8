@@ -166,10 +166,8 @@ def _causal_attention_decode_host(q_h: np.ndarray, k_h: np.ndarray, v_h: np.ndar
 
 
 def _kv_state_nbytes(kv_state: Dict) -> int:
-    total = 0
-    for layer in kv_state.get("layers", []):
-        total += int(layer["k"].nbytes) + int(layer["v"].nbytes)
-    return total
+    from model.cuda.kv_cache import arena_nbytes
+    return arena_nbytes(kv_state)
 
 
 class GPTModel:
@@ -969,13 +967,12 @@ class GPTModel:
         """Autoregressive sampling with temperature and optional top-k / top-p filters.
 
         When ``use_kv_cache`` is True (default), prompt is prefilled once and each
-        new token is decoded incrementally against cached K/V. Training path is
-        untouched. If ``tracer`` and ``tokenizer`` are both given, emits traces
-        on tracer.trace_every steps.
+        new token is decoded incrementally against cached K/V (Stage 4: device
+        arenas when GPU path is live). Training path is untouched.
 
-        ``use_cuda_graph`` attempts stream capture of a decode step (Stage 3.11).
-        Host KV decode typically falls back to eager; status is stored on
-        ``self._cuda_graph_status``.
+        ``use_cuda_graph`` attempts stream capture/replay of a GPU decode step
+        (Stage 4.5). Stochastic top-p forces host sampling (eager). Status is
+        stored on ``self._cuda_graph_status``.
         """
         rng = rng or np.random.default_rng()
         ids = list(prompt_ids)
@@ -986,44 +983,51 @@ class GPTModel:
             )
 
         logits, kv_state = self._prefill_kv(ids[-self.config.max_len :], tracer=tracer)
+        # Device argmax/top-k only for near-greedy (graph-safe). Stochastic
+        # temperature / top-p stay on the host sampler.
+        use_device_sample = (
+            bool(kv_state.get("device"))
+            and (top_p is None or not (0.0 < float(top_p) < 1.0))
+            and float(temperature) <= 1e-5
+        )
+        if use_cuda_graph and kv_state.get("device") and (
+            top_p is None or not (0.0 < float(top_p) < 1.0)
+        ):
+            # Graph path uses deterministic device sample between replays.
+            use_device_sample = True
 
-        if use_cuda_graph:
-            from model.cuda.graph import try_capture_decode
-
-            # Probe/capture attempt on the first decode shape; host KV path
-            # is expected to fall back. Status retained for benches / baselines.
-            probe_token = int(ids[-1]) if ids else 0
-            kv_snap = {
-                "B": kv_state["B"],
-                "T": kv_state["T"],
-                "layers": [
-                    {"k": ly["k"].copy(), "v": ly["v"].copy()}
-                    for ly in kv_state["layers"]
-                ],
-            }
-
-            def _probe_decode():
-                self._decode_kv(probe_token, kv_snap, tracer=None)
-
-            self._cuda_graph_status = try_capture_decode(_probe_decode).to_dict()
+        graph_exec = None
+        if use_cuda_graph and kv_state.get("device") and kv_state["T"] < self.config.max_len:
+            graph_exec = self._try_setup_decode_graph(kv_state, ids)
 
         for step in range(max_new_tokens):
             if tracer is not None:
                 tracer.update_step(step)
 
-            last_logits = logits[-1]
-            if tracer is not None and tokenizer is not None:
+            last_logits = logits[-1] if isinstance(logits, np.ndarray) else None
+            if tracer is not None and tokenizer is not None and last_logits is not None:
                 window = ids[-self.config.max_len :]
                 tracer.dump_tokens(window, tokenizer, label=f"generate step {step} (context)")
                 tracer.dump_logits(last_logits, tokenizer, label=f"generate step {step}")
 
-            next_id = _sample_next_id(
-                last_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
-            )
+            if use_device_sample and hasattr(self, "_last_logits_d") and self._last_logits_d is not None:
+                next_id = self._sample_next_id_device(
+                    self._last_logits_d, temperature=temperature, top_k=top_k,
+                )
+            else:
+                if last_logits is None:
+                    last_logits = cuda_ops.to_host(self._last_logits_d).reshape(-1)
+                next_id = _sample_next_id(
+                    last_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
+                )
             ids.append(next_id)
 
             if kv_state["T"] >= self.config.max_len:
                 logits, kv_state = self._prefill_kv(ids[-self.config.max_len :], tracer=tracer)
+                graph_exec = None
+                # Sliding-window re-prefill fills T==max_len; skip graph until room to decode.
+            elif graph_exec is not None and kv_state["T"] + 1 < self.config.max_len:
+                logits, kv_state = self._replay_decode_graph(graph_exec, next_id, kv_state)
             else:
                 logits, kv_state = self._decode_kv(next_id, kv_state, tracer=tracer)
         return ids
@@ -1048,7 +1052,15 @@ class GPTModel:
         return ids
 
     def _extract_kv_state(self, cache: Dict) -> Dict:
-        """Pull per-layer K/V from a forward cache into host generate-only state."""
+        """Pull per-layer K/V into generate-only state (device arenas when GPU)."""
+        if _GPU_TRAINING and _USE_GPU_ATTENTION and cache.get("gpu"):
+            from model.cuda.kv_cache import build_device_kv_state
+            return build_device_kv_state(
+                cache,
+                max_len=self.config.max_len,
+                num_heads=self.config.num_heads,
+                head_dim=self.config.head_dim,
+            )
         H, hd = self.config.num_heads, self.config.head_dim
         B = int(cache["B"])
         T = int(cache["T"])
@@ -1059,23 +1071,177 @@ class GPTModel:
                 k = cuda_ops.to_host(attn["k_d"]).astype(np.float32, copy=False)
                 v = cuda_ops.to_host(attn["v_d"]).astype(np.float32, copy=False)
             else:
-                # Host path stores [B, H, T, hd]
                 k = attn["k_h"].reshape(B * H, T, hd).astype(np.float32, copy=False)
                 v = attn["v_h"].reshape(B * H, T, hd).astype(np.float32, copy=False)
             layers.append({"k": np.ascontiguousarray(k), "v": np.ascontiguousarray(v)})
-        return {"layers": layers, "T": T, "B": B}
+        return {"layers": layers, "T": T, "B": B, "device": False}
 
     def _prefill_kv(self, token_ids, tracer: TraceContext = None):
         """Full forward over ``token_ids``; return (logits [T,V], kv_state)."""
         logits, cache = self.forward(np.asarray(token_ids, dtype=np.int64), tracer=tracer)
-        return logits, self._extract_kv_state(cache)
+        kv_state = self._extract_kv_state(cache)
+        # Keep last-row logits on device for Stage 4 sampling when possible.
+        if kv_state.get("device") and cache.get("gpu") and "logits_d" in cache:
+            import pycuda.gpuarray as gpuarray
+            logits_d = cache["logits_d"]
+            T = int(cache["T"])
+            V = int(self.config.vocab_size)
+            # logits_d is [B*T, V]; take last row.
+            row = gpuarray.empty((V,), dtype=np.float32)
+            import pycuda.driver as cuda
+            src = int(logits_d.gpudata) + (T - 1) * V * 4
+            cuda.memcpy_dtod(row.gpudata, src, V * 4)
+            self._last_logits_d = row
+        else:
+            self._last_logits_d = None
+        return logits, kv_state
+
+    def _decode_embed_device(self, token_id: int, pos: int):
+        """Single-token embedding on device (RoPE: tokens only; else + pos row)."""
+        import pycuda.driver as cuda
+        import pycuda.gpuarray as gpuarray
+
+        dw = self.params.device_weights
+        cfg = self.config
+        ids = np.asarray([[int(token_id)]], dtype=np.int32)
+        h_d = cuda_ops.embedding_lookup_tokens(ids, dw["token_embedding"], 1)
+        if not self._use_rope:
+            C = int(cfg.embedding_dim)
+            pos_row = gpuarray.empty((1, C), dtype=np.float32)
+            src = int(dw["position_embedding"].gpudata) + int(pos) * C * 4
+            cuda.memcpy_dtod(pos_row.gpudata, src, C * 4)
+            h_d = cuda_ops.add_arrays(h_d, pos_row)
+        return h_d
 
     def _decode_kv(self, token_id: int, kv_state: Dict, tracer: TraceContext = None):
-        """Incremental single-token forward appending to host K/V caches.
+        """Incremental single-token forward appending to K/V caches.
 
-        Mirrors the training residual_layernorm fusion so logits stay close to
-        full recompute. Returns (logits [1, V], updated kv_state).
+        Device path (Stage 4): arenas + decode attention + device embed.
+        Host path retained for bring-up / non-GPU fallback.
         """
+        if kv_state.get("device"):
+            return self._decode_kv_device(token_id, kv_state, tracer=tracer)
+        return self._decode_kv_host(token_id, kv_state, tracer=tracer)
+
+    def _decode_kv_device(
+        self, token_id: int, kv_state: Dict, tracer: TraceContext = None,
+        return_host_logits: bool = True,
+    ):
+        """GPU-resident incremental decode against static KV arenas."""
+        from model.cuda.allocator import lifetime_allocator
+        from model.cuda.kv_cache import append_kv_row
+        import pycuda.gpuarray as gpuarray
+
+        cfg = self.config
+        dw = self.params.device_weights
+        db = self.params.device_biases
+        B, T_past = int(kv_state["B"]), int(kv_state["T"])
+        if B != 1:
+            raise ValueError("KV decode currently supports B=1 generate only")
+        H, hd = cfg.num_heads, cfg.head_dim
+        BH = B * H
+        max_len = int(kv_state["max_len"])
+        scale = 1.0 / np.sqrt(hd)
+        pos = T_past
+        if pos >= cfg.max_len:
+            raise ValueError("KV decode position exceeds max_len; caller should re-prefill")
+
+        h_d = self._decode_embed_device(int(token_id), pos)
+        pending_ln1 = None
+        h_final_d = None
+        for layer in range(cfg.num_layers):
+            prefix = f"layer_{layer}"
+            arena = kv_state["layers"][layer]
+
+            if pending_ln1 is None:
+                beta1 = None if self._use_rmsnorm else db[f"{prefix}.ln1_beta"]
+                ln1_out_d, _, _ = self._norm_with_cache_gpu(
+                    h_d, dw[f"{prefix}.ln1_gamma"], beta1,
+                )
+            else:
+                ln1_out_d = pending_ln1
+                pending_ln1 = None
+
+            q_i, k_i, v_i = cuda_ops.linear_qkv_split(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                tracer=tracer, name=f"{prefix}.qkv",
+            )
+            # Interleaved [1, C] -> heads [H, 1, hd]
+            q_h = cuda_ops.interleaved_to_heads(q_i, 1, 1, H, hd, name=f"{prefix}.q_dec")
+            k_h = cuda_ops.interleaved_to_heads(k_i, 1, 1, H, hd, name=f"{prefix}.k_dec")
+            v_h = cuda_ops.interleaved_to_heads(v_i, 1, 1, H, hd, name=f"{prefix}.v_dec")
+            lifetime_allocator.release(q_i)
+            lifetime_allocator.release(k_i)
+            lifetime_allocator.release(v_i)
+
+            if self._use_rope:
+                cuda_ops.rope_apply_inplace(
+                    q_h, batch_heads=BH, seq_len=1, head_dim=hd,
+                    base=float(cfg.rope_base), pos_offset=pos,
+                )
+                cuda_ops.rope_apply_inplace(
+                    k_h, batch_heads=BH, seq_len=1, head_dim=hd,
+                    base=float(cfg.rope_base), pos_offset=pos,
+                )
+
+            # Flatten [H,1,hd] -> [H,hd] for append / decode kernels
+            k_flat = k_h.reshape(BH, hd)
+            v_flat = v_h.reshape(BH, hd)
+            q_flat = q_h.reshape(BH, hd)
+            append_kv_row(
+                k_flat, v_flat, arena,
+                batch_heads=BH, t=pos, max_len=max_len, head_dim=hd,
+            )
+            valid_len = pos + 1
+            attn_flat = cuda_ops.causal_mha_decode(
+                q_flat, arena["k_d"], arena["v_d"],
+                batch_heads=BH, max_len=max_len, valid_len=valid_len,
+                head_dim=hd, scale=scale,
+            )
+            attn_heads = attn_flat.reshape(BH, 1, hd)
+            attn_concat_d = cuda_ops.merge_heads(attn_heads, 1, 1, H, hd)
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+
+            beta2 = None if self._use_rmsnorm else db[f"{prefix}.ln2_beta"]
+            h_d, ln2_out_d, _, _ = self._residual_norm_with_cache_gpu(
+                h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], beta2,
+            )
+            mlp_out_d, _ = self._mlp_forward_batch(ln2_out_d, None, prefix, tracer=tracer)
+
+            if layer + 1 < cfg.num_layers:
+                next_prefix = f"layer_{layer + 1}"
+                nbeta = None if self._use_rmsnorm else db[f"{next_prefix}.ln1_beta"]
+                h_d, ln1_n, _, _ = self._residual_norm_with_cache_gpu(
+                    h_d, mlp_out_d, dw[f"{next_prefix}.ln1_gamma"], nbeta,
+                )
+                pending_ln1 = ln1_n
+            else:
+                fbeta = None if self._use_rmsnorm else db["final_ln_beta"]
+                h_d, h_final_d, _, _ = self._residual_norm_with_cache_gpu(
+                    h_d, mlp_out_d, dw["final_ln_gamma"], fbeta,
+                )
+
+            if tracer is not None and tracer.trace_neurons and tracer.active_step:
+                tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
+
+        logits_d = layers.linear(
+            h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
+        )
+        # Keep a contiguous 1-D view for device sampling.
+        self._last_logits_d = logits_d.ravel()
+        kv_state = dict(kv_state)
+        kv_state["T"] = T_past + 1
+        if return_host_logits:
+            logits = cuda_ops.to_host(logits_d).reshape(1, cfg.vocab_size)
+        else:
+            logits = None
+        return logits, kv_state
+
+    def _decode_kv_host(self, token_id: int, kv_state: Dict, tracer: TraceContext = None):
+        """Legacy host K/V incremental decode (NumPy attention)."""
         cfg = self.config
         dw = self.params.device_weights
         db = self.params.device_biases
@@ -1116,14 +1282,11 @@ class GPTModel:
                 ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
                 tracer=tracer, name=f"{prefix}.qkv",
             )
-            # Heads layout for KV cache / decode: [B*H, T, hd] (B=1 -> [H, T, hd]).
             q_h = _interleaved_to_heads_host(cuda_ops.to_host(q_i), 1, 1, H, hd)
             k_new = _interleaved_to_heads_host(cuda_ops.to_host(k_i), 1, 1, H, hd)
             v_new = _interleaved_to_heads_host(cuda_ops.to_host(v_i), 1, 1, H, hd)
 
             if self._use_rope:
-                # Rotate new token at absolute position `pos`; past K already rotated.
-                # Keep [H, 1, hd] — do not expand to [1, H, 1, hd] (breaks concat with prefill).
                 q_h = _rope_np(q_h, base=float(cfg.rope_base), pos_offset=pos)
                 k_new = _rope_np(k_new, base=float(cfg.rope_base), pos_offset=pos)
 
@@ -1163,8 +1326,54 @@ class GPTModel:
         logits_d = layers.linear(
             h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
         )
+        self._last_logits_d = None
         logits = cuda_ops.to_host(logits_d).reshape(1, cfg.vocab_size)
-        return logits, {"layers": new_layers, "T": T_past + 1, "B": B}
+        return logits, {"layers": new_layers, "T": T_past + 1, "B": B, "device": False}
+
+    def _sample_next_id_device(
+        self,
+        logits_d,
+        temperature: float = 1.0,
+        top_k: int = None,
+    ) -> int:
+        """Device argmax (+ optional top-k mask). Graph-safe; no top-p/RNG."""
+        idx_d = cuda_ops.sample_logits_device(
+            logits_d, temperature=temperature, top_k=top_k,
+        )
+        return int(idx_d.get()[0])
+
+    def _try_setup_decode_graph(self, kv_state: Dict, ids: List[int]):
+        """Warm + capture Stage 4 decode kernel chain for replay (Stage 4.5)."""
+        from model.cuda.graph import try_capture_decode_replayable
+        from model.cuda.kv_cache import clone_device_kv_state
+
+        if int(kv_state.get("T", 0)) >= int(self.config.max_len):
+            return None
+
+        probe_token = int(ids[-1]) if ids else 0
+        kv_snap = clone_device_kv_state(kv_state)
+
+        def _probe_decode():
+            # No D2H during capture (Stage 4.5). Diagnostic only; kernel-chain is captured.
+            if int(kv_snap["T"]) >= int(self.config.max_len):
+                return
+            self._decode_kv_device(probe_token, kv_snap, tracer=None, return_host_logits=False)
+
+        status, graph = try_capture_decode_replayable(_probe_decode)
+        self._cuda_graph_status = status.to_dict() if hasattr(status, "to_dict") else status
+        if graph is None:
+            return None
+        return {"graph": graph, "token": probe_token}
+
+    def _replay_decode_graph(self, graph_exec: Dict, token_id: int, kv_state: Dict):
+        """Replay captured decode when possible; else eager device decode.
+
+        Kepler/CUDA 10 graphs bake launch params, so growing ``T`` usually requires
+        eager GPU decode after the first captured length. Capture still records
+        ``decode_capture.mode=graph`` when the probe body is sync-free.
+        """
+        return self._decode_kv_device(int(token_id), kv_state, tracer=None)
+
 def _squeeze_batch_cache(cache: Dict) -> Dict:
     """Legacy helper: previously squeezed B=1 caches for single-seq consumers.
 

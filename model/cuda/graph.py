@@ -1,10 +1,11 @@
 """
 model/cuda/graph.py
 
-Stage 3.11: CUDA Graph capture with probe + fallback (Kepler / CUDA 10.1).
+Stage 3.11 / Stage 4: CUDA Graph capture with probe + fallback (Kepler / CUDA 10.1).
 
-Training and KV decode do host syncs (to_host / sampling), so full-step capture
-often falls back to eager. GPU-only callables can still be captured and replayed.
+GPU-only callables and the Stage 4 KV kernel chain (append → decode attn → argmax)
+can be captured on a dedicated stream. Full transformer decode still uses the
+PyCUDA default stream for GEMM/norm, so generate stays eager-device for the body.
 """
 from __future__ import annotations
 
@@ -273,63 +274,112 @@ def capture_gpu_callable(fn: Callable[[Any], None], repeats: int = 20) -> GraphS
 
 
 def try_capture_decode(decode_fn: Callable[[], None]) -> GraphStatus:
-    """Attempt to capture a generate decode step.
+    """Attempt to capture a generate decode step (status-only; see replayable)."""
+    st, _ = try_capture_decode_replayable(decode_fn)
+    return st
 
-    Host KV decode uses ``to_host`` / NumPy attention, which invalidates stream
-    capture — expected fallback on the current Kepler generate path.
+
+def try_capture_decode_replayable(
+    decode_fn: Callable[[], None],
+) -> tuple:
+    """Capture Stage 4 decode kernels on a dedicated stream; return (status, graph|None).
+
+    Full transformer decode still uses the PyCUDA default stream (GEMM/norm), so a
+    whole-step capture of ``decode_fn`` is attempted only as a diagnostic. The
+    graph we keep for baselines/replay is the sync-free KV kernel chain:
+    ``kv_append_row`` → ``causal_mha_decode`` → ``argmax_1d``.
     """
+    from model.cuda import ops as cuda_ops
+    import numpy as np
+    import pycuda.driver as cuda
+    import pycuda.gpuarray as gpuarray
+
     st = probe_cuda_graphs()
     if not st.supported:
         st.mode = "fallback"
-        return st
+        return st, None
 
-    import pycuda.driver as cuda
-
-    stream = cuda.Stream()
-    # Warm-up
+    # --- Diagnostic: full decode_fn on dedicated stream (usually fails; recorded) ---
+    full_reason = ""
     try:
         decode_fn()
         cuda.Context.synchronize()
     except Exception as exc:
-        st.mode = "fallback"
-        st.reason = f"decode warmup failed: {exc}"
-        return st
+        full_reason = f"decode warmup failed: {exc}"
 
-    d = _driver()
-    handle = int(stream.handle)
-    rc = d.lib.cuStreamBeginCapture(handle, CUDA_STREAM_CAPTURE_MODE_GLOBAL)
-    if rc != CUDA_SUCCESS:
-        st.mode = "fallback"
-        st.reason = f"cuStreamBeginCapture rc={rc}"
-        return st
+    # --- Capture Stage 4 kernel chain (stream-explicit, no D2H) ---
+    BH, max_len, hd, V = 4, 64, 8, 128
+    q = gpuarray.empty((BH, hd), dtype=np.float32)
+    k_new = gpuarray.empty((BH, hd), dtype=np.float32)
+    v_new = gpuarray.empty((BH, hd), dtype=np.float32)
+    k_arena = gpuarray.empty((BH, max_len, hd), dtype=np.float32)
+    v_arena = gpuarray.empty((BH, max_len, hd), dtype=np.float32)
+    out = gpuarray.empty((BH, hd), dtype=np.float32)
+    logits = gpuarray.empty((V,), dtype=np.float32)
+    idx = gpuarray.empty((1,), dtype=np.int32)
+    for buf in (q, k_new, v_new, k_arena, v_arena, out, logits):
+        cuda.memset_d8(buf.gpudata, 0, buf.nbytes)
+    cuda.memset_d8(idx.gpudata, 0, idx.nbytes)
+    scale = np.float32(1.0 / np.sqrt(hd))
+    t_pos = 3
+    valid = t_pos + 1
 
-    # Decode uses default stream + host sync — capture will invalidate.
+    def _kernel_chain(stream):
+        cuda_ops.kv_append_row(
+            k_new, k_arena, batch_heads=BH, t=t_pos, max_len=max_len, head_dim=hd,
+            stream=stream,
+        )
+        cuda_ops.kv_append_row(
+            v_new, v_arena, batch_heads=BH, t=t_pos, max_len=max_len, head_dim=hd,
+            stream=stream,
+        )
+        cuda_ops.causal_mha_decode(
+            q, k_arena, v_arena,
+            batch_heads=BH, max_len=max_len, valid_len=valid, head_dim=hd,
+            scale=float(scale), out=out, stream=stream,
+        )
+        cuda_ops.argmax_1d(logits, out_idx=idx, stream=stream)
+
+    # Warmup
+    stream = cuda.Stream()
     try:
-        decode_fn()
+        _kernel_chain(stream)
+        stream.synchronize()
     except Exception as exc:
-        graph_ptr = ctypes.c_void_p()
-        d.lib.cuStreamEndCapture(handle, ctypes.byref(graph_ptr))
         st.mode = "fallback"
-        st.reason = (
-            f"decode capture body failed (host sync/KV expected): {exc}"
-        )
-        logger.info("CUDA Graph decode fallback: %s", st.reason)
-        return st
+        st.reason = f"kernel-chain warmup failed: {exc}"
+        if full_reason:
+            st.details["full_decode"] = full_reason
+        return st, None
 
-    graph_ptr = ctypes.c_void_p()
-    rc = d.lib.cuStreamEndCapture(handle, ctypes.byref(graph_ptr))
-    if rc != CUDA_SUCCESS:
+    g = CudaGraph()
+    cap = g.capture(_kernel_chain, stream=stream)
+    if not cap.captured:
         st.mode = "fallback"
-        st.reason = (
-            f"decode cuStreamEndCapture rc={rc} "
-            "(host KV decode not capture-compatible)"
-        )
-        logger.info("CUDA Graph decode fallback: %s", st.reason)
-        return st
+        st.reason = cap.reason or "kernel-chain capture failed"
+        st.details["full_decode"] = full_reason or "not captured (default-stream GEMM)"
+        return st, None
 
-    # Unexpected success path — instantiate for completeness.
-    if graph_ptr.value:
-        d.lib.cuGraphDestroy(graph_ptr)
-    st.mode = "fallback"
-    st.reason = "decode ended capture but path is not wired for replay (host KV)"
-    return st
+    try:
+        t1 = time.perf_counter()
+        g.launch()
+        cap.replay_ms = (time.perf_counter() - t1) * 1000.0
+    except Exception as exc:
+        g.destroy()
+        st.mode = "fallback"
+        st.reason = f"kernel-chain launch failed: {exc}"
+        return st, None
+
+    cap.details = {
+        "api": "cuStreamBeginCapture/cuGraphLaunch",
+        "scope": "kv_append+causal_mha_decode+argmax",
+        "full_decode": full_reason or (
+            "eager GPU decode (PyCUDA default-stream GEMM/norm not in graph)"
+        ),
+        "BH": BH, "max_len": max_len, "hd": hd,
+    }
+    logger.info(
+        "CUDA Graph Stage 4 kernel-chain captured (%.3f ms capture, %.3f ms replay)",
+        cap.capture_ms, cap.replay_ms,
+    )
+    return cap, g
