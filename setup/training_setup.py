@@ -241,11 +241,14 @@ class TrainingSetup:
                 self.model_config, data_dir=self.data_dir,
             )
         
-        # Update vocab size in model config
-        if self.dataset:
-            vocab_size = len(set(' '.join(self.dataset)))
-            self.model_config['vocab_size'] = vocab_size
-            logger.info(f"Updated vocab_size from corpus: {vocab_size}")
+        # Vocab size comes from the tokenizer after train.build_tokenizer_and_config
+        # (BPE default). Leave null so train overrides from the real vocab.
+        if self.dataset and self.model_config is not None:
+            self.model_config['vocab_size'] = None
+            logger.info(
+                "Dataset selected (%s sentences); vocab_size deferred to tokenizer build",
+                len(self.dataset),
+            )
     
     def _setup_weight_initialization(self):
         """Setup weight initialization."""
@@ -308,15 +311,19 @@ class TrainingSetup:
         
         print("\n[MODEL]")
         print(f"  Name:                  {self.model_config.get('name', 'Custom')}")
-        print(f"  Vocabulary Size:       {self.model_config['vocab_size']}")
+        vocab_display = self.model_config.get('vocab_size')
+        print(f"  Vocabulary Size:       {vocab_display if vocab_display is not None else '(from tokenizer at train start)'}")
         print(f"  Embedding Dimension:   {self.model_config['embedding_dim']}")
         print(f"  Attention Heads:       {self.model_config['num_heads']}")
         print(f"  Transformer Layers:    {self.model_config['num_layers']}")
         print(f"  Max Sequence Length:   {self.model_config['max_len']}")
         
-        estimate = estimate_vram_footprint(self.model_config)
-        print(f"  Parameter Count:       {estimate['total_params']:,}")
-        print(f"  Estimated VRAM:        {estimate['total_mb']:.2f} MB")
+        est_cfg = dict(self.model_config)
+        if est_cfg.get('vocab_size') is None:
+            est_cfg['vocab_size'] = 256  # placeholder until BPE/char vocab is built
+        estimate = estimate_vram_footprint(est_cfg)
+        print(f"  Parameter Count:       ~{estimate['total_params']:,} (vocab TBD)")
+        print(f"  Estimated VRAM:        ~{estimate['total_mb']:.2f} MB (vocab TBD)")
         
         print("\n[DATASET]")
         print(f"  Name:                  {self.dataset_name}")
@@ -361,12 +368,16 @@ class TrainingSetup:
         Returns:
             Dict with all settings
         """
+        from tokenizer.factory import DEFAULT_BPE_MERGES, DEFAULT_TOKENIZER
+
         return {
             'model': self.model_config,
             'dataset': {
                 'name': self.dataset_name,
-                'vocab_size': self.model_config['vocab_size'],
+                'vocab_size': self.model_config.get('vocab_size'),
                 'num_sentences': len(self.dataset) if self.dataset else 0,
+                'tokenizer': DEFAULT_TOKENIZER,
+                'bpe_merges': DEFAULT_BPE_MERGES,
             },
             'weight_initialization': self.init_scales,
             'hyperparameters': self.hyperparams,

@@ -17,7 +17,7 @@ from logging_config import logger
 from model.config import GPTConfig
 from model.weights import ModelParameters
 from paths import OUTPUT_CHECKPOINTS, OUTPUT_TOKENIZER, checkpoint_vocab_sidecar, ensure_output_dirs
-from tokenizer.tokenizer import CharacterGPTTokenizer
+from tokenizer.factory import load_tokenizer, save_tokenizer
 from version import __version__
 
 
@@ -31,7 +31,7 @@ def _resolve_out_dir(checkpoint_dir: str) -> Path:
 def save_checkpoint(
     checkpoint_dir: str,
     params: ModelParameters,
-    tokenizer: CharacterGPTTokenizer,
+    tokenizer,
     config: Dict,
     step: int,
     epoch: int,
@@ -44,7 +44,7 @@ def save_checkpoint(
 
     np.savez(out_dir / "weights.npz", **params.all_params())
     vocab_path = out_dir / "vocab.json"
-    tokenizer.save_vocab(vocab_path)
+    save_tokenizer(tokenizer, vocab_path)
     sidecar = checkpoint_vocab_sidecar(out_dir)
     OUTPUT_TOKENIZER.mkdir(parents=True, exist_ok=True)
     shutil.copy2(vocab_path, sidecar)
@@ -102,7 +102,7 @@ def load_metrics(checkpoint_dir: Path) -> Dict:
 
 
 def load_checkpoint(checkpoint_dir: str):
-    """Returns (GPTConfig, ModelParameters, CharacterGPTTokenizer, full_config_dict, state_dict)."""
+    """Returns (GPTConfig, ModelParameters, tokenizer, full_config_dict, state_dict)."""
     ckpt_dir = Path(checkpoint_dir)
 
     with open(ckpt_dir / "config.json", "r", encoding="utf-8") as f:
@@ -118,7 +118,7 @@ def load_checkpoint(checkpoint_dir: str):
         with open(val_corpus_path, "r", encoding="utf-8") as f:
             full_config.setdefault("dataset", {})["val_corpus"] = json.load(f)
 
-    tokenizer = CharacterGPTTokenizer.load_vocab(ckpt_dir / "vocab.json")
+    tokenizer = load_tokenizer(ckpt_dir / "vocab.json")
     gpt_config = GPTConfig(full_config["model"])
 
     params = ModelParameters(gpt_config, init_scales=full_config.get("weight_initialization", {}))

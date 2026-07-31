@@ -8,7 +8,7 @@ and interactive.py so trace flags and paths stay consistent across CLIs.
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from model.trace import TraceContext
 from logging_config import logger
@@ -18,6 +18,7 @@ from paths import (
     LEGACY_CONFIG_PATH,
     resolve_checkpoints_dir,
 )
+from tokenizer.factory import DEFAULT_BPE_MERGES, DEFAULT_TOKENIZER
 
 
 def add_trace_args(parser: argparse.ArgumentParser) -> None:
@@ -231,6 +232,18 @@ def add_checkpoint_arg(parser: argparse.ArgumentParser, default: Optional[str] =
 
 def add_seed_arg(parser: argparse.ArgumentParser, default: int = 42) -> None:
     parser.add_argument("--seed", type=int, default=default, help="Random seed")
+
+
+def add_tokenizer_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("tokenizer")
+    group.add_argument(
+        "--tokenizer", type=str, choices=("bpe", "char"), default=None,
+        help=f"Tokenizer for new runs (default: {DEFAULT_TOKENIZER}; resume loads checkpoint vocab)",
+    )
+    group.add_argument(
+        "--bpe-merges", type=int, default=None, dest="bpe_merges",
+        help=f"BPE merge count when --tokenizer bpe (default: {DEFAULT_BPE_MERGES})",
+    )
 
 
 def build_tracer(args, default_trace_every: int = 100) -> TraceContext:
@@ -462,3 +475,404 @@ def select_checkpoint_interactive(
             print(f"'{choice}' has no config.json; pick a valid checkpoint.")
             continue
         return choice
+
+
+# ---------------------------------------------------------------------------
+# --menu flag-group picker (train / auto_train / generate)
+# ---------------------------------------------------------------------------
+
+def _ask_raw(label: str, default_display: str) -> Optional[str]:
+    try:
+        return input(f"{label} [default={default_display}]: ").strip()
+    except EOFError:
+        return None
+
+
+def _ask_value(args: argparse.Namespace, attr: str, label: str, caster, default):
+    """Prompt for args.attr; Enter keeps current value or default."""
+    current = getattr(args, attr, None)
+    display = current if current is not None else default
+    if getattr(args, "no_prompt", False):
+        if current is None:
+            setattr(args, attr, default)
+        return
+    raw = _ask_raw(label, display if display is not None else "None")
+    if raw is None or raw == "":
+        if current is None:
+            setattr(args, attr, default)
+        return
+    try:
+        setattr(args, attr, caster(raw))
+    except (TypeError, ValueError):
+        print(f"  Invalid value {raw!r}; keeping {display!r}")
+        if current is None:
+            setattr(args, attr, default)
+
+
+def _ask_bool(args: argparse.Namespace, attr: str, label: str, default: bool) -> None:
+    """Prompt y/n for a store_true-style flag. CLI True wins; unset uses default."""
+    if getattr(args, attr, False) is True:
+        return
+    # Optional store_true with default=None (tie_embeddings / grad_checkpoint).
+    existing = getattr(args, attr, None)
+    if existing is True:
+        return
+    if getattr(args, "no_prompt", False):
+        setattr(args, attr, default)
+        return
+    hint = "Y/n" if default else "y/N"
+    raw = _ask_raw(f"{label} ({hint})", "Y" if default else "N")
+    if raw is None or raw == "":
+        setattr(args, attr, default)
+        return
+    setattr(args, attr, raw.lower() in ("y", "yes", "1", "true", "on"))
+
+
+def _parse_group_selection(raw: str, n_groups: int) -> Set[int]:
+    raw = (raw or "").strip().lower()
+    if not raw:
+        return set()
+    if raw == "all":
+        return set(range(1, n_groups + 1))
+    selected: Set[int] = set()
+    for part in raw.replace(" ", "").split(","):
+        if part.isdigit() and 1 <= int(part) <= n_groups:
+            selected.add(int(part))
+    return selected
+
+
+def _prompt_tokenizer_group(args: argparse.Namespace, config: Optional[Dict]) -> None:
+    kind = getattr(args, "tokenizer", None) or (
+        (config or {}).get("dataset", {}) or {}
+    ).get("tokenizer") or DEFAULT_TOKENIZER
+    merges = getattr(args, "bpe_merges", None)
+    if merges is None:
+        merges = ((config or {}).get("dataset", {}) or {}).get("bpe_merges", DEFAULT_BPE_MERGES)
+
+    if getattr(args, "tokenizer", None) is None and not getattr(args, "no_prompt", False):
+        raw = _ask_raw("Tokenizer (bpe/char)", kind)
+        if raw:
+            kind = raw.strip().lower()
+            if kind not in ("bpe", "char"):
+                print(f"  Unknown tokenizer {raw!r}; using {DEFAULT_TOKENIZER}")
+                kind = DEFAULT_TOKENIZER
+        args.tokenizer = kind
+    elif getattr(args, "tokenizer", None) is None:
+        args.tokenizer = kind
+
+    if args.tokenizer == "bpe":
+        if getattr(args, "bpe_merges", None) is None and not getattr(args, "no_prompt", False):
+            raw = _ask_raw("BPE merges", merges)
+            args.bpe_merges = int(raw) if raw else int(merges)
+        elif getattr(args, "bpe_merges", None) is None:
+            args.bpe_merges = int(merges)
+
+    if config is not None:
+        dataset = config.setdefault("dataset", {})
+        dataset["tokenizer"] = args.tokenizer
+        if args.tokenizer == "bpe":
+            dataset["bpe_merges"] = int(args.bpe_merges or DEFAULT_BPE_MERGES)
+
+
+def _prompt_obs_group(args: argparse.Namespace) -> None:
+    _ask_bool(args, "runtime_metrics", "Enable --runtime-metrics?", False)
+    _ask_bool(args, "memory_timeline", "Enable --memory-timeline? (implies metrics)", False)
+    if getattr(args, "memory_timeline", False):
+        args.runtime_metrics = True
+
+
+def _prompt_trace_group(args: argparse.Namespace, *, generate_style: bool = False) -> None:
+    _ask_bool(args, "verbose", "Enable --verbose?", False)
+    _ask_bool(args, "trace_logits", "Enable --trace-logits?", False)
+    _ask_bool(args, "trace_tokens", "Enable --trace-tokens?", False)
+    _ask_bool(args, "trace_neurons", "Enable --trace-neurons?", False)
+    _ask_bool(args, "trace_vectorization", "Enable --trace-vectorization?", False)
+    any_trace = any(
+        getattr(args, a, False)
+        for a in ("verbose", "trace_logits", "trace_tokens", "trace_neurons", "trace_vectorization")
+    )
+    if any_trace and getattr(args, "trace_every", None) is None:
+        default_every = 1 if generate_style else None
+        if default_every is not None:
+            _ask_value(args, "trace_every", "Trace every N steps", int, default_every)
+        else:
+            raw = _ask_raw("Trace every N steps (blank = ~10% of train steps)", "auto")
+            if raw and raw.lower() != "auto":
+                try:
+                    args.trace_every = int(raw)
+                except ValueError:
+                    pass
+
+
+def _prompt_probe_group(args: argparse.Namespace) -> None:
+    # probes on by default → no_generate_probe default False
+    skip = False
+    if not getattr(args, "no_generate_probe", False):
+        _ask_bool(args, "no_generate_probe", "Skip quarterly generate probes (--no-generate-probe)?", False)
+        skip = bool(args.no_generate_probe)
+    if skip:
+        return
+    _ask_value(args, "generate_probe_prompt", "Generate-probe prompt", str, "once upon a")
+    _ask_value(args, "generate_probe_tokens", "Generate-probe tokens", int, 256)
+    if hasattr(args, "temperature"):
+        from training.probe import (
+            DEFAULT_GENERATE_PROBE_TEMPERATURE,
+            DEFAULT_GENERATE_PROBE_TOP_K,
+            DEFAULT_GENERATE_PROBE_TOP_P,
+        )
+        _ask_value(args, "temperature", "Probe temperature", float, DEFAULT_GENERATE_PROBE_TEMPERATURE)
+        _ask_value(args, "top_k", "Probe top-k (blank=None)", lambda s: int(s) if s else None, DEFAULT_GENERATE_PROBE_TOP_K)
+        _ask_value(args, "top_p", "Probe top-p (blank=None)", lambda s: float(s) if s else None, DEFAULT_GENERATE_PROBE_TOP_P)
+
+
+def _prompt_quality_group(args: argparse.Namespace) -> None:
+    # Interactive menu default: trial on
+    run_trial = True
+    if getattr(args, "no_quality_trial", False):
+        run_trial = False
+    elif getattr(args, "quality_trial", False):
+        run_trial = True
+    else:
+        _ask_bool(args, "quality_trial", "Run post-train quality trial?", True)
+        run_trial = bool(args.quality_trial)
+        if not run_trial:
+            args.no_quality_trial = True
+    if run_trial:
+        args.no_quality_trial = False
+        default_prompt = getattr(args, "generate_probe_prompt", None) or "once upon a"
+        if getattr(args, "quality_prompt", None) is None:
+            _ask_value(args, "quality_prompt", "Quality-trial prompt", str, default_prompt)
+        if getattr(args, "quality_weights", None) is None:
+            raw = _ask_raw("Quality weights (spelling,punctuation,grammar,semantics)", "1,1,1,1")
+            if raw:
+                args.quality_weights = raw
+
+
+def _prompt_length_extras(args: argparse.Namespace, hyperparams: Dict) -> None:
+    """Length flags beyond LR/steps/epochs (those use prompt_training_length_and_lr)."""
+    _ask_value(args, "log_every", "Log every N steps", int, getattr(args, "log_every", 100) or 100)
+    if getattr(args, "checkpoint_every", None) is None:
+        raw = _ask_raw("Checkpoint every N steps (blank=auto)", "auto")
+        if raw and raw.lower() != "auto":
+            try:
+                args.checkpoint_every = int(raw)
+            except ValueError:
+                pass
+    default_min = hyperparams.get("min_lr_ratio", 0.1)
+    if getattr(args, "min_lr_ratio", None) is None:
+        _ask_value(args, "min_lr_ratio", "Min LR ratio (cosine floor)", float, default_min)
+    default_stride = hyperparams.get("window_stride", 1)
+    if getattr(args, "window_stride", None) is None:
+        _ask_value(args, "window_stride", "Window stride", int, default_stride)
+    if getattr(args, "val_every", 0) == 0:
+        _ask_value(args, "val_every", "Val every N steps (0=off)", int, 0)
+
+
+def _prompt_model_arch_extras(args: argparse.Namespace, model_config: Dict, hyperparams: Dict) -> None:
+    """Architecture toggles prompted when Model group is selected (dims via prompt_model_hyperparams)."""
+    if getattr(args, "norm_type", None) is None:
+        default_norm = model_config.get("norm_type", "rmsnorm")
+        raw = _ask_raw("Norm type (layernorm/rmsnorm)", default_norm)
+        if raw:
+            args.norm_type = raw.strip().lower()
+        else:
+            args.norm_type = default_norm
+    if getattr(args, "pos_encoding", None) is None:
+        default_pos = model_config.get("pos_encoding", "rope")
+        raw = _ask_raw("Pos encoding (learned/rope)", default_pos)
+        if raw:
+            args.pos_encoding = raw.strip().lower()
+        else:
+            args.pos_encoding = default_pos
+
+    if not getattr(args, "no_tie_embeddings", False) and getattr(args, "tie_embeddings", None) is None:
+        tied = bool(model_config.get("tie_embeddings", True))
+        _ask_bool(args, "tie_embeddings", "Tie embeddings?", tied)
+        if not args.tie_embeddings:
+            args.no_tie_embeddings = True
+
+    if not getattr(args, "no_grad_checkpoint", False) and getattr(args, "grad_checkpoint", None) is None:
+        gc = bool(model_config.get("gradient_checkpointing", False))
+        _ask_bool(args, "grad_checkpoint", "Enable --grad-checkpoint (VRAM, not speed)?", gc)
+        if not args.grad_checkpoint:
+            args.no_grad_checkpoint = True
+
+    if getattr(args, "run_budget", None) is None:
+        raw = _ask_raw("Run budget steps for quarters (blank=session total)", "auto")
+        if raw and raw.lower() != "auto":
+            try:
+                args.run_budget = int(raw)
+            except ValueError:
+                pass
+
+
+def _prompt_sampling_group(args: argparse.Namespace, *, defaults: Optional[Dict] = None) -> None:
+    d = defaults or {}
+    _ask_value(args, "prompt", "Prompt", str, d.get("prompt", "the"))
+    _ask_value(args, "max_new_tokens", "Max new tokens", int, d.get("max_new_tokens", 80))
+    _ask_value(args, "temperature", "Temperature", float, d.get("temperature", 0.8))
+    if getattr(args, "top_k", None) is None:
+        raw = _ask_raw("Top-k (blank=None)", d.get("top_k", "None"))
+        if raw and raw.lower() != "none":
+            try:
+                args.top_k = int(raw)
+            except ValueError:
+                pass
+    if getattr(args, "top_p", None) is None:
+        raw = _ask_raw("Top-p (blank=None)", d.get("top_p", "None"))
+        if raw and raw.lower() != "none":
+            try:
+                args.top_p = float(raw)
+            except ValueError:
+                pass
+    if hasattr(args, "seed"):
+        _ask_value(args, "seed", "Seed", int, getattr(args, "seed", 42) or 42)
+
+
+def _prompt_decode_group(args: argparse.Namespace) -> None:
+    _ask_bool(args, "no_kv_cache", "Disable KV cache (--no-kv-cache)?", False)
+    _ask_bool(args, "cuda_graph", "Enable --cuda-graph (KV kernel-chain)?", False)
+
+
+def prompt_run_flag_menu(
+    args: argparse.Namespace,
+    *,
+    fresh_run: bool,
+    entry: str,
+    config: Optional[Dict] = None,
+    hyperparams: Optional[Dict] = None,
+    model_config: Optional[Dict] = None,
+) -> Set[str]:
+    """Pick flag groups to customize, then prompt selected flags. Returns group keys selected.
+
+    entry: "train" | "auto_train" | "generate"
+    """
+    if getattr(args, "no_prompt", False):
+        return set()
+
+    hyperparams = hyperparams or (config or {}).get("hyperparameters") or {}
+    model_config = model_config or (config or {}).get("model") or {}
+
+    if entry == "generate":
+        groups: List[tuple] = [
+            ("sampling", "Sampling", "prompt=the, tokens=80, temp=0.8, no top-k/p"),
+            ("decode", "Decode", "KV cache on, cuda-graph off"),
+            ("trace", "Tracing", "all off"),
+        ]
+        title = "Configure generate flags"
+    else:
+        groups = []
+        if fresh_run:
+            groups.append(("tokenizer", "Tokenizer", f"{DEFAULT_TOKENIZER} / {DEFAULT_BPE_MERGES} merges"))
+        groups.extend([
+            ("length", "Training length", "preset/config LR·steps; stride/val defaults"),
+        ])
+        if fresh_run:
+            groups.append(("model", "Model / arch", "rmsnorm+rope+tied; grad-checkpoint off"))
+        groups.extend([
+            ("obs", "Observability", "metrics off, timeline off"),
+            ("trace", "Tracing", "all off"),
+            ("probe", "Generate probes", "on"),
+            ("quality", "Quality trial", "on (interactive)"),
+        ])
+        if entry == "train":
+            groups.append(("plot", "Plot", "off"))
+        elif entry == "auto_train":
+            groups.append(("smoke", "Smoke generate", "prompt=the, tokens=80"))
+        title = "Configure run flags"
+
+    print(f"\n{title} — groups to customize (Enter=none / e.g. 1,4 or all)")
+    print("-" * 70)
+    for i, (_key, label, default_note) in enumerate(groups, 1):
+        print(f"  [{i}] {label:<18} default: {default_note}")
+
+    try:
+        raw = input("Groups to customize: ").strip()
+    except EOFError:
+        raw = ""
+    selected_idx = _parse_group_selection(raw, len(groups))
+    selected_keys = {groups[i - 1][0] for i in selected_idx}
+
+    if "tokenizer" in selected_keys:
+        print("\n[Tokenizer]")
+        _prompt_tokenizer_group(args, config)
+    elif fresh_run and entry != "generate" and config is not None:
+        # Apply silent defaults into config for new runs.
+        dataset = config.setdefault("dataset", {})
+        if getattr(args, "tokenizer", None) is None:
+            args.tokenizer = dataset.get("tokenizer") or DEFAULT_TOKENIZER
+        dataset["tokenizer"] = args.tokenizer
+        if args.tokenizer == "bpe":
+            if getattr(args, "bpe_merges", None) is None:
+                args.bpe_merges = int(dataset.get("bpe_merges", DEFAULT_BPE_MERGES))
+            dataset["bpe_merges"] = int(args.bpe_merges)
+
+    if "length" in selected_keys:
+        print("\n[Training length]")
+        prompt_training_length_and_lr(args, hyperparams)
+        _prompt_length_extras(args, hyperparams)
+
+    if "model" in selected_keys and fresh_run:
+        print("\n[Model / arch]")
+        _prompt_model_arch_extras(args, model_config, hyperparams)
+        # Dims / batch etc. — interactive
+        prompt_model_hyperparams(args, model_config, hyperparams)
+
+    if "obs" in selected_keys:
+        print("\n[Observability]")
+        _prompt_obs_group(args)
+
+    if "trace" in selected_keys:
+        print("\n[Tracing]")
+        _prompt_trace_group(args, generate_style=(entry == "generate"))
+
+    if "probe" in selected_keys:
+        print("\n[Generate probes]")
+        _prompt_probe_group(args)
+
+    if "quality" in selected_keys:
+        print("\n[Quality trial]")
+        _prompt_quality_group(args)
+
+    if "plot" in selected_keys and hasattr(args, "plot"):
+        print("\n[Plot]")
+        _ask_bool(args, "plot", "Enable --plot after training?", False)
+
+    if "smoke" in selected_keys:
+        print("\n[Smoke generate]")
+        from training.probe import (
+            DEFAULT_GENERATE_PROBE_TEMPERATURE,
+            DEFAULT_GENERATE_PROBE_TOP_K,
+            DEFAULT_GENERATE_PROBE_TOP_P,
+        )
+        _prompt_sampling_group(
+            args,
+            defaults={
+                "prompt": "the",
+                "max_new_tokens": 80,
+                "temperature": DEFAULT_GENERATE_PROBE_TEMPERATURE,
+                "top_k": DEFAULT_GENERATE_PROBE_TOP_K,
+                "top_p": DEFAULT_GENERATE_PROBE_TOP_P,
+            },
+        )
+
+    if "sampling" in selected_keys:
+        print("\n[Sampling]")
+        _prompt_sampling_group(args)
+
+    if "decode" in selected_keys:
+        print("\n[Decode]")
+        _prompt_decode_group(args)
+
+    return selected_keys
+
+
+def apply_silent_model_defaults(args: argparse.Namespace, model_config: Dict, hyperparams: Dict) -> None:
+    """Apply model/hyperparam defaults without prompting (menu group skipped)."""
+    saved = getattr(args, "no_prompt", False)
+    args.no_prompt = True
+    try:
+        prompt_model_hyperparams(args, model_config, hyperparams)
+    finally:
+        args.no_prompt = saved
+

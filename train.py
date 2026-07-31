@@ -52,7 +52,11 @@ from paths import (
     run_root_for_checkpoint,
 )
 from tools.tracing.runtime_metrics import memory_timeline, runtime_metrics
-from tokenizer.tokenizer import CharacterGPTTokenizer
+from tokenizer.factory import (
+    bpe_merges_from_config,
+    build_tokenizer,
+    tokenizer_kind_from_config,
+)
 from training.checkpoint import promote_best, save_checkpoint
 from training.dataset import WindowedDataset
 from training.eval import (
@@ -86,10 +90,11 @@ def parse_args() -> argparse.Namespace:
     cli_common.add_runtime_observability_args(parser)
     cli_common.add_probe_args(parser)
     cli_common.add_quality_args(parser)
+    cli_common.add_tokenizer_args(parser)
     parser.add_argument(
         "--menu", action="store_true",
-        help="Run the interactive training setup wizard (model/dataset/init/hyperparams) "
-             "before training, instead of loading --config from disk",
+        help="Interactive wizard + flag-group picker (tokenizer/length/model/obs/trace/…) "
+             "before training; Enter keeps recipe defaults per group",
     )
     parser.add_argument(
         "--data-dir", type=str, default=str(DATA_DIR),
@@ -128,12 +133,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_tokenizer_and_config(config: dict) -> tuple:
+def build_tokenizer_and_config(config: dict, args: Optional[argparse.Namespace] = None) -> tuple:
     from setup.config_loader import resolve_dataset_corpus
 
     corpus = resolve_dataset_corpus(config["dataset"])
     config["dataset"]["corpus"] = corpus
-    tokenizer = CharacterGPTTokenizer.from_corpus(corpus)
+    kind = tokenizer_kind_from_config(config.get("dataset"), args)
+    merges = bpe_merges_from_config(config.get("dataset"), args)
+    config["dataset"]["tokenizer"] = kind
+    if kind == "bpe":
+        config["dataset"]["bpe_merges"] = merges
+    tokenizer = build_tokenizer(corpus, kind=kind, num_merges=merges)
 
     configured_vocab = config["model"].get("vocab_size")
     if configured_vocab != tokenizer.vocab_size:
@@ -439,12 +449,28 @@ def train(args: argparse.Namespace) -> str:
         args.checkpoint = str(run_dir)
 
     hyperparams = config["hyperparameters"]
+    menu_selected = set()
+    entry = "auto_train" if getattr(args, "_entry", None) == "auto_train" else "train"
+    if getattr(args, "menu", False) and not getattr(args, "no_prompt", False):
+        menu_selected = cli_common.prompt_run_flag_menu(
+            args,
+            fresh_run=not resumed,
+            entry=entry,
+            config=config,
+            hyperparams=hyperparams,
+            model_config=config["model"],
+        )
 
     if not resumed:
         # Architecture is fixed once a checkpoint exists, so these prompts only
         # apply to fresh runs.
-        cli_common.prompt_model_hyperparams(args, config["model"], hyperparams)
-        tokenizer, gpt_config = build_tokenizer_and_config(config)
+        if getattr(args, "menu", False):
+            if "model" not in menu_selected:
+                cli_common.apply_silent_model_defaults(args, config["model"], hyperparams)
+            # model group already called prompt_model_hyperparams when selected
+        else:
+            cli_common.prompt_model_hyperparams(args, config["model"], hyperparams)
+        tokenizer, gpt_config = build_tokenizer_and_config(config, args)
         params = ModelParameters(gpt_config, init_scales=config.get("weight_initialization", {}), seed=args.seed)
     else:
         # Resume: allow CLI overrides for grad-accum / tie only when explicitly set.
@@ -456,7 +482,16 @@ def train(args: argparse.Namespace) -> str:
     # 90/10 val holdout (stable across resume when val_corpus.json is present).
     train_corpus, val_corpus = ensure_train_val_split(config, seed=args.seed)
 
-    cli_common.prompt_training_length_and_lr(args, hyperparams)
+    # Length prompts: menu Length group already asked; otherwise keep legacy prompt.
+    if not (getattr(args, "menu", False) and "length" in menu_selected):
+        if getattr(args, "menu", False) and "length" not in menu_selected:
+            # Silent length defaults when menu skipped the Length group.
+            if args.learning_rate is None:
+                args.learning_rate = hyperparams.get("learning_rate", 0.01)
+            if args.steps is None and args.epochs is None:
+                args.epochs = hyperparams.get("num_epochs", 10)
+        else:
+            cli_common.prompt_training_length_and_lr(args, hyperparams)
     if args.learning_rate is not None:
         hyperparams["learning_rate"] = args.learning_rate
     if getattr(args, "gradient_accumulation_steps", None) is not None:

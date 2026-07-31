@@ -104,7 +104,7 @@ Exists
 
 Exists (Stage 3.2–3.11)
 ├── Generate KV cache + tools/bench_generate.py
-├── tokenizer/bpe.py (experiment; char remains BiggerTest default)
+├── tokenizer/bpe.py + factory (BPE default for new runs; char via --tokenizer char)
 ├── Activation accounting (tools/tracing/activation_account.py)
 ├── FP16 activation storage + device casts (model/cuda/fp16_storage.py)
 ├── LifetimeAllocator (model/cuda/allocator.py)
@@ -119,6 +119,11 @@ Exists (Stage 4)
 ├── Device argmax + fixed-k top-k sampling (top-p stays host)
 ├── CUDA Graph kernel-chain capture (append → decode attn → argmax)
 └── Baseline: output/baselines/stage4_gpu_kv_decode.json
+
+Exists (tokenizer + menus)
+├── BPE default for new train/auto_train runs (--tokenizer char to opt out)
+├── train/auto_train/generate --menu flag-group picker (Enter = defaults)
+└── Checkpoint vocab load dispatches char vs type=bpe
 
 Not yet (Stage 4 follow-ons)
 ├── full transformer decode inside one CUDA Graph (GEMM/norm still default-stream)
@@ -148,7 +153,7 @@ Not yet (Stage 4 follow-ons)
 
 Principle for later milestones: every change must answer (1) Did the runtime get better? (2) Did correctness hold?
 
-**Next:** Stage 4 (GPU-resident KV decode → device sampling → CUDA Graph replay) uses the stabilization discipline against the v0.1.2 snapshot.
+**Next:** Stage 4 follow-ons (full-decode graph, device top-p) and longer BPE BiggerTest validation against the v0.1.2 / stage4 baselines.
 
 ### Stabilization release discipline
 
@@ -177,7 +182,7 @@ Generation: Prompt → Tokenizer → Transformer prefill → KV cache → Increm
 |--------|----------------|
 | Runtime | CUDA transformer engine + CUDA Graph API (decode fallback) |
 | Memory | process-only VRAM + FP16 device casts + lifetime reuse |
-| Model | GPT + tokenizer experiments (char default) |
+| Model | GPT + BPE default tokenizer (char opt-in) |
 | Observability | metrics, timeline, reports |
 | Verification | NumPy reference + parity |
 
@@ -290,7 +295,7 @@ llm gpu 8/
 ├── tests/parity/             ← NumPy↔CUDA verification
 ├── model/                    ← GPT + CUDA kernels/ops (fp16_storage, graph, …)
 ├── training/                 ← checkpoint, loss, AdamWGPU, quality, …
-├── tokenizer/                ← char default + bpe.py experiment
+├── tokenizer/                ← BPE default (factory) + char opt-in
 ├── setup/ / data/
 └── output/                   ← runtime artifacts (baselines/releases tracked)
 ```
@@ -566,6 +571,12 @@ Generation at this stage: reliable TinyStories openers; mid-sample coherence sti
 ---
 
 ## Changelog
+
+### [0.1.2+] — 2026-08-01 — BPE default + `--menu` flag groups
+
+- **BPE default:** [`tokenizer/factory.py`](tokenizer/factory.py) — new runs use BPE (`--tokenizer bpe`, `--bpe-merges 200`); char via `--tokenizer char`; resume loads checkpoint vocab type
+- **Menu flag picker:** `train.py` / `auto_train.py` / `generate.py --menu` — pick groups to customize; Enter keeps on/off defaults ([`cli_common.prompt_run_flag_menu`](cli_common.py))
+- **generate.py --menu:** checkpoint picker + Sampling / Decode / Trace groups
 
 ### [0.1.2+] — 2026-07-31 — Stage 4 GPU-resident KV decode
 

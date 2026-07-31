@@ -1,7 +1,8 @@
 """
 tools/bpe_protocol.py
 
-Stage 3.3 char vs BPE measurement protocol (does not change BiggerTest default).
+Stage 3.3 char vs BPE measurement protocol (historical control table).
+New training defaults to BPE via tokenizer/factory.py; this tool stays comparative.
 """
 from __future__ import annotations
 

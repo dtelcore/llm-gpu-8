@@ -27,9 +27,10 @@ python train.py --menu
 
 1. Resume or **new** run → pick a checkpoint name under `output/checkpoints/`.
 2. Scaling preset → **2. Tiny Stories**.
-3. When asked for steps, start with **500–2000** for smoke, or **20k+** for a real run.
+3. **Flag groups** — Enter keeps recipe defaults; or enter e.g. `1,4` to customize Tokenizer / Observability / …. New runs default to **BPE** (`--tokenizer bpe`, 200 merges); use group Tokenizer or `--tokenizer char` for character-level.
+4. When Length is customized (or you skip the menu groups and use non-menu prompts), start with **500–2000** steps for smoke, or **20k+** for a real run.
 
-Same wizard from `auto_train.py --menu` if you want a generate smoke right after train.
+Same wizard from `auto_train.py --menu` (adds a **Smoke generate** flag group). One-shot sample config: `python generate.py --menu`.
 
 **Non-interactive length/LR only** (after you already ran the wizard once, or when resuming):
 
@@ -56,6 +57,7 @@ Preset hyperparams and architecture come from the checkpoint/config; override LR
 | Grad accum | 4 | Effective batch **16** sequences per optimizer step |
 | `window_stride` | 64 | Fewer windows per epoch vs dense stride-1 |
 | LR schedule knobs | `--min-lr-ratio`, `--warmup-steps` | Cosine needs a step budget (`--steps` or epochs) |
+| Tokenizer | **BPE** (200 merges) | Char via `--tokenizer char`; old checkpoints keep their vocab |
 
 Training skips host logits sync on the GPU CE path (`need_host_logits=False`); parity and benches still use host logits by default.
 

@@ -93,6 +93,27 @@ Shared flag groups live in [`cli_common.py`](cli_common.py) and are referenced b
 | `--compare-quarters` | flag | off |
 | `--set-best` | str | `None` (e.g. `quarter_50`) |
 
+### Tokenizer `(shared: tokenizer)`
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--tokenizer` | `bpe`\|`char` | `bpe` (new runs) | Resume loads checkpoint `vocab.json` type |
+| `--bpe-merges` | int | `200` | Only for new BPE builds |
+
+### `--menu` flag-group picker
+
+`train.py --menu`, `auto_train.py --menu`, and `generate.py --menu` call
+`cli_common.prompt_run_flag_menu`. Enter = keep defaults for unlisted groups;
+selected groups prompt each flag with Enter-to-accept (booleans as `y/N` / `Y/n`).
+
+| Entry | Groups |
+|-------|--------|
+| train | Tokenizer*, Length, Model*, Obs, Trace, Probe, Quality, Plot |
+| auto_train | same + Smoke generate (no Plot) |
+| generate | Sampling, Decode (KV / cuda-graph), Trace |
+
+\* Tokenizer / Model only on fresh runs (not resume).
+
 ---
 
 ## Training & generation
@@ -105,8 +126,8 @@ python train.py [flags]
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
-| *(shared: config, checkpoint, seed, length, model, trace, obs, probe, quality)* | | | |
-| `--menu` | flag | off | Interactive setup wizard |
+| *(shared: config, checkpoint, seed, length, model, trace, obs, probe, quality, tokenizer)* | | | |
+| `--menu` | flag | off | Wizard + flag-group picker |
 | `--data-dir` | str | `data` | Datasets for `--menu` |
 | `--models-dir` | str | `output/checkpoints` | Checkpoint scan for menu / `--generate` |
 | `--generate` | flag | off | Skip train; generation REPL |
@@ -125,6 +146,7 @@ python train.py --menu
 python train.py --resume --checkpoint output\checkpoints\BiggerTest256256 --steps 5000 --no-prompt
 python train.py --resume --checkpoint output\checkpoints\ts_run --val-every 500 --steps 2000 --no-prompt
 python train.py --resume --checkpoint output\checkpoints\BiggerTest256256 --runtime-metrics --memory-timeline --no-prompt --steps 200
+python train.py --tokenizer char --menu   # opt into character tokenizer
 python train.py --generate --models-dir output\checkpoints
 python train.py --compare-quarters --checkpoint output\checkpoints\BiggerTest256256
 ```
@@ -141,14 +163,14 @@ python auto_train.py [flags]
 
 | Flag | Type | Default |
 |------|------|---------|
-| *(shared: config, checkpoint, seed, length, model, probe, quality, trace, obs)* | | |
+| *(shared: config, checkpoint, seed, length, model, probe, quality, trace, obs, tokenizer)* | | |
 | `--resume` | flag | off |
 | `--prompt` | str | `the` |
 | `--max-new-tokens` | int | `80` |
 | `--temperature` | float | probe default |
 | `--top-k` | int | probe default |
 | `--top-p` | float | probe default |
-| `--menu` | flag | off |
+| `--menu` | flag | off | Wizard + flag groups (incl. smoke generate) |
 | `--data-dir` | str | `data` |
 | `--models-dir` | str | `output/checkpoints` |
 
@@ -170,9 +192,14 @@ python generate.py [flags]
 | `--top-p` | float | `None` | |
 | `--no-kv-cache` | flag | off | Full recompute each token |
 | `--cuda-graph` | flag | off | Stage 4: capture KV kernel-chain graph; full decode stays eager GPU |
+| `--menu` | flag | off | Pick checkpoint + Sampling / Decode / Trace groups |
+| `--models-dir` | str | `output/checkpoints` | For `--menu` |
+| `--no-prompt` | flag | off | Skip flag prompts when used with `--menu` |
 
 ```powershell
+python generate.py --menu
 python generate.py --checkpoint output\checkpoints\BiggerTest256256 --prompt "once upon a" --max-new-tokens 256 --temperature 0.6 --top-k 10 --top-p 0.9
+python generate.py --checkpoint output\checkpoints\BiggerTest256256 --cuda-graph --max-new-tokens 128
 ```
 
 ---

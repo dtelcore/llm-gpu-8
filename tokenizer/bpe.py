@@ -1,8 +1,8 @@
 """
 tokenizer/bpe.py
 
-Simple byte-pair encoding tokenizer for Stage 3.3 experiments.
-Does not replace CharacterGPTTokenizer as the BiggerTest default.
+Whitespace-aware BPE over character symbols. Default tokenizer for new training
+runs (see tokenizer/factory.py). Char remains available via --tokenizer char.
 """
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import json
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
+
+from logging_config import logger
 
 
 def _word_tokens(text: str) -> List[str]:
@@ -56,13 +58,13 @@ def _merge_pair(seqs: List[List[str]], pair: Tuple[str, str]) -> List[List[str]]
 
 
 class BPETokenizer:
-    """Whitespace-aware BPE over character symbols (experiment path)."""
+    """Whitespace-aware BPE; API-compatible with CharacterGPTTokenizer for train/trace."""
 
     def __init__(self) -> None:
         self.vocab: List[str] = []
         self.merges: List[Tuple[str, str]] = []
-        self.token_to_id: Dict[str, int] = {}
-        self.id_to_token: Dict[int, str] = {}
+        self._token_to_id: Dict[str, int] = {}
+        self._id_to_token: Dict[int, str] = {}
         self.vocab_size: int = 0
 
     @classmethod
@@ -80,7 +82,6 @@ class BPETokenizer:
         return inst
 
     def train(self, text: str, num_merges: int = 200) -> None:
-        # Start from characters present in text (+ keep space/newline as atoms).
         chars = sorted(set(text))
         seqs: List[List[str]] = []
         for word in _word_tokens(text):
@@ -101,8 +102,8 @@ class BPETokenizer:
 
         self.merges = merges
         self.vocab = sorted(vocab_set, key=lambda s: (len(s), s))
-        self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
-        self.id_to_token = {i: t for t, i in self.token_to_id.items()}
+        self._token_to_id = {t: i for i, t in enumerate(self.vocab)}
+        self._id_to_token = {i: t for t, i in self._token_to_id.items()}
         self.vocab_size = len(self.vocab)
 
     def _apply_merges(self, symbols: List[str]) -> List[str]:
@@ -126,18 +127,26 @@ class BPETokenizer:
         for word in _word_tokens(text):
             pieces = self._apply_merges(list(word))
             for p in pieces:
-                tid = self.token_to_id.get(p)
+                tid = self._token_to_id.get(p)
                 if tid is not None:
                     ids.append(tid)
                 else:
-                    # Fall back to characters if an unknown merge piece appears
                     for ch in p:
-                        if ch in self.token_to_id:
-                            ids.append(self.token_to_id[ch])
+                        if ch in self._token_to_id:
+                            ids.append(self._token_to_id[ch])
         return ids
 
     def decode(self, ids: List[int]) -> str:
-        return "".join(self.id_to_token.get(i, "") for i in ids)
+        return "".join(self._id_to_token.get(i, "") for i in ids)
+
+    def id_to_token(self, token_id: int) -> str:
+        return self._id_to_token.get(token_id, "<unk>")
+
+    def token_to_id(self, token: str) -> int:
+        return self._token_to_id.get(token, -1)
+
+    def save_vocab(self, filepath: Union[str, Path]) -> None:
+        self.save(filepath)
 
     def save(self, filepath: Union[str, Path]) -> None:
         path = Path(filepath)
@@ -146,10 +155,11 @@ class BPETokenizer:
             "type": "bpe",
             "vocab": self.vocab,
             "merges": [[a, b] for a, b in self.merges],
-            "token_to_id": self.token_to_id,
-            "id_to_token": {str(k): v for k, v in self.id_to_token.items()},
+            "token_to_id": self._token_to_id,
+            "id_to_token": {str(k): v for k, v in self._id_to_token.items()},
         }
         path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info("BPE vocab saved to %s (%s tokens)", path, self.vocab_size)
 
     @classmethod
     def load(cls, filepath: Union[str, Path]) -> "BPETokenizer":
@@ -157,8 +167,8 @@ class BPETokenizer:
         inst = cls()
         inst.vocab = state["vocab"]
         inst.merges = [tuple(p) for p in state["merges"]]
-        inst.token_to_id = state["token_to_id"]
-        inst.id_to_token = {int(k): v for k, v in state["id_to_token"].items()}
+        inst._token_to_id = {str(k): int(v) for k, v in state["token_to_id"].items()}
+        inst._id_to_token = {int(k): v for k, v in state["id_to_token"].items()}
         inst.vocab_size = len(inst.vocab)
         return inst
 

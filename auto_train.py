@@ -65,18 +65,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--menu", action="store_true",
-        help="Run the interactive training setup wizard before training. First prompt lets "
-             "you resume from an existing checkpoint instead of starting fresh.",
+        help="Interactive wizard + flag-group picker (incl. smoke-generate flags). "
+             "First prompt: resume or new run; Enter keeps recipe defaults per group.",
     )
     parser.add_argument("--data-dir", type=str, default=str(DATA_DIR), help="Directory auto-scanned for .txt datasets when --menu is used")
     parser.add_argument("--models-dir", type=str, default=str(OUTPUT_CHECKPOINTS), help="Directory scanned for existing checkpoints by --menu (default: output/checkpoints)")
     cli_common.add_trace_args(parser)
     cli_common.add_runtime_observability_args(parser)
+    cli_common.add_tokenizer_args(parser)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    args._entry = "auto_train"
     ensure_output_dirs()
     setup_logging(log_filename="auto_train")
     logger.info("auto_train.py starting | version=%s | checkpoint=%s", __version__, args.checkpoint)
