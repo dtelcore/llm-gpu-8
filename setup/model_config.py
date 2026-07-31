@@ -204,24 +204,25 @@ def estimate_vram_footprint(config_dict: Dict) -> Dict[str, float]:
     tie_embeddings = bool(config_dict.get('tie_embeddings', False))
     if tie_embeddings:
         breakdown['output_projection'] = 0
-        breakdown['tied_embeddings'] = True
     else:
         output_proj = C * vocab_size
         total_params += output_proj
         breakdown['output_projection'] = output_proj
-        breakdown['tied_embeddings'] = False
-    breakdown['norm_type'] = 'rmsnorm' if use_rmsnorm else 'layernorm'
-    breakdown['pos_encoding'] = 'rope' if use_rope else 'learned'
-    
+
     # Convert to bytes (float32 = 4 bytes per param)
     total_bytes = total_params * 4
     total_mb = total_bytes / (1024 * 1024)
-    
+
+    # Keep breakdown numeric-only (print_summary divides by total_params).
+    # Architecture flags live alongside, not inside breakdown.
     return {
         'total_params': total_params,
         'total_bytes': total_bytes,
         'total_mb': total_mb,
-        'breakdown': {k: v for k, v in breakdown.items()},
+        'breakdown': breakdown,
+        'tie_embeddings': tie_embeddings,
+        'norm_type': 'rmsnorm' if use_rmsnorm else 'layernorm',
+        'pos_encoding': 'rope' if use_rope else 'learned',
     }
 
 
@@ -502,6 +503,9 @@ class ModelConfigBuilder:
         print(f"Attention Heads:       {self.config['num_heads']}")
         print(f"Transformer Layers:    {self.config['num_layers']}")
         print(f"Dropout Probability:   {self.config['dropout_prob']:.2f}")
+        print(f"Norm Type:             {estimate.get('norm_type', self.config.get('norm_type', 'layernorm'))}")
+        print(f"Position Encoding:     {estimate.get('pos_encoding', self.config.get('pos_encoding', 'learned'))}")
+        print(f"Tied Embeddings:       {estimate.get('tie_embeddings', self.config.get('tie_embeddings', False))}")
         print()
         print("PARAMETER COUNTS")
         print("-" * 70)
@@ -510,8 +514,11 @@ class ModelConfigBuilder:
         print()
         print("BREAKDOWN BY COMPONENT")
         print("-" * 70)
+        total = estimate['total_params'] or 1
         for component, count in estimate['breakdown'].items():
-            pct = 100 * count / estimate['total_params']
+            if not isinstance(count, (int, float)) or isinstance(count, bool):
+                continue
+            pct = 100.0 * count / total
             print(f"  {component:30s}: {count:10,} params ({pct:5.1f}%)")
         print("="*70 + "\n")
 

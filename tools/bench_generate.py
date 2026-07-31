@@ -26,6 +26,7 @@ from model.gpt import GPTModel, _kv_state_nbytes
 from model.weights import ModelParameters
 from tokenizer.tokenizer import CharacterGPTTokenizer
 from training.checkpoint import load_checkpoint
+from version import __version__
 
 DEFAULT_PROMPT = "once upon a time"
 
@@ -122,7 +123,7 @@ def main():
 
     n = args.max_new_tokens
     result = {
-        "version": "0.1.1-dev",
+        "version": __version__,
         "milestone": "stage_3_2",
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": args.checkpoint or "tiny_random",

@@ -169,6 +169,7 @@ python generate.py [flags]
 | `--top-k` | int | `None` | |
 | `--top-p` | float | `None` | |
 | `--no-kv-cache` | flag | off | Full recompute each token |
+| `--cuda-graph` | flag | off | Stage 3.11: attempt CUDA Graph capture of KV decode (falls back if host sync) |
 
 ```powershell
 python generate.py --checkpoint output\checkpoints\BiggerTest256256 --prompt "once upon a" --max-new-tokens 256 --temperature 0.6 --top-k 10 --top-p 0.9
@@ -364,15 +365,17 @@ python tools/bpe_protocol.py [flags]
 
 ### `tools/stage3_milestones.py`
 
-Runs Stage 3.4–3.7 measurement artifacts.
+Runs Stage 3.4–3.7 and 3.11 measurement artifacts.
 
 ```text
-python tools/stage3_milestones.py [--stages 34,35,36,37]
+python tools/stage3_milestones.py [--stages 34,35,36,37,311]
 ```
 
 | Flag | Type | Default |
 |------|------|---------|
-| `--stages` | str | `34,35,36,37` |
+| `--stages` | str | `34,35,36,37,311` |
+
+Writes under `output/baselines/` including `stage311_cuda_graph.json`.
 
 ### `tools/reports/evolution_report.py`
 
@@ -389,12 +392,12 @@ python tools/reports/evolution_report.py [--out PATH]
 Known-good release snapshot (parity gate included).
 
 ```text
-python tools/releases/make_snapshot.py [--tag v0.1.1]
+python tools/releases/make_snapshot.py [--tag v0.1.2]
 ```
 
 | Flag | Type | Default |
 |------|------|---------|
-| `--tag` | str | `v0.1.1` |
+| `--tag` | str | `v0.1.2` |
 
 Writes `output/releases/<tag>/{runtime,quality,generation,memory}.json`, `parity.txt`, `evolution.html`.
 
@@ -433,7 +436,7 @@ These are imported by the entry points above; they have no project-facing argpar
 
 | Path | Role |
 |------|------|
-| `model/*`, `model/cuda/*` | GPT + kernels / ops / allocator / FP16 storage |
+| `model/*`, `model/cuda/*` | GPT + kernels / ops / allocator / FP16 storage / graph |
 | `training/*` | dataset, loss, checkpoint, optimizer, probe, quality, eval |
 | `tokenizer/tokenizer.py`, `tokenizer/bpe.py` | Char + experimental BPE |
 | `setup/config_loader.py`, `dataset_setup.py`, `model_config.py`, `training_presets.py`, `weight_init.py` | Setup helpers |
@@ -459,9 +462,9 @@ These are imported by the entry points above; they have no project-facing argpar
 | `tools/tracing/memory_timeline.py` | Summarize ScratchPool JSONL |
 | `tools/tracing/activation_account.py` | Activation VRAM buckets |
 | `tools/bpe_protocol.py` | Char vs BPE protocol |
-| `tools/stage3_milestones.py` | Stages 3.4–3.7 batch |
+| `tools/stage3_milestones.py` | Stages 3.4–3.7 + 3.11 batch |
 | `tools/reports/evolution_report.py` | HTML evolution report |
-| `tools/releases/make_snapshot.py` | `v0.1.1` release snapshot |
+| `tools/releases/make_snapshot.py` | `v0.1.2` release snapshot |
 | `python -m tests.parity.run_parity` | Correctness gate (prefer `.\venv\Scripts\python.exe -m tests.parity.run_parity`) |
 | [`guide.md`](guide.md) | GT 730 TinyStories fast start |
 | `setup/training_setup.py` | Setup wizard |

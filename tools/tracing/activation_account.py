@@ -22,6 +22,7 @@ from model.config import GPTConfig
 from model.cuda import ops as cuda_ops
 from model.gpt import GPTModel
 from model.weights import ModelParameters
+from version import __version__
 from tools.tracing.runtime_metrics import runtime_metrics, memory_timeline
 
 
@@ -89,9 +90,9 @@ def account_forward_cache(cache: Dict) -> Dict[str, int]:
 
 
 def device_used_mb() -> float:
-    import pycuda.driver as cuda
-    free, total = cuda.mem_get_info()
-    return (total - free) / (1024 * 1024)
+    """Process-only used VRAM (excludes display/HDMI via ops baseline/NVML)."""
+    from model.cuda import ops as cuda_ops
+    return float(cuda_ops.process_used_mb())
 
 
 def run_account(B: int, T: int, embed: int, layers: int, heads: int, vocab: int) -> Dict:
@@ -114,6 +115,7 @@ def run_account(B: int, T: int, embed: int, layers: int, heads: int, vocab: int)
     buckets = account_forward_cache(cache)
     p = account_params(params)
     scratch = int(cuda_ops.scratch_pool.resident_bytes()) if hasattr(cuda_ops, "scratch_pool") else 0
+    mem = cuda_ops.get_memory_usage()
 
     # Adam m/v estimate (not allocated here): 2 * param device
     adam_est = 2 * p["parameter_device_bytes"]
@@ -123,12 +125,15 @@ def run_account(B: int, T: int, embed: int, layers: int, heads: int, vocab: int)
     largest = max(buckets.items(), key=lambda kv: kv[1])[0] if buckets else "none"
 
     return {
-        "version": "0.1.1-dev",
+        "version": __version__,
         "milestone": "stage_3_4",
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "shapes": {"B": B, "T": T, "embed": embed, "layers": layers, "heads": heads, "vocab": vocab},
         "device_used_mb_before_forward": round(before, 3),
         "device_used_mb_after_forward": round(after, 3),
+        "vram_driver_used_mb": round(mem["driver_used_bytes"] / (1024 * 1024), 3),
+        "vram_source": mem["source"],
+        "vram_note": "device_used_mb is process-only (excludes display/HDMI); vram_driver_used_mb is total-free.",
         "parameter_mb": round(p["parameter_device_bytes"] / (1024 * 1024), 4),
         "adam_m_v_estimated_mb": round(adam_est / (1024 * 1024), 4),
         "scratch_pool_mb": round(scratch / (1024 * 1024), 4),

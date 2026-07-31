@@ -130,8 +130,10 @@ Leave **`--grad-checkpoint` off** when measuring tok/s; use it only to save VRAM
 | `dropout_prob: 0.1` expecting regularization | Set **0**; kernels not wired |
 | `--grad-checkpoint` for speed | VRAM lever only — adds recompute |
 | `--runtime-metrics` / `--memory-timeline` left on | Extra sync/I/O; off for max tok/s |
-| Expecting bf16 / FlashAttention / CUDA Graphs on GT 730 | Out of scope for this card |
-| FP16 **storage** vs training | Storage path exists; training is still FP32 compute |
+| Expecting bf16 / FlashAttention / AMP GEMM on GT 730 | Out of scope for this card |
+| Expecting CUDA Graph speedup on KV decode | API exists; host KV decode falls back to eager |
+| FP16 **storage** vs training | Device casts for storage; training math is still FP32 |
+| `device_used_mb` ≈ full card | Process-only (excludes HDMI/display); see `vram_driver_used_mb` for total-free |
 | Stride 64 “short epoch” | Normal — fewer unique windows per pass over the corpus |
 
 ---

@@ -1,7 +1,7 @@
 """
 tools/stage3_milestones.py
 
-Run Stage 3.4–3.7 measurement artifacts (and helpers for 3.5/3.6/3.7).
+Run Stage 3.4–3.7 and 3.11 measurement artifacts.
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from tools.tracing.activation_account import run_account
 from tools.tracing.runtime_metrics import kernel_timeline
 from training.gpu_optimizer import AdamWGPU
 from training.loss import softmax_cross_entropy_batch_gpu
+from version import __version__
 
 
 def _cfg(B=4, T=64, embed=64, layers=2, heads=4, vocab=110):
@@ -80,7 +81,7 @@ def run_35(out: Path):
     set_fp16_activation_storage(False)
 
     result = {
-        "version": "0.1.1-dev",
+        "version": __version__,
         "milestone": "stage_3_5",
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "estimated_activation_savings_bytes": int(est),
@@ -89,7 +90,8 @@ def run_35(out: Path):
         "loss_fp16_storage_path": float(loss1),
         "lm_head_grad_maxdiff": diff,
         "parity_ok": diff < 1e-2,
-        "note": "Activations stored FP16; compute cast to FP32 for sm_35 kernels.",
+        "note": "Activations stored FP16 via device cast kernels; compute remains FP32 for sm_35.",
+        "cast_path": "device_float_to_half / half_to_float",
         "saved_keys_sample": list(saved.keys())[:8],
     }
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -125,7 +127,7 @@ def run_36(out: Path):
 
     stats = lifetime_allocator.stats()
     result = {
-        "version": "0.1.1-dev",
+        "version": __version__,
         "milestone": "stage_3_6",
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "allocator_stats": stats,
@@ -156,12 +158,85 @@ def run_37(out: Path):
     kernel_timeline.disable()
 
     result = {
-        "version": "0.1.1-dev",
+        "version": __version__,
         "milestone": "stage_3_7",
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "timeline_path": str(sample_path),
         "summary": summary,
-        "note": "Software kernel timeline (not CUDA Graph API) for CC 3.5.",
+        "note": "Software kernel timeline; CUDA Graph API is Stage 3.11 (graph.py).",
+    }
+    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def run_311(out: Path):
+    """Stage 3.11: CUDA Graph probe + GPU-only capture + decode fallback."""
+    import numpy as np
+    from pycuda import gpuarray
+    from model.cuda import ops as cuda_ops
+    from model.cuda.graph import capture_gpu_callable, probe_cuda_graphs, try_capture_decode
+    from model.config import GPTConfig
+    from model.gpt import GPTModel
+    from model.weights import ModelParameters
+
+    probe = probe_cuda_graphs()
+
+    # GPU-only callable: device float↔half round-trip (no host sync inside).
+    x = gpuarray.to_gpu(np.random.randn(4096).astype(np.float32))
+    out_h = gpuarray.empty(x.shape, dtype=np.float16)
+    out_f = gpuarray.empty(x.shape, dtype=np.float32)
+
+    def _cast_pair(stream):
+        n = np.int32(x.size)
+        grid, block = cuda_ops._launch_1d(int(x.size))
+        cuda_ops._float_to_half_kernel(x, out_h, n, block=block, grid=grid, stream=stream)
+        cuda_ops._half_to_float_kernel(out_h, out_f, n, block=block, grid=grid, stream=stream)
+
+    gpu_status = capture_gpu_callable(_cast_pair, repeats=30)
+
+    # Tiny model decode capture (expected fallback — host KV).
+    cfg = GPTConfig({
+        "vocab_size": 64,
+        "max_len": 32,
+        "embedding_dim": 32,
+        "num_heads": 4,
+        "num_layers": 1,
+        "dropout_prob": 0.0,
+        "name": "graph_probe",
+    })
+    params = ModelParameters(cfg, seed=0)
+    model = GPTModel(cfg, params)
+    prompt = [1, 2, 3, 4]
+    _logits, kv = model._prefill_kv(prompt)
+    tok = 5
+    kv_snap = {
+        "B": kv["B"],
+        "T": kv["T"],
+        "layers": [{"k": ly["k"].copy(), "v": ly["v"].copy()} for ly in kv["layers"]],
+    }
+
+    def _decode():
+        model._decode_kv(tok, kv_snap, tracer=None)
+
+    decode_status = try_capture_decode(_decode)
+
+    # Also exercise generate wiring.
+    model.generate(prompt, max_new_tokens=2, use_kv_cache=True, use_cuda_graph=True)
+    gen_status = getattr(model, "_cuda_graph_status", None)
+
+    result = {
+        "version": __version__,
+        "milestone": "stage_3_11",
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "probe": probe.to_dict(),
+        "gpu_only_cast_graph": gpu_status.to_dict(),
+        "decode_capture": decode_status.to_dict(),
+        "generate_wiring": gen_status,
+        "note": (
+            "GPU-only callables may capture on CUDA 10+; host KV decode falls back "
+            "to eager (to_host / NumPy attention). Use --cuda-graph on generate.py to probe."
+        ),
     }
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
@@ -170,7 +245,7 @@ def run_37(out: Path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stages", type=str, default="34,35,36,37")
+    ap.add_argument("--stages", type=str, default="34,35,36,37,311")
     args = ap.parse_args()
     Path("output/baselines").mkdir(parents=True, exist_ok=True)
     for s in args.stages.split(","):
@@ -183,6 +258,8 @@ def main():
             run_36(Path("output/baselines/stage36_allocator.json"))
         elif s == "37":
             run_37(Path("output/baselines/stage37_timeline_meta.json"))
+        elif s in ("311", "3.11"):
+            run_311(Path("output/baselines/stage311_cuda_graph.json"))
 
 
 if __name__ == "__main__":

@@ -1,15 +1,20 @@
 """
 model/cuda/fp16_storage.py
 
-Stage 3.5: store selected forward-cache activations as FP16 on device;
+Stage 3.5 / 3.10: store selected forward-cache activations as FP16 on device;
 cast back to FP32 before existing Kepler *_fp32 kernels / backward use.
+
+Casts use device kernels (float_to_half / half_to_float) — no host round-trip.
+Compute math remains FP32 (sm_35 has no useful AMP GEMM path).
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable
 
 import numpy as np
 from pycuda import gpuarray
+
+from model.cuda import ops as cuda_ops
 
 # Keys commonly large in BiggerTest activation accounting.
 DEFAULT_FP16_KEYS = (
@@ -36,16 +41,13 @@ def _is_gpuarray(x: Any) -> bool:
 
 
 def to_fp16_storage(arr: gpuarray.GPUArray) -> gpuarray.GPUArray:
-    """Download→cast→upload as float16 (CC 3.5 safe; kernels stay FP32)."""
-    host = arr.get().astype(np.float16, copy=False)
-    return gpuarray.to_gpu(np.ascontiguousarray(host))
+    """Device float32 → float16 for activation storage."""
+    return cuda_ops.float_to_half(arr)
 
 
 def to_fp32_compute(arr: gpuarray.GPUArray) -> gpuarray.GPUArray:
-    if arr.dtype == np.float32:
-        return arr
-    host = arr.get().astype(np.float32, copy=False)
-    return gpuarray.to_gpu(np.ascontiguousarray(host))
+    """Device float16 → float32 for existing compute / backward kernels."""
+    return cuda_ops.half_to_float(arr)
 
 
 def compress_cache_fp16(cache: Dict, keys: Iterable[str] = DEFAULT_FP16_KEYS) -> Dict[str, int]:

@@ -713,9 +713,10 @@ def train(args: argparse.Namespace) -> str:
             remaining_steps = max(0, total_steps - global_step)
             eta_seconds = (avg_step_ms / 1000.0) * remaining_steps
 
-            free_bytes, total_bytes = cuda_ops.get_memory_info()
-            used_mb = (total_bytes - free_bytes) / (1024 ** 2)
-            free_mb = free_bytes / (1024 ** 2)
+            mem = cuda_ops.get_memory_usage()
+            used_mb = mem["process_used_bytes"] / (1024 ** 2)
+            free_mb = mem["driver_free_bytes"] / (1024 ** 2)
+            driver_used_mb = mem["driver_used_bytes"] / (1024 ** 2)
 
             metrics_extra = ""
             if want_metrics:
@@ -745,11 +746,13 @@ def train(args: argparse.Namespace) -> str:
                 + (f" |{metrics_extra}" if metrics_extra else "")
             )
             # Tagged + keyed for training_log_plotter.py / loss_landscape_plotter.py to parse.
+            # device_used_mb = process-only (excludes display/HDMI); driver_used includes them.
             logger.info(
                 f"[train] step={global_step}/{total_steps} epoch={epoch} loss={avg_recent_loss:.4f} "
                 f"ppl={perplexity_from_loss(avg_recent_loss):.4f} "
                 f"step_ms={avg_step_ms:.1f} tok_s={tokens_per_sec:.0f} lr={optimizer.current_lr():.6g} "
                 f"device_used_mb={used_mb:.0f} vram_free_mb={free_mb:.0f} "
+                f"vram_driver_used_mb={driver_used_mb:.0f} vram_source={mem['source']} "
                 f"elapsed_s={elapsed:.2f} eta_s={eta_seconds:.2f} grad_accum={grad_accum}"
                 + metrics_extra
             )

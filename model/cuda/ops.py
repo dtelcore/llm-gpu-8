@@ -21,6 +21,11 @@ from pycuda.compiler import SourceModule  # noqa: E402
 from logging_config import logger  # noqa: E402
 from model.cuda.kernels import CUDA_SOURCE  # noqa: E402
 
+# Driver used (total-free) just after context init, before our SourceModule /
+# model allocs — so process_used later excludes HDMI/display + foreign VRAM.
+_free0, _total0 = cuda.mem_get_info()
+_baseline_driver_used = int(_total0 - _free0)
+
 _mod = SourceModule(CUDA_SOURCE, options=_env.NVCC_OPTIONS)
 
 TILE_SIZE = 16  # shared-memory tiled GEMM (sm_35 / GT 730)
@@ -72,6 +77,8 @@ _gemm_bias_qkv_split_kernel = _mod.get_function("gemm_bias_qkv_split_fp32")
 _gemm_bias_gelu_kernel = _mod.get_function("gemm_bias_gelu_fp32")
 _fused_mlp_row_kernel = _mod.get_function("fused_mlp_row_fp32")
 _adamw_update_batched_kernel = _mod.get_function("adamw_update_batched_fp32")
+_float_to_half_kernel = _mod.get_function("float_to_half_kernel")
+_half_to_float_kernel = _mod.get_function("half_to_float_kernel")
 
 logger.info("PyCUDA kernels compiled for sm_35 (Kepler GT 730)")
 
@@ -140,6 +147,105 @@ def get_memory_info():
     return free_bytes, total_bytes
 
 
+def _nvml_process_used_bytes():
+    """Return this PID's usedGpuMemory via NVML, or None if unavailable."""
+    try:
+        import ctypes
+        import os
+
+        nvml = ctypes.WinDLL("nvml.dll")
+    except Exception:
+        return None
+
+    NVML_SUCCESS = 0
+
+    class nvmlProcessInfo_t(ctypes.Structure):
+        _fields_ = [
+            ("pid", ctypes.c_uint),
+            ("usedGpuMemory", ctypes.c_ulonglong),
+        ]
+
+    try:
+        if nvml.nvmlInit() != NVML_SUCCESS:
+            return None
+        handle = ctypes.c_void_p()
+        if nvml.nvmlDeviceGetHandleByIndex(0, ctypes.byref(handle)) != NVML_SUCCESS:
+            nvml.nvmlShutdown()
+            return None
+        count = ctypes.c_uint(64)
+        infos = (nvmlProcessInfo_t * 64)()
+        # Prefer v2/v3 if present; fall back to original.
+        getter = getattr(nvml, "nvmlDeviceGetComputeRunningProcesses_v3", None)
+        if getter is None:
+            getter = getattr(nvml, "nvmlDeviceGetComputeRunningProcesses_v2", None)
+        if getter is None:
+            getter = nvml.nvmlDeviceGetComputeRunningProcesses
+        rc = getter(handle, ctypes.byref(count), infos)
+        my_pid = os.getpid()
+        used = None
+        if rc == NVML_SUCCESS:
+            for i in range(int(count.value)):
+                if int(infos[i].pid) == my_pid:
+                    used = int(infos[i].usedGpuMemory)
+                    break
+        nvml.nvmlShutdown()
+        return used
+    except Exception:
+        try:
+            nvml.nvmlShutdown()
+        except Exception:
+            pass
+        return None
+
+
+def reset_memory_baseline():
+    """Re-arm process VRAM baseline from current driver used (total - free)."""
+    global _baseline_driver_used
+    free_b, total_b = cuda.mem_get_info()
+    _baseline_driver_used = int(total_b - free_b)
+    return _baseline_driver_used
+
+
+def get_memory_usage():
+    """Process-attributed VRAM plus driver capacity.
+
+    ``process_used_bytes`` excludes steady display/HDMI reservation when using
+    the baseline method (driver used just after context init, before our
+    SourceModule, is subtracted). Prefers NVML per-PID ``usedGpuMemory`` when
+    ``nvml.dll`` loads.
+
+    Returns dict with: process_used_bytes, driver_free_bytes, driver_total_bytes,
+    driver_used_bytes, source ('nvml'|'baseline').
+    """
+    global _baseline_driver_used
+    free_b, total_b = cuda.mem_get_info()
+    driver_used = int(total_b - free_b)
+    nvml_used = _nvml_process_used_bytes()
+    if nvml_used is not None:
+        return {
+            "process_used_bytes": int(nvml_used),
+            "driver_free_bytes": int(free_b),
+            "driver_total_bytes": int(total_b),
+            "driver_used_bytes": driver_used,
+            "source": "nvml",
+        }
+    if _baseline_driver_used is None:
+        _baseline_driver_used = driver_used
+    process_used = max(0, driver_used - int(_baseline_driver_used))
+    return {
+        "process_used_bytes": int(process_used),
+        "driver_free_bytes": int(free_b),
+        "driver_total_bytes": int(total_b),
+        "driver_used_bytes": driver_used,
+        "source": "baseline",
+    }
+
+
+def process_used_mb():
+    """Convenience: process-only used VRAM in MiB."""
+    return get_memory_usage()["process_used_bytes"] / (1024.0 ** 2)
+
+
 def next_pow2(n: int, cap: int = MAX_THREADS_PER_BLOCK) -> int:
     """Smallest power of two >= n, capped at `cap`. Minimum 32 (one warp)."""
     p = 32
@@ -186,6 +292,40 @@ def to_device_int64(arr: np.ndarray) -> gpuarray.GPUArray:
     with runtime_metrics.measure("to_device"):
         out = gpuarray.to_gpu(host)
         cuda.Context.synchronize()
+    return out
+
+
+def float_to_half(arr: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Device cast float32 → float16 (FP16 storage; no host round-trip)."""
+    if arr.dtype == np.float16:
+        return arr
+    if arr.dtype != np.float32:
+        raise TypeError(f"float_to_half expects float32, got {arr.dtype}")
+    n = int(arr.size)
+    out = gpuarray.empty(arr.shape, dtype=np.float16)
+    if n == 0:
+        return out
+    grid, block = _launch_1d(n)
+    _float_to_half_kernel(
+        arr, out, np.int32(n), block=block, grid=grid,
+    )
+    return out
+
+
+def half_to_float(arr: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Device cast float16 → float32 for existing FP32 compute kernels."""
+    if arr.dtype == np.float32:
+        return arr
+    if arr.dtype != np.float16:
+        raise TypeError(f"half_to_float expects float16, got {arr.dtype}")
+    n = int(arr.size)
+    out = gpuarray.empty(arr.shape, dtype=np.float32)
+    if n == 0:
+        return out
+    grid, block = _launch_1d(n)
+    _half_to_float_kernel(
+        arr, out, np.int32(n), block=block, grid=grid,
+    )
     return out
 
 

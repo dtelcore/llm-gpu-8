@@ -1,6 +1,6 @@
 # llm-gpu-8
 
-**Version:** 0.1.1-dev  
+**Version:** 0.1.2  
 **Repo:** [github.com/dtelcore/llm-gpu-8](https://github.com/dtelcore/llm-gpu-8)  
 **Stack:** NumPy + PyCUDA character-level GPT — a compact **transformer runtime** targeting Kepler **GT 730** (CC 3.5)
 
@@ -64,9 +64,9 @@ not the reverse. Five pillars:
 | **Observability** | What is the runtime actually doing? |
 | **Verification** | Did an optimization preserve correctness? |
 
-### Stage 3.1 exit — what exists vs Not yet
+### Stage 3 exit — what exists
 
-**Stage 3.1 is measurable + verified + baselined — not optimized.**
+**Stage 3 is complete** (3.1–3.8 plus closeout 3.9–3.11). Measurement and Kepler-honest optimizations shipped; full AMP GEMM / always-on decode graphs are not viable on sm_35.
 
 Empirical answer from the BiggerTest metrics window (step **111100**):
 
@@ -74,17 +74,20 @@ Empirical answer from the BiggerTest metrics window (step **111100**):
 > **Not transfers.** Sync ≈ **0.018%** of step time. ScratchPool peak ≈ **28 MB** of ~**844 MB** device use. Next chapter = **memory efficiency** (activations) and **model efficiency** (KV cache, BPE) — not more CUDA plumbing.
 
 ```text
-llm-gpu-8 v0.1.1-dev
+llm-gpu-8 v0.1.2
 
 Exists
 ├── Runtime
 │   ├── CUDA forward / loss / manual backward / GPU AdamW
 │   ├── ScratchPool telemetry (pool lifetime)
-│   └── Generate KV cache (prefill + incremental decode)
+│   ├── Generate KV cache (prefill + incremental decode)
+│   ├── Device FP16↔FP32 cast kernels (storage; math stays FP32)
+│   └── CUDA Graph API (GPU-only capture; decode falls back)
 ├── Observability
 │   ├── training metrics (--runtime-metrics)
 │   ├── sync timing (to_host / to_device)
-│   └── memory timeline (--memory-timeline)
+│   ├── memory timeline (--memory-timeline)
+│   └── process-only VRAM (excludes HDMI/display via baseline/NVML)
 ├── Verification
 │   ├── NumPy reference path
 │   └── CUDA parity suite (tests/parity)
@@ -96,20 +99,23 @@ Exists
     ├── output/baselines/stage35_fp16_storage.json
     ├── output/baselines/stage36_allocator.json
     ├── output/baselines/stage37_timeline.json
+    ├── output/baselines/stage311_cuda_graph.json
     └── output/reports/evolution.html
 
-Exists (Stage 3.2–3.8 additions)
+Exists (Stage 3.2–3.11)
 ├── Generate KV cache + tools/bench_generate.py
 ├── tokenizer/bpe.py (experiment; char remains BiggerTest default)
 ├── Activation accounting (tools/tracing/activation_account.py)
-├── FP16 activation storage (model/cuda/fp16_storage.py)
+├── FP16 activation storage + device casts (model/cuda/fp16_storage.py)
 ├── LifetimeAllocator (model/cuda/allocator.py)
 ├── Software kernel timeline (tools/tracing/runtime_metrics.kernel_timeline)
-└── Evolution HTML report (tools/reports/evolution_report.py)
+├── Evolution HTML report (tools/reports/evolution_report.py)
+├── Process-only VRAM (model/cuda/ops.get_memory_usage)
+└── CUDA Graph capture/fallback (model/cuda/graph.py; generate --cuda-graph)
 
-Not yet
-├── native FP16 compute kernels (storage path exists)
-└── CUDA Graph capture (software timeline exists)
+Not yet (post–Stage 3)
+├── native FP16 GEMM / AMP training (Kepler has no useful Tensor-Core path)
+└── capture-compatible GPU-resident KV decode (host attention today)
 ```
 
 **Modern block (shipped with this train of work):** `norm_type=rmsnorm`, `pos_encoding=rope`, optional `--grad-checkpoint` (**VRAM** lever: selective attn/MLP recompute; ~72 MB less activation cache at BiggerTest shapes — not a tok/s speedup; see [`output/baselines/modern_activation_recompute.json`](output/baselines/modern_activation_recompute.json)). Legacy checkpoints without these keys stay LayerNorm + learned positions. RoPE path uses **QKV-split fusion** again (no full `[B·T, 3C]` buffer).
@@ -134,7 +140,7 @@ Not yet
 
 Principle for later milestones: every change must answer (1) Did the runtime get better? (2) Did correctness hold?
 
-**Next:** stabilization — compare against the release snapshot before new features.
+**Next:** post–Stage 3 work uses the stabilization discipline against the v0.1.2 snapshot.
 
 ### Stabilization release discipline
 
@@ -142,14 +148,14 @@ Principle for later milestones: every change must answer (1) Did the runtime get
 Change → Parity → Benchmark → Baseline comparison → Longer training validation → Release
 ```
 
-**Known-good snapshot:** [`output/releases/v0.1.1/`](output/releases/v0.1.1/)  
-Rebuild with: `python tools/releases/make_snapshot.py --tag v0.1.1`
+**Known-good snapshot:** [`output/releases/v0.1.2/`](output/releases/v0.1.2/)  
+Rebuild with: `python tools/releases/make_snapshot.py --tag v0.1.2`
 
 | Gate | Requirement |
 |------|-------------|
-| Correctness | Parity suite **10/10** (blocker) |
+| Correctness | Parity suite **OK** (blocker; live test count in `parity.txt`) |
 | Runtime | No material regression vs stage31 train / stage32 generate |
-| Memory | Compare stage34/35/36 artifacts (activations, FP16, allocator reuse) |
+| Memory | Compare stage34/35/36 artifacts (activations, FP16, allocator reuse); `device_used_mb` is process-only |
 | Observability | Timeline sample + evolution report present |
 
 ### Architecture (as shipped)
@@ -161,8 +167,8 @@ Generation: Prompt → Tokenizer → Transformer prefill → KV cache → Increm
 
 | Pillar | Current state |
 |--------|----------------|
-| Runtime | CUDA transformer engine |
-| Memory | telemetry + FP16 storage + lifetime reuse |
+| Runtime | CUDA transformer engine + CUDA Graph API (decode fallback) |
+| Memory | process-only VRAM + FP16 device casts + lifetime reuse |
 | Model | GPT + tokenizer experiments (char default) |
 | Observability | metrics, timeline, reports |
 | Verification | NumPy reference + parity |
@@ -185,8 +191,10 @@ KV cache is generate-only (default on; `--no-kv-cache` to disable). Training pat
 Future package map (**docs only** until built):
 
 ```text
-Shipped:  tools/tracing/   tests/parity/   tools/bench_generate.py   output/baselines/
-Future:   training/allocator.py   model/cuda/graph.py   tokenizer/bpe.py
+Shipped:  tools/tracing/   tests/parity/   tools/bench_generate.py
+          tokenizer/bpe.py   model/cuda/graph.py   model/cuda/fp16_storage.py
+          output/baselines/  output/releases/v0.1.2/
+Future:   training/allocator.py (ScratchPool redesign still demoted)
 ```
 
 ---
@@ -546,6 +554,13 @@ Generation at this stage: reliable TinyStories openers; mid-sample coherence sti
 
 ## Changelog
 
+### [0.1.2] — 2026-07-31 — Stage 3 closeout
+
+- **3.9 Process-only VRAM:** `ops.get_memory_usage()` / `process_used_mb()` — baseline (post-context) or NVML per-PID; train/bench logs `device_used_mb` exclude HDMI/display; optional `vram_driver_used_mb`
+- **3.10 Device FP16 casts:** `float_to_half` / `half_to_float` kernels; `fp16_storage` no longer host round-trips; compute remains FP32
+- **3.11 CUDA Graph:** [`model/cuda/graph.py`](model/cuda/graph.py) probe/capture/replay; GPU-only cast graph works; host KV decode falls back; `generate.py --cuda-graph`; [`stage311_cuda_graph.json`](output/baselines/stage311_cuda_graph.json)
+- **Release snapshot:** [`output/releases/v0.1.2/`](output/releases/v0.1.2/)
+
 ### [0.1.1-dev] — 2026-07-30 — Train recipe + throughput hygiene
 
 - **`tiny_stories` preset:** C=256, L=4, T=128, ~3M params; LR **3e-4**, warmup **1000**, batch **4**, grad accum **4**, cosine LR (`min_lr_ratio=0.1`), **`window_stride=64`**, dropout **0** (warn if >0)
@@ -653,9 +668,9 @@ Treated as `0.0.x`–`0.9.9` relative to `version.py` policy. Building blocks be
 
 ## Versioning
 
-- Canonical version string: [`VERSION`](VERSION) (currently `0.1.1-dev`), exposed as `version.py` → `__version__`.
+- Canonical version string: [`VERSION`](VERSION) (currently `0.1.2`), exposed as `version.py` → `__version__`.
 - Printed at startup by `train.py` / `auto_train.py`; stamped into checkpoint `config.json` / `state.json` / `metrics.json`.
-- **Policy:** all work before `a2b1a6f` is pre-0.1.0. Stage 3.1 ships as `0.1.1-dev` until a tagged release.
+- **Policy:** all work before `a2b1a6f` is pre-0.1.0. Stage 3 closeout ships as **`0.1.2`**.
 
 ---
 

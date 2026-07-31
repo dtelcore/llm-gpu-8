@@ -87,6 +87,27 @@ def build_html() -> str:
                           sm.get("total_ms"),
                           list((sm.get("by_name_ms") or {}).keys())[:3],
                           s37.get("timeline_path")]))
+    s311 = _load("stage311_cuda_graph.json")
+    if s311:
+        g = s311.get("gpu_only_cast_graph") or {}
+        d = s311.get("decode_capture") or {}
+        rows.append(_row(["3.11 CUDA Graph",
+                          g.get("mode"),
+                          g.get("replay_ms"),
+                          d.get("mode"),
+                          (d.get("reason") or "")[:60]]))
+    if s34 and s34.get("vram_source"):
+        rows.append(_row(["3.9 process VRAM",
+                          s34.get("device_used_mb_after_forward"),
+                          s34.get("vram_driver_used_mb"),
+                          s34.get("vram_source"),
+                          "process vs driver"]))
+    if s35 and s35.get("cast_path"):
+        rows.append(_row(["3.10 FP16 device cast",
+                          s35.get("cast_path"),
+                          s35.get("parity_ok"),
+                          s35.get("lm_head_grad_maxdiff"),
+                          s35.get("estimated_activation_savings_mb")]))
 
     body = f"""<!DOCTYPE html>
 <html lang="en">

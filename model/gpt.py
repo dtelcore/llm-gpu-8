@@ -964,6 +964,7 @@ class GPTModel:
         tokenizer=None,
         rng: np.random.Generator = None,
         use_kv_cache: bool = True,
+        use_cuda_graph: bool = False,
     ) -> List[int]:
         """Autoregressive sampling with temperature and optional top-k / top-p filters.
 
@@ -971,15 +972,41 @@ class GPTModel:
         new token is decoded incrementally against cached K/V. Training path is
         untouched. If ``tracer`` and ``tokenizer`` are both given, emits traces
         on tracer.trace_every steps.
+
+        ``use_cuda_graph`` attempts stream capture of a decode step (Stage 3.11).
+        Host KV decode typically falls back to eager; status is stored on
+        ``self._cuda_graph_status``.
         """
         rng = rng or np.random.default_rng()
         ids = list(prompt_ids)
+        self._cuda_graph_status = None
         if not use_kv_cache:
             return self._generate_no_kv(
                 ids, max_new_tokens, temperature, top_k, top_p, tracer, tokenizer, rng,
             )
 
         logits, kv_state = self._prefill_kv(ids[-self.config.max_len :], tracer=tracer)
+
+        if use_cuda_graph:
+            from model.cuda.graph import try_capture_decode
+
+            # Probe/capture attempt on the first decode shape; host KV path
+            # is expected to fall back. Status retained for benches / baselines.
+            probe_token = int(ids[-1]) if ids else 0
+            kv_snap = {
+                "B": kv_state["B"],
+                "T": kv_state["T"],
+                "layers": [
+                    {"k": ly["k"].copy(), "v": ly["v"].copy()}
+                    for ly in kv_state["layers"]
+                ],
+            }
+
+            def _probe_decode():
+                self._decode_kv(probe_token, kv_snap, tracer=None)
+
+            self._cuda_graph_status = try_capture_decode(_probe_decode).to_dict()
+
         for step in range(max_new_tokens):
             if tracer is not None:
                 tracer.update_step(step)
@@ -1089,14 +1116,16 @@ class GPTModel:
                 ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
                 tracer=tracer, name=f"{prefix}.qkv",
             )
+            # Heads layout for KV cache / decode: [B*H, T, hd] (B=1 -> [H, T, hd]).
             q_h = _interleaved_to_heads_host(cuda_ops.to_host(q_i), 1, 1, H, hd)
             k_new = _interleaved_to_heads_host(cuda_ops.to_host(k_i), 1, 1, H, hd)
             v_new = _interleaved_to_heads_host(cuda_ops.to_host(v_i), 1, 1, H, hd)
 
             if self._use_rope:
                 # Rotate new token at absolute position `pos`; past K already rotated.
-                q_h = _rope_np(q_h.reshape(H, 1, hd), base=float(cfg.rope_base), pos_offset=pos).reshape(1, H, 1, hd)
-                k_new = _rope_np(k_new.reshape(H, 1, hd), base=float(cfg.rope_base), pos_offset=pos).reshape(1, H, 1, hd)
+                # Keep [H, 1, hd] — do not expand to [1, H, 1, hd] (breaks concat with prefill).
+                q_h = _rope_np(q_h, base=float(cfg.rope_base), pos_offset=pos)
+                k_new = _rope_np(k_new, base=float(cfg.rope_base), pos_offset=pos)
 
             k_all = np.concatenate([past["k"], k_new], axis=1)
             v_all = np.concatenate([past["v"], v_new], axis=1)

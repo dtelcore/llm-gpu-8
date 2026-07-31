@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable Stage 3.2 KV cache (full recompute each token)",
     )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Stage 3.11: attempt CUDA Graph capture of KV decode (falls back if unsupported)",
+    )
     cli_common.add_trace_args(parser)
     return parser.parse_args()
 
@@ -70,7 +75,11 @@ def generate(args: argparse.Namespace) -> str:
         tokenizer=tokenizer if tracer.any_enabled else None,
         rng=rng,
         use_kv_cache=not args.no_kv_cache,
+        use_cuda_graph=bool(args.cuda_graph),
     )
+
+    if args.cuda_graph and getattr(model, "_cuda_graph_status", None):
+        logger.info("cuda_graph_status=%s", model._cuda_graph_status)
 
     text = tokenizer.decode(generated_ids)
     print("\n" + "=" * 70)

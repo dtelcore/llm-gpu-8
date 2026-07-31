@@ -28,13 +28,13 @@ from training.dataset import WindowedDataset
 from training.gpu_optimizer import AdamWGPU
 from training.loss import softmax_cross_entropy_batch_gpu
 from tools.tracing.runtime_metrics import runtime_metrics, memory_timeline
+from version import __version__
 
 
 def _device_used_mb() -> float:
     try:
-        import pycuda.driver as cuda
-        free, total = cuda.mem_get_info()
-        return (total - free) / (1024 * 1024)
+        from model.cuda import ops as cuda_ops
+        return float(cuda_ops.process_used_mb())
     except Exception:
         return float("nan")
 
@@ -126,7 +126,7 @@ def main():
     bpe_tok.save(bpe_path)
 
     result = {
-        "version": "0.1.1-dev",
+        "version": __version__,
         "milestone": "stage_3_3",
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "note": "Char remains BiggerTest default. BPE is experiment-only.",

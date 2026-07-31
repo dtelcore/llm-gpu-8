@@ -5,12 +5,13 @@ Assemble a known-good release snapshot from frozen Stage 3 baselines + parity.
 
 Usage:
     python tools/releases/make_snapshot.py
-    python tools/releases/make_snapshot.py --tag v0.1.1
+    python tools/releases/make_snapshot.py --tag v0.1.2
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -46,12 +47,21 @@ def _run_parity(out_txt: Path) -> dict:
     text = (proc.stdout or "") + (proc.stderr or "")
     out_txt.write_text(text, encoding="utf-8")
     ok = proc.returncode == 0 and "OK" in text
-    # unittest summary line e.g. "Ran 10 tests in 0.538s"
     ran = None
+    n_tests = None
     for line in text.splitlines():
         if line.startswith("Ran "):
             ran = line.strip()
-    return {"ok": ok, "returncode": proc.returncode, "summary": ran, "path": str(out_txt)}
+            m = re.match(r"Ran (\d+) tests?", line)
+            if m:
+                n_tests = int(m.group(1))
+    return {
+        "ok": ok,
+        "returncode": proc.returncode,
+        "summary": ran,
+        "n_tests": n_tests,
+        "path": str(out_txt),
+    }
 
 
 def build(tag: str) -> Path:
@@ -65,6 +75,8 @@ def build(tag: str) -> Path:
     s35 = _load("stage35_fp16_storage.json") or {}
     s36 = _load("stage36_allocator.json") or {}
     s37 = _load("stage37_timeline_meta.json") or _load("stage37_timeline.json") or {}
+    s311 = _load("stage311_cuda_graph.json") or {}
+    modern = _load("modern_activation_recompute.json") or {}
 
     runtime = {
         "tag": tag,
@@ -84,8 +96,14 @@ def build(tag: str) -> Path:
         },
         "hardware": s31.get("hardware"),
         "model": s31.get("model"),
+        "cuda_graph": {
+            "source": "stage311_cuda_graph.json",
+            "probe": s311.get("probe"),
+            "gpu_only_cast_graph": s311.get("gpu_only_cast_graph"),
+            "decode_capture": s311.get("decode_capture"),
+        },
         "gates": {
-            "parity_required": "10/10",
+            "parity_required": "OK (live count in parity.txt)",
             "compare_against": [
                 "stage31_baseline.json",
                 "stage32_kv_generate.json",
@@ -93,6 +111,8 @@ def build(tag: str) -> Path:
                 "stage35_fp16_storage.json",
                 "stage36_allocator.json",
                 "stage37_timeline.json",
+                "stage311_cuda_graph.json",
+                "modern_activation_recompute.json",
             ],
         },
     }
@@ -128,12 +148,17 @@ def build(tag: str) -> Path:
             "largest_activation_bucket": s34.get("largest_activation_bucket"),
             "parameter_mb": s34.get("parameter_mb"),
             "device_used_mb_after_forward": s34.get("device_used_mb_after_forward"),
+            "vram_driver_used_mb": s34.get("vram_driver_used_mb"),
+            "vram_source": s34.get("vram_source"),
+            "vram_note": s34.get("vram_note"),
         },
         "fp16_storage": {
             "source": "stage35_fp16_storage.json",
             "estimated_savings_mb": s35.get("estimated_activation_savings_mb"),
             "parity_ok": s35.get("parity_ok"),
             "lm_head_grad_maxdiff": s35.get("lm_head_grad_maxdiff"),
+            "cast_path": s35.get("cast_path"),
+            "note": s35.get("note"),
         },
         "allocator": {
             "source": "stage36_allocator.json",
@@ -145,6 +170,13 @@ def build(tag: str) -> Path:
             "summary": s37.get("summary"),
             "timeline_path": s37.get("timeline_path"),
         },
+        "modern_recompute": {
+            "source": "modern_activation_recompute.json",
+            "summary": {k: modern.get(k) for k in (
+                "activation_cache_mb", "device_used_mb", "grad_checkpoint",
+                "norm_type", "pos_encoding", "note",
+            ) if k in modern} or modern,
+        },
         "stage31_scratch_peak_mb": (s31.get("runtime") or {}).get("scratch_peak_mb"),
     }
 
@@ -154,6 +186,10 @@ def build(tag: str) -> Path:
     (dest / "memory.json").write_text(json.dumps(memory, indent=2), encoding="utf-8")
 
     parity = _run_parity(dest / "parity.txt")
+    n = parity.get("n_tests")
+    runtime["gates"]["parity_required"] = f"{n}/{n}" if n else "OK (see parity.txt)"
+    (dest / "runtime.json").write_text(json.dumps(runtime, indent=2), encoding="utf-8")
+
     manifest = {
         "tag": tag,
         "captured_at": runtime["captured_at"],
@@ -175,7 +211,6 @@ def build(tag: str) -> Path:
     if evo_src.exists():
         shutil.copy2(evo_src, dest / "evolution.html")
     else:
-        # regenerate if missing
         subprocess.run(
             [str(PY), str(ROOT / "tools" / "reports" / "evolution_report.py"),
              "--out", str(dest / "evolution.html")],
@@ -183,16 +218,18 @@ def build(tag: str) -> Path:
             check=False,
         )
 
-    # Pointer copies of source baselines for auditability
     audit = dest / "sources"
     audit.mkdir(exist_ok=True)
     for name in (
         "stage31_baseline.json",
         "stage32_kv_generate.json",
+        "stage33_bpe_protocol.json",
         "stage34_activation_account.json",
         "stage35_fp16_storage.json",
         "stage36_allocator.json",
         "stage37_timeline.json",
+        "stage311_cuda_graph.json",
+        "modern_activation_recompute.json",
     ):
         src = BASELINES / name
         if src.exists():
@@ -207,7 +244,7 @@ def build(tag: str) -> Path:
 
 def main():
     ap = argparse.ArgumentParser(description="Create known-good release snapshot")
-    ap.add_argument("--tag", type=str, default="v0.1.1")
+    ap.add_argument("--tag", type=str, default="v0.1.2")
     args = ap.parse_args()
     build(args.tag)
 

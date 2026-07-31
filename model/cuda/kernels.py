@@ -2,7 +2,8 @@
 model/cuda/kernels.py
 
 Raw CUDA C source for the sm_35 (Kepler GT 730) PyCUDA SourceModule.
-Precision is strictly float32.
+Compute kernels are float32. Stage 3.10 adds device float↔half cast kernels
+for FP16 activation *storage* (math remains FP32 after expand).
 
 All row-wise reductions (layernorm mean/var, softmax max/sum) use a
 shared-memory tree reduction with an explicit zero/sentinel initialization
@@ -14,6 +15,8 @@ step before any accumulation, and require a POWER-OF-TWO block size
 """
 
 CUDA_SOURCE = r"""
+#include <cuda_fp16.h>
+
 // Tiled GEMM for Kepler (sm_35). TILE=16 fits well on GT 730.
 #define GEMM_TILE 16
 
@@ -1445,6 +1448,26 @@ __global__ void fused_attention_forward_kernel(
             acc += row_scores[j] * V[h * M * D + j * D + d];
         }
         Out[h * M * D + i * D + d] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3.10: device-side FP16 storage casts (compute stays FP32)
+// ---------------------------------------------------------------------------
+
+__global__ void float_to_half_kernel(const float* __restrict__ in,
+                                     __half* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2half_rn(in[i]);
+    }
+}
+
+__global__ void half_to_float_kernel(const __half* __restrict__ in,
+                                     float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __half2float(in[i]);
     }
 }
 """

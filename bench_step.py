@@ -101,8 +101,8 @@ def bench_dataset(label: str, corpus: List[str]) -> dict:
 
     avg_ms = float(np.mean(times))
     tok_s = (BATCH_SIZE * cfg.max_len) / (avg_ms / 1000.0)
-    free_b, total_b = cuda_ops.get_memory_info()
-    used_mb = (total_b - free_b) / (1024 ** 2)
+    mem = cuda_ops.get_memory_usage()
+    used_mb = mem["process_used_bytes"] / (1024 ** 2)
     param_mb = params.param_count() * 4 / (1024 ** 2)
     adam_mb = 2 * param_mb  # FP32 m + v
     print(f"  avg: {avg_ms:.1f} ms  tok/s={tok_s:.0f}  vram_used={used_mb:.0f}MB  "
@@ -112,6 +112,8 @@ def bench_dataset(label: str, corpus: List[str]) -> dict:
         "avg_step_ms": avg_ms,
         "tokens_per_sec": tok_s,
         "device_used_mb": used_mb,
+        "vram_driver_used_mb": mem["driver_used_bytes"] / (1024 ** 2),
+        "vram_source": mem["source"],
         "parameter_mb": param_mb,
         "adam_estimated_mb": adam_mb,
         "batch_size": BATCH_SIZE,
