@@ -1,0 +1,19 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_7",
+  "captured_at": "2026-07-31T20:42:40.327253+00:00",
+  "timeline_path": "output\\baselines\\stage37_timeline.json",
+  "summary": {
+    "event_count": 7,
+    "total_ms": 1.203799999998978,
+    "by_name_ms": {
+      "layer_0.attn_out": 1.021099999999997,
+      "causal_mha": 0.0691999999995474,
+      "lm_head": 0.03019999999942513,
+      "layer_0.mlp_contract": 0.029399999999846216,
+      "layer_1.mlp_contract": 0.027900000000080638,
+      "layer_1.attn_out": 0.026000000000081513
+    }
+  },
+  "note": "Software kernel timeline; CUDA Graph API is Stage 3.11 (graph.py)."
+}

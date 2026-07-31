@@ -1,0 +1,56 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_1",
+  "recorded_at": "2026-07-22T21:07:03.895547+00:00",
+  "notes": "Scientific control after Stage 3.1 exit. Runtime from GPU microbench (metrics disabled). Quality from BiggerTest256256 quarter_100 / latest sidecars. Memory fields mix measured VRAM with rough Adam/activation estimates — not perfect accounting. tokens_per_sec here may be depressed vs unloaded ~600 tok/s training if another train process shares the GT 730; use as dated control under your machine conditions.",
+  "hardware": {
+    "gpu": "GT 730 GK208",
+    "compute_capability": "3.5",
+    "vram_total_mb": 4096.0,
+    "display_shared": true
+  },
+  "model": {
+    "name": "BiggerTest256256-class",
+    "embedding_dim": 256,
+    "layers": 4,
+    "heads": 8,
+    "context": 256,
+    "vocab_size": 110,
+    "batch_size": 4,
+    "param_count": 3281518,
+    "dropout_prob": 0.1
+  },
+  "runtime": {
+    "tokens_per_sec": 318.7,
+    "step_ms": 3213.55,
+    "sync_count": 0,
+    "sync_ms": 0.0,
+    "scratch_peak_mb": null,
+    "metrics_enabled": false,
+    "source": "bench microbench forward_batch+backward_batch_gpu+AdamWGPU"
+  },
+  "memory": {
+    "device_used_mb": 842.5,
+    "parameter_mb": 12.52,
+    "adam_estimated_mb": 25.04,
+    "activation_estimated_mb": 24.0,
+    "notes": "adam_estimated = 2 * parameter_mb (m+v FP32); activation_estimated rough attn workspace + stream temps"
+  },
+  "quality": {
+    "checkpoint": "output/checkpoints/BiggerTest256256",
+    "step_latest": 111000,
+    "train_loss_latest": 0.9379588508605957,
+    "train_ppl_latest": 2.5547614436461012,
+    "step_quarter_100": 101000,
+    "val_loss": 0.9599550813436508,
+    "val_ppl": 2.6115791621614917,
+    "quality_score": 0.8837483675666737,
+    "quality_detail": {
+      "spelling": 0.9323308270676691,
+      "punctuation": 0.75,
+      "grammar": 1.0,
+      "semantics": 0.8526626431990262,
+      "aggregate": 0.8837483675666737
+    }
+  }
+}

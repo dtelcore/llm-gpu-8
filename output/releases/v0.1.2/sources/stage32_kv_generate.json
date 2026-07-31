@@ -1,0 +1,33 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_2",
+  "captured_at": "2026-07-31T20:28:53.011830+00:00",
+  "checkpoint": ".\\output\\checkpoints\\BiggerTestSmoke\\best",
+  "prompt": "once upon a time",
+  "max_new_tokens": 256,
+  "seed": 42,
+  "model": {
+    "embedding_dim": 256,
+    "layers": 4,
+    "heads": 8,
+    "context": 128,
+    "vocab_size": 110
+  },
+  "before_no_kv": {
+    "wall_s": 15.192,
+    "tokens_per_sec": 16.85
+  },
+  "after_kv": {
+    "wall_s": 13.3475,
+    "tokens_per_sec": 19.18,
+    "kv_peak_bytes": 1048576,
+    "kv_peak_mb": 1.0
+  },
+  "speedup": 1.138,
+  "determinism": {
+    "kv_self_match_32": true,
+    "kv_vs_nokv_match_32": true
+  },
+  "sample_tail_kv": " always heart. One day, she went to the ",
+  "sample_tail_nokv": " always heart. One day, she went to the "
+}

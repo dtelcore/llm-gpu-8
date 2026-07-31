@@ -1,0 +1,21 @@
+{
+  "tag": "v0.1.2",
+  "source": "stage32_kv_generate.json",
+  "checkpoint": ".\\output\\checkpoints\\BiggerTestSmoke\\best",
+  "max_new_tokens": 256,
+  "before_no_kv": {
+    "wall_s": 15.192,
+    "tokens_per_sec": 16.85
+  },
+  "after_kv": {
+    "wall_s": 13.3475,
+    "tokens_per_sec": 19.18,
+    "kv_peak_bytes": 1048576,
+    "kv_peak_mb": 1.0
+  },
+  "speedup": 1.138,
+  "determinism": {
+    "kv_self_match_32": true,
+    "kv_vs_nokv_match_32": true
+  }
+}

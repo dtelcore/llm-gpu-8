@@ -1,0 +1,54 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_11",
+  "captured_at": "2026-07-31T20:42:40.380273+00:00",
+  "probe": {
+    "supported": true,
+    "captured": false,
+    "mode": "eager",
+    "reason": "driver symbols present (CUDA 10+)",
+    "capture_ms": 0.0,
+    "replay_ms": 0.0,
+    "eager_ms": 0.0,
+    "details": {
+      "api": "cuStreamBeginCapture/cuGraphLaunch"
+    }
+  },
+  "gpu_only_cast_graph": {
+    "supported": true,
+    "captured": true,
+    "mode": "graph",
+    "reason": "captured",
+    "capture_ms": 0.07199999999940587,
+    "replay_ms": 0.16069333333333566,
+    "eager_ms": 0.11194666666665871,
+    "details": {
+      "api": "cuStreamBeginCapture/cuGraphLaunch"
+    }
+  },
+  "decode_capture": {
+    "supported": true,
+    "captured": false,
+    "mode": "fallback",
+    "reason": "decode capture body failed (host sync/KV expected): cuMemcpyDtoH failed: operation would make the legacy stream depend on a capturing blocking stream",
+    "capture_ms": 0.0,
+    "replay_ms": 0.0,
+    "eager_ms": 0.0,
+    "details": {
+      "api": "cuStreamBeginCapture/cuGraphLaunch"
+    }
+  },
+  "generate_wiring": {
+    "supported": true,
+    "captured": false,
+    "mode": "fallback",
+    "reason": "decode capture body failed (host sync/KV expected): cuMemcpyDtoH failed: operation would make the legacy stream depend on a capturing blocking stream",
+    "capture_ms": 0.0,
+    "replay_ms": 0.0,
+    "eager_ms": 0.0,
+    "details": {
+      "api": "cuStreamBeginCapture/cuGraphLaunch"
+    }
+  },
+  "note": "GPU-only callables may capture on CUDA 10+; host KV decode falls back to eager (to_host / NumPy attention). Use --cuda-graph on generate.py to probe."
+}

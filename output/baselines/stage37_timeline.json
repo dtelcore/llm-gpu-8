@@ -1,0 +1,59 @@
+{
+  "step": 0,
+  "events": [
+    {
+      "name": "causal_mha",
+      "category": "attention",
+      "step": 0,
+      "ms": 0.03360000000007801
+    },
+    {
+      "name": "layer_0.attn_out",
+      "category": "gemm",
+      "step": 0,
+      "ms": 1.021099999999997
+    },
+    {
+      "name": "layer_0.mlp_contract",
+      "category": "gemm",
+      "step": 0,
+      "ms": 0.029399999999846216
+    },
+    {
+      "name": "causal_mha",
+      "category": "attention",
+      "step": 0,
+      "ms": 0.03559999999946939
+    },
+    {
+      "name": "layer_1.attn_out",
+      "category": "gemm",
+      "step": 0,
+      "ms": 0.026000000000081513
+    },
+    {
+      "name": "layer_1.mlp_contract",
+      "category": "gemm",
+      "step": 0,
+      "ms": 0.027900000000080638
+    },
+    {
+      "name": "lm_head",
+      "category": "gemm",
+      "step": 0,
+      "ms": 0.03019999999942513
+    }
+  ],
+  "summary": {
+    "event_count": 7,
+    "total_ms": 1.203799999998978,
+    "by_name_ms": {
+      "layer_0.attn_out": 1.021099999999997,
+      "causal_mha": 0.0691999999995474,
+      "lm_head": 0.03019999999942513,
+      "layer_0.mlp_contract": 0.029399999999846216,
+      "layer_1.mlp_contract": 0.027900000000080638,
+      "layer_1.attn_out": 0.026000000000081513
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "milestone": "modern_activation_recompute",
+  "shapes": {
+    "B": 4,
+    "T": 256,
+    "C": 256,
+    "L": 4,
+    "H": 8,
+    "vocab": 110
+  },
+  "config": {
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "tie_embeddings": true
+  },
+  "full_cache": {
+    "other_activations": 1.87,
+    "ln_cache": 17.04,
+    "attention_cache": 48.0,
+    "mlp_cache": 32.0
+  },
+  "checkpoint_cache": {
+    "other_activations": 1.87,
+    "ln_cache": 17.04,
+    "attention_cache": 8.0
+  },
+  "full_total_mb": 98.9,
+  "checkpoint_total_mb": 26.9,
+  "saved_mb": 72.0
+}

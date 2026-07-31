@@ -119,6 +119,7 @@ Not yet (post–Stage 3)
 ```
 
 **Modern block (shipped with this train of work):** `norm_type=rmsnorm`, `pos_encoding=rope`, optional `--grad-checkpoint` (**VRAM** lever: selective attn/MLP recompute; ~72 MB less activation cache at BiggerTest shapes — not a tok/s speedup; see [`output/baselines/modern_activation_recompute.json`](output/baselines/modern_activation_recompute.json)). Legacy checkpoints without these keys stay LayerNorm + learned positions. RoPE path uses **QKV-split fusion** again (no full `[B·T, 3C]` buffer).
+
 **Scientific control (BiggerTest telemetry, not a contended microbench):**
 
 [`output/baselines/stage31_baseline.json`](output/baselines/stage31_baseline.json)
@@ -203,15 +204,15 @@ Future:   training/allocator.py (ScratchPool redesign still demoted)
 
 | Area | What you get |
 |------|----------------|
-| Model | Character GPT: embeddings → N× (LN → MHA → residual → LN → MLP → residual) → LN → LM head |
-| GPU path | Tiled GEMM, fused residual LayerNorm, causal MHA, **GPU manual backward**, GPU AdamW |
+| Model | Character GPT: embeddings → N× (norm → MHA → residual → norm → MLP → residual) → norm → LM head; defaults **RMSNorm + RoPE** (legacy: LayerNorm + learned pos) |
+| GPU path | Tiled GEMM, fused residual norm, causal MHA, **GPU manual backward**, GPU AdamW; optional `--grad-checkpoint` |
 | Host path | NumPy analytic backward as **reference / fallback**; persistent device weight mirror |
-| Training | Wizard, resume, step/epoch overrides, val 90/10 holdout |
+| Training | Wizard, resume, step/epoch overrides, cosine LR + warmup, val 90/10 holdout |
 | Checkpoints | Latest + `quarter_*` + optional `best/` |
 | Quality | Heuristic generation scores + quarter trial |
-| Observability | `--runtime-metrics`, `--memory-timeline`, kernel timeline (off by default) |
+| Observability | `--runtime-metrics`, `--memory-timeline`, kernel timeline, process-only VRAM (off by default) |
 | Verification | `.\venv\Scripts\python.exe -m tests.parity.run_parity` |
-| Generation | KV cache on by default (`--no-kv-cache` to disable) |
+| Generation | KV cache on by default (`--no-kv-cache`); optional `--cuda-graph` (GPU-only capture; decode may fall back) |
 | Reports | `python tools/reports/evolution_report.py` → `output/reports/evolution.html` |
 
 ---
@@ -260,6 +261,7 @@ NumPy backward path = reference implementation / testing fallback
 
 - Weights stay GPU-resident between steps (`upload_to_device` / `sync_device`).
 - `ScratchPool` reuses temporary GPU buffers (pool lifetime until `clear()` — see Observability).
+- New presets default to **RMSNorm + RoPE**; older checkpoints without those keys keep LayerNorm + learned positions.
 - Character vocab (~110 for TinyStories ASCII) keeps embedding/LM-head matrices small on Kepler.
 
 ---
@@ -270,16 +272,20 @@ NumPy backward path = reference implementation / testing fallback
 llm gpu 8/
 ├── README.md                 ← this file
 ├── guide.md                  ← GT 730 TinyStories fast start
-├── VERSION / version.py      ← 0.1.1-dev
+├── VERSION / version.py      ← 0.1.2
 ├── train.py / auto_train.py / generate.py / interactive.py
 ├── cli_common.py / paths.py / logging_config.py
-├── tools/tracing/            ← Stage 3.1 observability
-│   ├── runtime_metrics.py    ← SyncMeter + MemoryTimeline recorders
-│   └── memory_timeline.py    ← JSONL summary / --plot CLI
-├── tests/parity/             ← Stage 3.1 NumPy↔CUDA verification
-├── model/                    ← GPT + CUDA kernels/ops
+├── tools/
+│   ├── tracing/              ← metrics, memory timeline, activation account
+│   ├── reports/              ← evolution HTML report
+│   ├── releases/             ← make_snapshot.py (v0.1.2 known-good pack)
+│   └── bench_generate.py     ← KV generate microbench
+├── tests/parity/             ← NumPy↔CUDA verification
+├── model/                    ← GPT + CUDA kernels/ops (fp16_storage, graph, …)
 ├── training/                 ← checkpoint, loss, AdamWGPU, quality, …
-├── tokenizer/ / setup/ / data/ / output/
+├── tokenizer/                ← char default + bpe.py experiment
+├── setup/ / data/
+└── output/                   ← runtime artifacts (baselines/releases tracked)
 ```
 
 Runtime artifact convention is documented in [`output/README.md`](output/README.md). Setup details: [`setup/README.md`](setup/README.md).
@@ -662,6 +668,11 @@ Treated as `0.0.x`–`0.9.9` relative to `version.py` policy. Building blocks be
 2026-07-21  a2b1a6f  ★ v0.1.0 quarterly + quality trial
 2026-07-21  26073fa  Plotter last-1000-lines default
 2026-07-21  7fba7da  Plotter sliding contiguous window
+2026-07-22  995e175  Stage 3.1 observability + parity foundation
+2026-07-29  e19d3f7  Stage 3.2–3.8 runtime/memory/report path
+2026-07-30  9ae9632  RMSNorm / RoPE / modern-block CLI
+2026-07-30  cbd093c  Train recipe (cosine LR, window stride, val-every)
+2026-07-31  52f5e18  ★ v0.1.2 Stage 3 closeout (process VRAM, FP16 casts, CUDA Graph)
 ```
 
 ---

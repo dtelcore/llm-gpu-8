@@ -1,0 +1,14 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_5",
+  "captured_at": "2026-07-31T20:42:40.197543+00:00",
+  "estimated_activation_savings_bytes": 737280,
+  "estimated_activation_savings_mb": 0.7031,
+  "loss_fp32": 5.049239635467529,
+  "loss_fp16_storage_path": 5.049239635467529,
+  "lm_head_grad_maxdiff": 1.576170325279236e-05,
+  "parity_ok": true,
+  "note": "Activations stored FP16 via device cast kernels; compute remains FP32 for sm_35.",
+  "cast_path": "device_float_to_half / half_to_float",
+  "saved_keys_sample": []
+}

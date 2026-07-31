@@ -1,0 +1,45 @@
+{
+  "version": "0.1.1-dev",
+  "milestone": "stage_3_3",
+  "captured_at": "2026-07-22T21:29:22.543931+00:00",
+  "note": "Char remains BiggerTest default. BPE is experiment-only.",
+  "dataset": "tiny_english",
+  "num_merges": 100,
+  "sample_chars": 241,
+  "char": {
+    "vocab_size": 27,
+    "tokens_for_sample": 241,
+    "chars_per_token": 1.0,
+    "chars_covered_in_window": 64.0,
+    "step_ms_mean": 24.456266666666707,
+    "train_loss_last": 3.8513684272766113,
+    "tokens_per_sec": 5233.832364710877,
+    "device_used_mb": 665.5437488555908,
+    "device_used_mb_before": 662.5437488555908,
+    "param_count": 106176,
+    "probe_text": "thewwwwwwwpjojojojowwww"
+  },
+  "bpe": {
+    "char_len": 241.0,
+    "bpe_token_count": 154.0,
+    "chars_per_token": 1.5649350649350648,
+    "context_token_window": 64.0,
+    "chars_covered_in_window": 93.0,
+    "compression_vs_chars": 1.5649350649350648,
+    "vocab_size": 61,
+    "merges": 34,
+    "vocab_path": "output\\tokenizer\\stage33_bpe_vocab.json",
+    "step_ms_mean": 23.91966666666667,
+    "train_loss_last": 4.4032182693481445,
+    "tokens_per_sec": 5351.24513998244,
+    "device_used_mb": 664.5437488555908,
+    "device_used_mb_before": 664.5437488555908,
+    "param_count": 110528,
+    "probe_text": "theereraanelearninerererererererererererererer"
+  },
+  "conclusions": [
+    "Do not replace char BiggerTest without a longer measured run",
+    "BPE increases vocab (embed/LM head cost) while compressing span per token",
+    "Use this table as the Stage 3.3 scientific control"
+  ]
+}

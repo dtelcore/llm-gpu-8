@@ -1,0 +1,35 @@
+2026-07-31 22:42:41 | INFO     | llm_gpu | Logging initialized | Level: INFO | File: C:\dev\llm gpu 8\output\logs\training_20260731_224241.log
+2026-07-31 22:42:46 | INFO     | llm_gpu | PyCUDA kernels compiled for sm_35 (Kepler GT 730)
+2026-07-31 22:42:46 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+2026-07-31 22:42:46 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+2026-07-31 22:42:46 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+2026-07-31 22:42:46 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+2026-07-31 22:42:46 | INFO     | llm_gpu | Tokenizer vocab built: 16 unique characters
+test_causal_attention_forward (tests.parity.test_attention.TestAttentionParity) ... ok
+test_forward_cache_keeps_batch_dims (tests.parity.test_forward_contract.TestForwardBackwardContract) ... ok
+test_gelu_forward_backward (tests.parity.test_gelu.TestGeluParity) ... ok
+test_kv_grows (tests.parity.test_kv_cache.TestKVCacheGenerate) ... ok
+test_kv_matches_nokv_greedy (tests.parity.test_kv_cache.TestKVCacheGenerate)
+Argmax decode: KV vs full recompute should agree on token ids. ... ok
+test_kv_rope_decode_shapes (tests.parity.test_kv_cache.TestKVCacheGenerate)
+Prefill K/V stay [H, T, hd]; decode append must not introduce a batch dim. ... ok
+test_kv_rope_rmsnorm_matches_nokv_greedy (tests.parity.test_kv_cache.TestKVCacheGenerate)
+Modern stack (RoPE + RMSNorm): KV decode must match full recompute. ... ok
+test_kv_self_deterministic (tests.parity.test_kv_cache.TestKVCacheGenerate) ... ok
+test_layernorm_forward_backward (tests.parity.test_layernorm.TestLayerNormParity) ... ok
+test_residual_rmsnorm_fuse (tests.parity.test_layernorm.TestLayerNormParity) ... ok
+test_rmsnorm_forward_backward (tests.parity.test_layernorm.TestLayerNormParity) ... ok
+test_linear_backward (tests.parity.test_linear.TestLinearParity) ... ok
+test_matmul_bias_forward (tests.parity.test_linear.TestLinearParity) ... ok
+test_checkpoint_matches_full_cache_grads (tests.parity.test_modern_step.TestModernStepParity)
+Same weights: grads with/without checkpointing should match. ... ok
+test_grad_checkpoint_step (tests.parity.test_modern_step.TestModernStepParity) ... ok
+test_rmsnorm_rope_step (tests.parity.test_modern_step.TestModernStepParity) ... ok
+test_rope_apply_forward_backward (tests.parity.test_rope.TestRoPEParity) ... ok
+test_rope_pos_offset (tests.parity.test_rope.TestRoPEParity) ... ok
+test_forward_backward_grads (tests.parity.test_step.TestStepParity) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 0.552s
+
+OK
